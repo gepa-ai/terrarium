@@ -12,5 +12,5 @@ dependencies = []
 [project.optional-dependencies]
 gepa = ["gepa"]
 
-[tool.setuptools]
-packages = ["terrarium", "terrarium.tasks", "terrarium.adapters"]
+[tool.setuptools.packages.find]
+where = ["src"]
