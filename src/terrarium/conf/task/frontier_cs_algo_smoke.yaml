@@ -1,0 +1,8 @@
+# @package task
+# Frontier-CS algorithmic smoke subset — 3 small problems. Use this to
+# validate the adapter → judge pipeline end-to-end before targeting a
+# single problem for real optimization.
+#
+# For a specific problem, override the name directly:
+#   python -m terrarium task.name=frontier_cs_algo_107 adapter=gepa
+name: frontier_cs_algo_smoke
