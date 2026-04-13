@@ -39,15 +39,24 @@ Usage::
 
 from __future__ import annotations
 
+import fcntl
+import logging
 import os
 import shutil
 import subprocess
+import time
 import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import requests
+
 _FRONTIER_CS_REPO_URL = "https://github.com/FrontierCS/Frontier-CS"
+_JUDGE_PORT = 8081
+_JUDGE_URL = f"http://localhost:{_JUDGE_PORT}"
+
+logger = logging.getLogger(__name__)
 
 from terrarium.registry import register_task_factory
 from terrarium.task import Example, Task
@@ -160,6 +169,63 @@ def _algorithmic_rows() -> dict[str, dict[str, Any]]:
     return rows
 
 
+def _judge_is_alive() -> bool:
+    """Check if the judge server is responding on the default port."""
+    try:
+        r = requests.get(f"{_JUDGE_URL}/problems", timeout=5)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _ensure_shared_judge(base: Path) -> bool:
+    """Start the judge server if not already running, using a cross-process file lock.
+
+    Multiple terrarium processes can run in parallel. Without coordination they
+    all race to ``docker compose up``, creating duplicate Docker networks and
+    failing. This function serialises the startup: the first process to acquire
+    the lock starts the judge; the rest wait for it to become healthy.
+    """
+    if _judge_is_alive():
+        return True
+
+    lock_path = base / "algorithmic" / ".terrarium_judge.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            # Another process may have started it while we waited for the lock.
+            if _judge_is_alive():
+                return True
+
+            compose_dir = base / "algorithmic"
+            logger.info("Starting shared judge server in %s", compose_dir)
+            result = subprocess.run(
+                ["docker", "compose", "up", "-d", "--wait"],
+                cwd=compose_dir,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                logger.error("docker compose failed: %s", result.stderr.strip())
+                return False
+
+            # Wait for the judge HTTP endpoint to become ready.
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                if _judge_is_alive():
+                    logger.info("Judge server is ready")
+                    return True
+                time.sleep(2)
+
+            logger.error("Judge server did not become ready within 60 s")
+            return False
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+
 def _evaluate(candidate: str, *, problem_id: str) -> tuple[float, dict[str, Any]]:
     """Evaluate a C++ candidate on one Frontier-CS algorithmic problem.
 
@@ -199,8 +265,18 @@ def _evaluate(candidate: str, *, problem_id: str) -> tuple[float, dict[str, Any]
             "logs": "",
         }
 
+    # Start the judge once across all parallel terrarium processes.
+    if not _ensure_shared_judge(base):
+        return 0.0, {
+            "score": 0.0,
+            "problem_id": problem_id,
+            "status": "error",
+            "message": "Could not start the Frontier-CS judge server (Docker).",
+            "logs": "",
+        }
+
     try:
-        runner = AlgorithmicLocalRunner(base_dir=base)
+        runner = AlgorithmicLocalRunner(base_dir=base, auto_start=False)
         result = runner.evaluate(str(problem_id), candidate)
     except Exception as e:
         return 0.0, {
@@ -214,13 +290,11 @@ def _evaluate(candidate: str, *, problem_id: str) -> tuple[float, dict[str, Any]
     score = float(result.score) if result.score is not None else 0.0
     return score, {
         "score": score,
-        "score_unbounded": getattr(result, "score_unbounded", None),
         "problem_id": problem_id,
         "status": str(getattr(result, "status", "unknown")),
         "message": getattr(result, "message", None),
         "logs": getattr(result, "logs", None),
         "duration_seconds": getattr(result, "duration_seconds", None),
-        "metadata": getattr(result, "metadata", {}),
     }
 
 
@@ -252,9 +326,10 @@ def _make_problem_task(problem_id: str) -> Task:
             "frontier_cs_track": "algorithmic",
             "frontier_cs_problem_id": problem_id,
             "objective": (
-                f"Write a C++ program that maximizes the Frontier-CS checker "
-                f"score on algorithmic problem {problem_id}."
+                f"Write a C++ program that maximizes the score "
+                f"on algorithmic problem {problem_id}."
             ),
+            "background": row["statement"],
         },
     )
 
@@ -310,7 +385,8 @@ def _make_smoke_task() -> Task:
             "candidate_type": "code",
             "language": "cpp",
             "frontier_cs_track": "algorithmic",
-            "objective": "Average Frontier-CS checker score across the smoke subset.",
+            "objective": "Write a C++ program that maximizes the score on the given problem.",
+            "background": statements,
         },
     )
 
