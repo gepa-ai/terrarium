@@ -14,6 +14,12 @@ dependencies = [
 
 [project.optional-dependencies]
 gepa = ["gepa"]
+frontier_cs = [
+    # frontier-cs itself requires Python >= 3.11; gate on that marker so
+    # terrarium's broader 3.10 support isn't blocked at lock time.
+    "frontier-cs @ git+https://github.com/FrontierCS/Frontier-CS ; python_version >= '3.11'",
+    "datasets>=2.14",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

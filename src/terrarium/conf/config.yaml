@@ -1,8 +1,9 @@
 # Default terrarium run configuration.
 #
 # Override from the CLI:
-#   python -m terrarium task=aime_math adapter=gepa max_evals=200
-#   python -m terrarium adapter=claude_code adapter.model=opus
+#   python -m terrarium task=aime_math adapter=gepa budget.max_evals=200
+#   python -m terrarium adapter=claude_code budget.max_token_cost=5.0
+#   python -m terrarium budget.max_evals=200 budget.max_token_cost=10.0
 #   python -m terrarium adapter.engine.max_workers=32
 #   python -m terrarium tracking=wandb tracking.wandb_project=my-proj
 #
@@ -15,8 +16,13 @@ defaults:
   - tracking: none
   - _self_
 
-# Eval budget (total number of eval calls allowed).
-max_evals: 100
+# Budget limits. At least one must be set.
+# max_evals: total number of eval calls allowed.
+# max_token_cost: max USD spend on adapter LLM tokens
+#   (GEPA → max_reflection_cost, Claude Code → --max-budget-usd).
+budget:
+  max_evals: 100
+  max_token_cost: null
 
 # Max parallel evaluations in the server.
 max_concurrency: 8

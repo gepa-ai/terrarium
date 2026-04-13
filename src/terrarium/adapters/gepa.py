@@ -89,15 +89,19 @@ class GEPAAdapter:
         self.background = background
         self.callbacks = callbacks or []
 
-    def evolve(self, task: Task, server: EvalServer, max_evals: int) -> Result:
+    def evolve(self, task: Task, server: EvalServer) -> Result:
         from gepa.optimize_anything import GEPAConfig, optimize_anything
+
+        budget = server.budget
 
         # Runner-controlled engine fields override whatever the user set.
         engine_kwargs: dict[str, Any] = {
             **self.engine,
             "run_dir": self.run_dir,
-            "max_metric_calls": max_evals,
+            "max_metric_calls": budget.max_evals,
         }
+        if budget.max_token_cost is not None:
+            engine_kwargs["max_reflection_cost"] = budget.max_token_cost
 
         # GEPAConfig.__post_init__ converts dict -> nested config dataclass.
         config = GEPAConfig(
