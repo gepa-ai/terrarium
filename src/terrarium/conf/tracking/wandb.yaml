@@ -1,0 +1,11 @@
+# @package tracking
+enabled: true
+use_wandb: true
+wandb_project: terrarium
+wandb_entity: null
+wandb_api_key: null
+wandb_tags: []
+use_mlflow: false
+mlflow_tracking_uri: null
+mlflow_experiment_name: terrarium
+mlflow_run_name: null

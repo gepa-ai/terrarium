@@ -15,6 +15,7 @@ When budget is exhausted, the server returns HTTP 429.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
@@ -151,12 +152,23 @@ class ClaudeCodeAdapter:
         self,
         model: str = "sonnet",
         max_turns: int | None = None,
+        run_dir: str | None = None,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
+        # When set, artifacts (candidate.txt, eval.sh, best_candidate.txt,
+        # plus anything Claude writes) persist under this dir. Otherwise a
+        # tempdir is used and cleaned up on exit. The terrarium runner
+        # injects <hydra_run_dir>/<adapter_name> at run time.
+        self.run_dir = run_dir
 
     def evolve(self, task: Task, server: EvalServer, max_evals: int) -> Result:
-        with tempfile.TemporaryDirectory(prefix="terrarium_cc_") as work_dir:
+        if self.run_dir:
+            work_ctx: Any = contextlib.nullcontext(self.run_dir)
+            Path(self.run_dir).mkdir(parents=True, exist_ok=True)
+        else:
+            work_ctx = tempfile.TemporaryDirectory(prefix="terrarium_cc_")
+        with work_ctx as work_dir:
             work = Path(work_dir)
 
             # Write initial candidate

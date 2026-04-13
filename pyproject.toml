@@ -7,10 +7,16 @@ name = "terrarium"
 version = "0.1.0"
 description = "Common evaluation infrastructure for evolving/auto-research systems."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+]
 
 [project.optional-dependencies]
 gepa = ["gepa"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+terrarium = ["conf/**/*.yaml"]

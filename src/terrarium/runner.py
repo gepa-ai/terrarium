@@ -1,12 +1,32 @@
-"""Main entry point: load a task + adapter, run evolution, report results."""
+"""Terrarium runner: library ``run()`` API + Hydra-managed ``main()`` entry point.
+
+Two ways to drive a run:
+
+1. **Library**::
+
+       from terrarium import run
+       result = run("circle_packing", adapter, max_evals=100)
+
+2. **CLI** (via ``python -m terrarium`` — see ``__main__.py``)::
+
+       python -m terrarium task=aime_math adapter=claude_code max_evals=200
+
+   Hydra composes the config from ``terrarium/conf/`` and calls :func:`main`.
+"""
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import hydra
+from hydra.core.hydra_config import HydraConfig
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
 
 from terrarium.adapter import Adapter, Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
@@ -14,6 +34,8 @@ from terrarium.eval_server import EvalServer
 from terrarium.registry import get_task
 from terrarium.task import Task
 from terrarium.tracking import TerrariumTracker, TrackingConfig
+
+CONFIG_PATH = str(Path(__file__).parent / "conf")
 
 
 def run(
@@ -26,26 +48,24 @@ def run(
 ) -> Result:
     """Run an evolution system on a task.
 
-    This is the main terrarium entry point. It:
-    1. Loads the task and adapter (from name/path or object).
-    2. Creates an EvalServer (the single budget choke point).
-    3. Starts the HTTP endpoint (for external adapters).
-    4. Calls adapter.evolve(task, server, max_evals).
-
-    All adapters — in-process or external — go through the same server.
+    Loads task + adapter, creates the ``EvalServer`` (single budget choke point),
+    starts the HTTP endpoint, and calls ``adapter.evolve(task, server, max_evals)``.
 
     Args:
         task: Task name (e.g. "circle_packing") or a Task object.
-        adapter: Path to an adapter Python file, or an Adapter object.
-            The file must define a ``create_adapter()`` function.
-        max_evals: Maximum number of eval calls allowed.
+        adapter: Path to an adapter .py file (must define ``create_adapter()``)
+            or an Adapter object.
+        max_evals: Maximum eval calls allowed.
+        max_concurrency: Max parallel evaluations in the server.
+        tracking: Optional wandb/mlflow tracking config.
 
     Returns:
-        Result from the evolution run.
+        :class:`Result` with ``best_score``, ``best_candidate``, ``total_evals``,
+        ``eval_log``, and metadata.
 
     Example::
 
-        result = terrarium.run("circle_packing", "my_adapter.py", max_evals=100)
+        result = run("circle_packing", "my_adapter.py", max_evals=100)
         print(result.best_score)
     """
     if isinstance(task, str):
@@ -97,10 +117,11 @@ def run(
     return result
 
 
-def load_adapter(path: str) -> Adapter:
+def load_adapter(path: str, **_: Any) -> Adapter:
     """Load an Adapter from a Python file.
 
-    The file must define ``create_adapter() -> Adapter``.
+    The file must define ``create_adapter() -> Adapter``. Extra kwargs are
+    ignored (Hydra's ``_target_`` may pass internals like ``_partial_``).
     """
     path = str(Path(path).resolve())
     spec = importlib.util.spec_from_file_location("_terrarium_adapter", path)
@@ -116,65 +137,84 @@ def load_adapter(path: str) -> Adapter:
     return mod.create_adapter()
 
 
-def main() -> None:
-    """CLI: ``python -m terrarium <task_name> <adapter_path> [--max-evals N]``."""
-    import argparse
-    import json
+def _build_tracking_config(cfg: DictConfig) -> TrackingConfig | None:
+    if not cfg.get("enabled", False):
+        return None
+    raw = OmegaConf.to_container(cfg, resolve=True)
+    assert isinstance(raw, dict)
+    raw.pop("enabled", None)
+    return TrackingConfig(**raw)  # type: ignore[arg-type]
 
-    parser = argparse.ArgumentParser(
-        prog="terrarium",
-        description="Run an evolution system on a Terrarium task.",
-    )
-    parser.add_argument("task", help="Task name (e.g. circle_packing, aime_math)")
-    parser.add_argument("adapter", help="Path to adapter .py file (must define create_adapter())")
-    parser.add_argument("--max-evals", type=int, default=100, help="Maximum eval budget (default: 100)")
-    parser.add_argument("--output", "-o", help="Write result JSON to this file")
-    parser.add_argument("--wandb", action="store_true", help="Enable wandb tracking")
-    parser.add_argument("--wandb-project", default="terrarium", help="wandb project name (default: terrarium)")
-    parser.add_argument("--wandb-entity", default=None, help="wandb entity/team")
-    parser.add_argument("--mlflow", action="store_true", help="Enable mlflow tracking")
-    parser.add_argument("--mlflow-tracking-uri", default=None, help="mlflow tracking URI")
-    parser.add_argument("--mlflow-experiment", default="terrarium", help="mlflow experiment name (default: terrarium)")
-    parser.add_argument("--mlflow-run-name", default=None, help="mlflow run name")
-    parser.add_argument("--max-concurrency", type=int, default=8, help="Max parallel evaluations (default: 8)")
 
-    args = parser.parse_args()
+@hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
+def main(cfg: DictConfig) -> None:
+    """Hydra entry point — invoked by ``python -m terrarium``.
 
-    tracking_config = None
-    if args.wandb or args.mlflow:
-        tracking_config = TrackingConfig(
-            use_wandb=args.wandb,
-            wandb_project=args.wandb_project,
-            wandb_entity=args.wandb_entity,
-            use_mlflow=args.mlflow,
-            mlflow_tracking_uri=args.mlflow_tracking_uri,
-            mlflow_experiment_name=args.mlflow_experiment,
-            mlflow_run_name=args.mlflow_run_name,
-            wandb_tags=[args.task],
-        )
+    Layout on disk (per run)::
+
+        outputs/terrarium/<task>/<timestamp>/
+          .hydra/                 # composed config, overrides, hydra log
+          summary.json            # task, adapter, scores, eval_log, best_candidate
+          <adapter_name>/         # whatever the adapter writes (GEPA run dir,
+                                  # claude_code work files, etc.)
+    """
+    print(OmegaConf.to_yaml(cfg))
+
+    hydra_cfg = HydraConfig.get()
+    hydra_out = Path(hydra_cfg.runtime.output_dir)
+    # Group name chosen from `defaults: - adapter: <name>` (or CLI override).
+    adapter_name = hydra_cfg.runtime.choices.get("adapter", "adapter")
+    adapter_dir = hydra_out / adapter_name
+
+    adapter = instantiate(cfg.adapter)
+
+    # Inject the per-run artifact dir into the adapter. Any adapter that
+    # persists files can declare a ``run_dir`` attribute and the runner will
+    # set it to <hydra_out>/<adapter_name>/, unless the adapter yaml already
+    # set a non-null value (explicit user override wins).
+    if hasattr(adapter, "run_dir") and not getattr(adapter, "run_dir", None):
+        adapter.run_dir = str(adapter_dir)
+
+    tracking = _build_tracking_config(cfg.tracking) if "tracking" in cfg else None
+
+    # Tag wandb runs with the task name by default.
+    if tracking and not tracking.wandb_tags:
+        tracking.wandb_tags = [cfg.task.name]
 
     result = run(
-        args.task,
-        args.adapter,
-        max_evals=args.max_evals,
-        max_concurrency=args.max_concurrency,
-        tracking=tracking_config,
+        cfg.task.name,
+        adapter,
+        max_evals=cfg.max_evals,
+        max_concurrency=cfg.max_concurrency,
+        tracking=tracking,
     )
 
-    summary = {
-        "task": args.task,
-        "adapter": args.adapter,
+    summary: dict[str, Any] = {
+        "task": cfg.task.name,
+        "adapter": adapter_name,
+        "adapter_target": cfg.adapter.get("_target_", "unknown"),
+        "adapter_dir": str(adapter_dir),
         "best_score": result.best_score,
         "total_evals": result.total_evals,
-        "metadata": result.metadata,
+        "wall_time": result.metadata.get("wall_time"),
+        "budget": result.metadata.get("budget"),
+        "eval_log": result.eval_log,
+        "best_candidate": result.best_candidate,
     }
 
-    print(json.dumps(summary, indent=2, default=str))
+    summary_path = hydra_out / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
-    if args.output:
-        out = {**summary, "best_candidate": result.best_candidate}
-        Path(args.output).write_text(json.dumps(out, indent=2, default=str))
-        print(f"\nFull result written to {args.output}")
+    # Compact stdout summary — drop eval_log/best_candidate which can be large.
+    compact = {k: v for k, v in summary.items() if k not in ("eval_log", "best_candidate")}
+    print(json.dumps(compact, indent=2, default=str))
+    print(f"\nRun artifacts: {hydra_out}")
+    print(f"Summary:       {summary_path}")
+
+    if cfg.get("output"):
+        out_path = Path(cfg.output)
+        out_path.write_text(json.dumps(summary, indent=2, default=str))
+        print(f"Copy at:       {out_path}")
 
 
 if __name__ == "__main__":
