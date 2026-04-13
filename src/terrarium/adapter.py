@@ -19,13 +19,19 @@ class Adapter(Protocol):
     directly. External/black-box adapters point their subprocess at
     ``server.url`` for HTTP-based eval.
 
+    Budget limits are available via ``server.budget`` (a :class:`BudgetTracker`).
+    ``max_evals`` is enforced centrally by the server. ``max_token_cost`` must
+    be enforced by each adapter in its own way (e.g. GEPA via
+    ``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
+
     Example::
 
         class MyEvolver:
-            def evolve(self, task, server, max_evals):
+            def evolve(self, task, server):
+                budget = server.budget
                 candidate = task.initial_candidate
                 best, best_score = candidate, -float("inf")
-                for _ in range(max_evals):
+                while not budget.exhausted:
                     score, info = server.evaluate(candidate)
                     if score > best_score:
                         best_score, best = score, candidate
@@ -37,7 +43,6 @@ class Adapter(Protocol):
         self,
         task: Task,
         server: EvalServer,
-        max_evals: int,
     ) -> Result:
         """Run evolution and return the best candidate found.
 
@@ -45,8 +50,9 @@ class Adapter(Protocol):
             task: Task definition (description, initial_candidate, datasets).
             server: The eval server. Call ``server.evaluate(candidate)`` for
                     in-process eval, or use ``server.url`` for HTTP-based eval.
-                    Raises ``BudgetExhausted`` when the budget is used up.
-            max_evals: Total eval budget (informational — enforced by server).
+                    Raises ``BudgetExhausted`` when the eval budget is used up.
+                    Access ``server.budget`` for budget limits (``max_evals``,
+                    ``max_token_cost``) and status.
 
         Returns:
             Result containing the best candidate and metadata.

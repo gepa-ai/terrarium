@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+
+# Terrarium run artifacts
+outputs/
+
+# IDE
+.idea/
+.vscode/
+*.swp

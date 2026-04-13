@@ -6,10 +6,14 @@ Two ways to drive a run:
 
        from terrarium import run
        result = run("circle_packing", adapter, max_evals=100)
+       result = run("circle_packing", adapter, max_token_cost=5.0)
+       result = run("circle_packing", adapter, max_evals=200, max_token_cost=10.0)
 
 2. **CLI** (via ``python -m terrarium`` — see ``__main__.py``)::
 
-       python -m terrarium task=aime_math adapter=claude_code max_evals=200
+       python -m terrarium task=aime_math adapter=claude_code budget.max_evals=200
+       python -m terrarium adapter=gepa budget.max_token_cost=5.0
+       python -m terrarium budget.max_evals=200 budget.max_token_cost=10.0
 
    Hydra composes the config from ``terrarium/conf/`` and calls :func:`main`.
 """
@@ -42,20 +46,24 @@ def run(
     task: str | Task,
     adapter: str | Adapter,
     *,
-    max_evals: int = 100,
+    max_evals: int | None = 100,
+    max_token_cost: float | None = None,
     max_concurrency: int = 8,
     tracking: TrackingConfig | None = None,
 ) -> Result:
     """Run an evolution system on a task.
 
     Loads task + adapter, creates the ``EvalServer`` (single budget choke point),
-    starts the HTTP endpoint, and calls ``adapter.evolve(task, server, max_evals)``.
+    starts the HTTP endpoint, and calls ``adapter.evolve(task, server)``.
 
     Args:
         task: Task name (e.g. "circle_packing") or a Task object.
         adapter: Path to an adapter .py file (must define ``create_adapter()``)
             or an Adapter object.
-        max_evals: Maximum eval calls allowed.
+        max_evals: Maximum eval calls allowed. ``None`` for unlimited.
+        max_token_cost: Maximum USD spend on adapter LLM tokens. ``None`` for
+            unlimited. Enforcement is adapter-side (GEPA via
+            ``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
         max_concurrency: Max parallel evaluations in the server.
         tracking: Optional wandb/mlflow tracking config.
 
@@ -66,7 +74,8 @@ def run(
     Example::
 
         result = run("circle_packing", "my_adapter.py", max_evals=100)
-        print(result.best_score)
+        result = run("circle_packing", "my_adapter.py", max_token_cost=5.0)
+        result = run("circle_packing", "my_adapter.py", max_evals=200, max_token_cost=10.0)
     """
     if isinstance(task, str):
         task = get_task(task)
@@ -75,12 +84,12 @@ def run(
         adapter = load_adapter(adapter)
 
     tracker = TerrariumTracker(tracking) if tracking else None
-    budget = BudgetTracker(max_evals=max_evals)
+    budget = BudgetTracker(max_evals=max_evals, max_token_cost=max_token_cost)
     server = EvalServer(task, budget, tracker=tracker, max_concurrency=max_concurrency)
     server.start()
 
     if tracker:
-        tracker.start({"task": task.name, "max_evals": max_evals})
+        tracker.start({"task": task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
         # Inject GEPA-level callback for iteration/valset metrics
         from terrarium.adapters.gepa import GEPAAdapter
 
@@ -90,7 +99,7 @@ def run(
     start = time.time()
 
     try:
-        result = adapter.evolve(task, server, max_evals)
+        result = adapter.evolve(task, server)
     except BudgetExhausted:
         result = Result(
             best_candidate=server.best_candidate,
@@ -184,7 +193,8 @@ def main(cfg: DictConfig) -> None:
     result = run(
         cfg.task.name,
         adapter,
-        max_evals=cfg.max_evals,
+        max_evals=cfg.budget.get("max_evals"),
+        max_token_cost=cfg.budget.get("max_token_cost"),
         max_concurrency=cfg.max_concurrency,
         tracking=tracking,
     )

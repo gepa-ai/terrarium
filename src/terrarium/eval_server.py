@@ -169,7 +169,7 @@ class EvalServer:
                 "_budget": self.budget.status(),
             }
 
-        if self.budget.remaining < len(examples):
+        if self.budget.remaining is not None and self.budget.remaining < len(examples):
             raise BudgetExhausted(
                 f"Not enough budget to evaluate all examples: {self.budget.remaining} remaining, {len(examples)} needed"
             )

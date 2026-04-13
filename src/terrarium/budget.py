@@ -3,6 +3,14 @@
 The BudgetTracker lives inside the terrarium process and wraps the real eval
 function. Evolution systems (including external black-box ones) can only evaluate
 through terrarium — they cannot modify the counter.
+
+Two independent limits are supported — ``max_evals`` (number of eval calls) and
+``max_token_cost`` (cumulative USD spent on adapter LLM tokens). At least one
+must be specified.
+
+``max_evals`` is enforced centrally by the BudgetTracker (every eval goes through
+it). ``max_token_cost`` is enforced by each adapter in its own way (GEPA via
+``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
 """
 
 from __future__ import annotations
@@ -23,42 +31,65 @@ class BudgetTracker:
 
     This is NOT exposed to evolution systems. Terrarium wraps the task's
     eval_fn with this tracker, so every call is counted and hard-limited.
+
+    Args:
+        max_evals: Maximum number of evaluation calls allowed. ``None`` means
+            unlimited (token-cost-only mode).
+        max_token_cost: Maximum cumulative USD spent on adapter LLM tokens.
+            ``None`` means unlimited (eval-count-only mode). Enforcement is
+            adapter-side; the tracker holds the config value for propagation.
+
+    Raises:
+        ValueError: If both ``max_evals`` and ``max_token_cost`` are ``None``.
     """
 
-    max_evals: int
+    max_evals: int | None = None
+    max_token_cost: float | None = None
+
     _used: int = field(default=0, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _log: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        if self.max_evals is None and self.max_token_cost is None:
+            raise ValueError("At least one of max_evals or max_token_cost must be specified")
+
     def record(self, score: float) -> None:
-        """Record one eval call. Raises BudgetExhausted if over limit."""
+        """Record one eval call. Raises BudgetExhausted if over eval limit."""
         with self._lock:
-            if self._used >= self.max_evals:
-                raise BudgetExhausted(f"Budget exhausted: {self.max_evals}/{self.max_evals} used")
+            if self.max_evals is not None and self._used >= self.max_evals:
+                raise BudgetExhausted(f"Eval budget exhausted: {self._used}/{self.max_evals} used")
             self._used += 1
             self._log.append({"eval": self._used, "score": score, "time": time.time()})
 
     def check(self) -> None:
-        """Raise BudgetExhausted if budget is used up."""
-        if self._used >= self.max_evals:
-            raise BudgetExhausted(f"Budget exhausted: {self.max_evals}/{self.max_evals} used")
+        """Raise BudgetExhausted if the eval budget is used up."""
+        if self.max_evals is not None and self._used >= self.max_evals:
+            raise BudgetExhausted(f"Eval budget exhausted: {self._used}/{self.max_evals} used")
 
     @property
     def used(self) -> int:
         return self._used
 
     @property
-    def remaining(self) -> int:
+    def remaining(self) -> int | None:
+        """Remaining eval calls, or ``None`` if unlimited."""
+        if self.max_evals is None:
+            return None
         return max(0, self.max_evals - self._used)
 
     @property
     def exhausted(self) -> bool:
-        return self._used >= self.max_evals
+        if self.max_evals is not None and self._used >= self.max_evals:
+            return True
+        return False
 
     def status(self) -> dict[str, Any]:
-        return {
-            "max_evals": self.max_evals,
-            "used": self._used,
-            "remaining": self.remaining,
-            "exhausted": self.exhausted,
-        }
+        result: dict[str, Any] = {"exhausted": self.exhausted}
+        if self.max_evals is not None:
+            result["max_evals"] = self.max_evals
+            result["used"] = self._used
+            result["remaining_evals"] = self.remaining
+        if self.max_token_cost is not None:
+            result["max_token_cost"] = self.max_token_cost
+        return result

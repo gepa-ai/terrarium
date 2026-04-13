@@ -121,8 +121,7 @@ Response fields:
 {dataset_info}
 
 ## Budget
-You have a maximum of {max_evals} individual example evaluations.
-Each example = 1 budget unit. A full train split of N examples costs N units.
+{budget_info}
 If budget runs out mid-evaluation, you get partial results.
 
 ## Strategy Tips
@@ -162,7 +161,9 @@ class ClaudeCodeAdapter:
         # injects <hydra_run_dir>/<adapter_name> at run time.
         self.run_dir = run_dir
 
-    def evolve(self, task: Task, server: EvalServer, max_evals: int) -> Result:
+    def evolve(self, task: Task, server: EvalServer) -> Result:
+        budget = server.budget
+
         if self.run_dir:
             work_ctx: Any = contextlib.nullcontext(self.run_dir)
             Path(self.run_dir).mkdir(parents=True, exist_ok=True)
@@ -199,20 +200,35 @@ class ClaudeCodeAdapter:
             else:
                 dataset_info = "## Task Type\nThis is a single-task problem (no dataset). Each eval call costs 1 budget unit."
 
+            # Build budget info for the system prompt
+            budget_lines: list[str] = []
+            if budget.max_evals is not None:
+                budget_lines.append(
+                    f"You have a maximum of {budget.max_evals} individual example evaluations.\n"
+                    "Each example = 1 budget unit. A full train split of N examples costs N units."
+                )
+            if budget.max_token_cost is not None:
+                budget_lines.append(
+                    f"You have a maximum token budget of ${budget.max_token_cost:.2f} USD "
+                    "(enforced via --max-budget-usd)."
+                )
+            budget_info = "\n".join(budget_lines) if budget_lines else "No explicit budget limits set."
+
             # Build the prompt for Claude Code
             prompt = CLAUDE_CODE_SYSTEM.format(
                 task_description=task.description,
                 candidate_file=str(candidate_file),
                 eval_script=str(eval_script),
-                max_evals=max_evals,
                 best_file=str(best_file),
                 dataset_info=dataset_info,
+                budget_info=budget_info,
             )
 
             # Launch Claude Code
-            cmd = ["claude", "--print", "--model", self.model, "--prompt", prompt]
-            if self.max_turns:
-                cmd.extend(["--max-turns", str(self.max_turns)])
+            cmd = ["claude", "--print", "--model", self.model]
+            if budget.max_token_cost is not None:
+                cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
+            cmd.append(prompt)
 
             env = {**os.environ, "TERRARIUM_WORK_DIR": str(work)}
 
