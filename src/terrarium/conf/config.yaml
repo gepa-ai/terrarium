@@ -1,0 +1,31 @@
+# Default terrarium run configuration.
+#
+# Override from the CLI:
+#   python -m terrarium task=aime_math adapter=gepa max_evals=200
+#   python -m terrarium adapter=claude_code adapter.model=opus
+#   python -m terrarium adapter.engine.max_workers=32
+#   python -m terrarium tracking=wandb tracking.wandb_project=my-proj
+#
+# Or point at a custom adapter file:
+#   python -m terrarium adapter=custom adapter.path=./my_adapter.py
+
+defaults:
+  - task: circle_packing
+  - adapter: gepa
+  - tracking: none
+  - _self_
+
+# Eval budget (total number of eval calls allowed).
+max_evals: 100
+
+# Max parallel evaluations in the server.
+max_concurrency: 8
+
+# If set, write full result JSON (including best_candidate) to this path.
+output: null
+
+hydra:
+  run:
+    dir: outputs/terrarium/${task.name}/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false

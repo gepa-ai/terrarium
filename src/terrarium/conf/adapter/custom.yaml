@@ -1,0 +1,5 @@
+# @package adapter
+# Load an adapter from a Python file that defines `create_adapter()`.
+#   python -m terrarium adapter=custom adapter.path=./my_adapter.py
+_target_: terrarium.runner.load_adapter
+path: ???

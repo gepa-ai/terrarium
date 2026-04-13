@@ -1,0 +1,68 @@
+# @package adapter
+#
+# Full GEPA optimize_anything config. Fields listed here are overridable from
+# the CLI without the `+` prefix:
+#
+#   python -m terrarium adapter.reflection.reflection_lm=openai/gpt-5.1
+#   python -m terrarium adapter.engine.max_workers=32
+#   python -m terrarium adapter.refiner='{max_refinements: 2}'
+#   python -m terrarium adapter.merge='{max_merge_invocations: 10}'
+#
+# For fields not listed, add them with the `+` prefix:
+#
+#   python -m terrarium +adapter.engine.cache_evaluation_storage=disk
+#
+# Structure mirrors gepa.optimize_anything.GEPAConfig. Runner always injects
+# engine.max_metric_calls (= max_evals) and engine.run_dir (= adapter.run_dir).
+
+_target_: terrarium.adapters.gepa.GEPAAdapter
+
+# Where GEPA writes its run artifacts. Left null here — the runner injects
+# <hydra_run_dir>/gepa/ at run time. Override in yaml or CLI to redirect.
+run_dir: null
+
+# EngineConfig — optimization loop, budget, parallelism, caching.
+engine:
+  seed: 0
+  display_progress_bar: false
+  raise_on_exception: true
+  use_cloudpickle: true
+  track_best_outputs: true
+  max_candidate_proposals: null
+  max_reflection_cost: null
+  val_evaluation_policy: full_eval
+  candidate_selection_strategy: pareto        # pareto | current_best | epsilon_greedy | top_k_pareto
+  frontier_type: hybrid
+  acceptance_criterion: strict_improvement    # strict_improvement | improvement_or_equal
+  parallel: true
+  max_workers: 16
+  num_parallel_proposals: 1                   # int or "auto"
+  cache_evaluation: true
+  cache_evaluation_storage: auto
+  best_example_evals_k: 30
+  capture_stdio: false
+
+# ReflectionConfig — how the LLM proposes improved candidates.
+reflection:
+  reflection_lm: openai/gpt-5
+  skip_perfect_score: false
+  perfect_score: null
+  batch_sampler: epoch_shuffled
+  reflection_minibatch_size: null             # null → 1 for single-task, 3 otherwise
+  module_selector: round_robin                # round_robin | all
+  reflection_prompt_template: null            # str or {param_name: str}
+
+# MergeConfig — cross-pollination between Pareto-frontier candidates.
+# null disables merging. Set as a mapping to enable:
+#   adapter.merge='{max_merge_invocations: 10}'
+merge: null
+
+# RefinerConfig — per-evaluation LLM refinement step.
+# null disables. Set as a mapping to enable:
+#   adapter.refiner='{max_refinements: 2}'
+refiner: null
+
+# optimize_anything top-level args (forwarded into the reflection prompt).
+# null falls back to task.metadata["objective"] / ["background"].
+objective: null
+background: null
