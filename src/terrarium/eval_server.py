@@ -234,19 +234,24 @@ class EvalServer:
 
     def log_progress(self, val_score: float, candidate: str | None = None, reflection_cost: float = 0.0) -> dict[str, Any]:
         """Record a progress checkpoint."""
+        # Register candidate outside _lock to avoid _lock → _io_lock nesting.
+        candidate_id: int | None = None
+        if candidate is not None:
+            candidate_id = self._register_candidate(candidate)
+
         with self._lock:
             if val_score > self._best_val_score:
                 self._best_val_score = val_score
             entry: dict[str, Any] = {
                 "val_score": val_score,
                 "best_val_score": self._best_val_score,
-                "train_evals": self.budget.used,
+                "total_evals": self.budget.used,
                 "wall_time": time.time() - self._start_time,
                 "total_cost": self.total_cost,
                 "reflection_cost": reflection_cost,
             }
-            if candidate is not None:
-                entry["candidate_id"] = self._register_candidate(candidate)
+            if candidate_id is not None:
+                entry["candidate_id"] = candidate_id
             self._progress_log.append(entry)
 
         if self._output_dir is not None:
@@ -349,6 +354,7 @@ class EvalServer:
             with self._io_lock:
                 self._append_eval_log(entry)
                 self._write_summary(snapshot)
+
     def _snapshot(self) -> dict[str, Any]:
         """Capture current run state. Must be called inside ``_lock``."""
         return {
@@ -429,6 +435,30 @@ class EvalServer:
                 "errors": info.get("errors", {}),
                 "budget": self.budget.status(),
             })
+
+        except BudgetExhausted:
+            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+
+        except Exception as e:
+            self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
+
+    def _handle_validate(self, handler: BaseHTTPRequestHandler) -> None:
+        content_length = int(handler.headers.get("Content-Length", 0))
+        body = json.loads(handler.rfile.read(content_length)) if content_length else {}
+
+        candidate = body.get("candidate", "")
+
+        if not self.task.val_set:
+            self._send_json(handler, {"error": "Task has no validation set"}, status=400)
+            return
+
+        if self.budget.exhausted:
+            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            return
+
+        try:
+            result = self.validate(candidate)
+            self._send_json(handler, {**result, "budget": self.budget.status()})
 
         except BudgetExhausted:
             self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
