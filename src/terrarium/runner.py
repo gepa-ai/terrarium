@@ -50,6 +50,7 @@ def run(
     max_token_cost: float | None = None,
     max_concurrency: int = 8,
     tracking: TrackingConfig | None = None,
+    output_dir: str | Path | None = None,
 ) -> Result:
     """Run an evolution system on a task.
 
@@ -66,6 +67,8 @@ def run(
             ``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
         max_concurrency: Max parallel evaluations in the server.
         tracking: Optional wandb/mlflow tracking config.
+        output_dir: Directory where incremental log files (``eval_log.jsonl``,
+            ``reflection_cost_log.jsonl``) are written during the run.
 
     Returns:
         :class:`Result` with ``best_score``, ``best_candidate``, ``total_evals``,
@@ -85,7 +88,7 @@ def run(
 
     tracker = TerrariumTracker(tracking) if tracking else None
     budget = BudgetTracker(max_evals=max_evals, max_token_cost=max_token_cost)
-    server = EvalServer(task, budget, tracker=tracker, max_concurrency=max_concurrency)
+    server = EvalServer(task, budget, tracker=tracker, max_concurrency=max_concurrency, output_dir=output_dir)
     server.start()
 
     if tracker:
@@ -114,12 +117,27 @@ def run(
     result.eval_log = server.eval_log
     result.metadata["wall_time"] = time.time() - start
     result.metadata["budget"] = budget.status()
+    result.metadata["total_cost"] = server.total_cost
+    result.metadata["progress_log"] = server.progress_log
+
+    # Evaluate best candidate on held-out test set (outside budget).
+    if isinstance(task, Task) and task.test_set and result.best_candidate:
+        test_scores: dict[str, float] = {}
+        for ex in task.test_set:
+            try:
+                score, _ = task.eval_fn(result.best_candidate, ex)
+                test_scores[ex.id] = score
+            except Exception:
+                test_scores[ex.id] = 0.0
+        result.metadata["test_scores"] = test_scores
+        result.metadata["test_score"] = sum(test_scores.values()) / len(test_scores) if test_scores else 0.0
 
     if tracker:
         tracker.log_summary({
             "best_score": result.best_score,
             "total_evals": result.total_evals,
             "wall_time": result.metadata["wall_time"],
+            "total_cost": server.total_cost,
         })
         tracker.end()
 
@@ -153,6 +171,7 @@ def _build_tracking_config(cfg: DictConfig) -> TrackingConfig | None:
     assert isinstance(raw, dict)
     raw.pop("enabled", None)
     return TrackingConfig(**raw)  # type: ignore[arg-type]
+
 
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
@@ -190,6 +209,17 @@ def main(cfg: DictConfig) -> None:
     if tracking and not tracking.wandb_tags:
         tracking.wandb_tags = [cfg.task.name]
 
+    # Configure task-level solver LM (e.g. for aime_math's dspy evaluator).
+    solver_lm = cfg.task.get('solver_lm')
+    if solver_lm:
+        import dspy
+        lm_kwargs = {}
+        if cfg.task.get('solver_temperature') is not None:
+            lm_kwargs['temperature'] = cfg.task.solver_temperature
+        if cfg.task.get('solver_max_tokens') is not None:
+            lm_kwargs['max_tokens'] = cfg.task.solver_max_tokens
+        dspy.configure(lm=dspy.LM(solver_lm, **lm_kwargs))
+
     result = run(
         cfg.task.name,
         adapter,
@@ -197,6 +227,7 @@ def main(cfg: DictConfig) -> None:
         max_token_cost=cfg.budget.get("max_token_cost"),
         max_concurrency=cfg.max_concurrency,
         tracking=tracking,
+        output_dir=hydra_out,
     )
 
     summary: dict[str, Any] = {
@@ -206,8 +237,13 @@ def main(cfg: DictConfig) -> None:
         "adapter_dir": str(adapter_dir),
         "best_score": result.best_score,
         "total_evals": result.total_evals,
+        "total_cost": result.metadata.get("total_cost", 0.0),
+        "reflection_cost_log": result.metadata.get("reflection_cost_log"),
         "wall_time": result.metadata.get("wall_time"),
         "budget": result.metadata.get("budget"),
+        "test_score": result.metadata.get("test_score"),
+        "test_scores": result.metadata.get("test_scores"),
+        "progress_log": result.metadata.get("progress_log"),
         "eval_log": result.eval_log,
         "best_candidate": result.best_candidate,
     }

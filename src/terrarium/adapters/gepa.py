@@ -18,6 +18,8 @@ runner normally injects = ``<hydra_run_dir>/<adapter_name>``) and
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
@@ -90,9 +92,16 @@ class GEPAAdapter:
         self.callbacks = callbacks or []
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
+        from gepa.lm import LM
         from gepa.optimize_anything import GEPAConfig, optimize_anything
 
         budget = server.budget
+
+        reflection_kwargs = dict(self.reflection)
+        reflection_lm: LM | None = None
+        if "reflection_lm" in reflection_kwargs:
+            reflection_lm = LM(reflection_kwargs["reflection_lm"])
+            reflection_kwargs["reflection_lm"] = reflection_lm
 
         # Runner-controlled engine fields override whatever the user set.
         engine_kwargs: dict[str, Any] = {
@@ -103,13 +112,22 @@ class GEPAAdapter:
         if budget.max_token_cost is not None:
             engine_kwargs["max_reflection_cost"] = budget.max_token_cost
 
+        cost_callback: _ReflectionCostCallback | None = None
+        callbacks = list(self.callbacks)
+        if reflection_lm is not None:
+            cost_callback = _ReflectionCostCallback(reflection_lm, server.tracker, output_dir=self.run_dir)
+            callbacks.append(cost_callback)
+
+        if task.val_set:
+            callbacks.append(_ProgressCallback(server))
+
         # GEPAConfig.__post_init__ converts dict -> nested config dataclass.
         config = GEPAConfig(
             engine=engine_kwargs,
-            reflection=self.reflection,
+            reflection=reflection_kwargs,
             merge=self.merge,
             refiner=self.refiner,
-            callbacks=self.callbacks if self.callbacks else None,
+            callbacks=callbacks or None,
         )
 
         # Bridge: optimize_anything calls this evaluator, which goes through
@@ -144,13 +162,17 @@ class GEPAAdapter:
         except BudgetExhausted:
             gepa_result = None
 
+        reflection_meta: dict[str, Any] = {}
+        if cost_callback is not None:
+            reflection_meta = {"reflection_cost_log": cost_callback.cost_log}
+
         if gepa_result is not None:
             return Result(
                 best_candidate=gepa_result.best_candidate,
                 best_score=gepa_result.val_aggregate_scores[gepa_result.best_idx],
                 total_evals=server.budget.used,
                 eval_log=server.eval_log,
-                metadata={"gepa_result": gepa_result},
+                metadata={"gepa_result": gepa_result, **reflection_meta},
             )
 
         return Result(
@@ -158,7 +180,59 @@ class GEPAAdapter:
             best_score=server.best_score,
             total_evals=server.budget.used,
             eval_log=server.eval_log,
+            metadata=reflection_meta,
         )
+
+
+class _ReflectionCostCallback:
+    """GEPA callback that snapshots reflection LM cost at each iteration."""
+
+    def __init__(self, lm: Any, tracker: Any | None, output_dir: str | Path | None = None) -> None:
+        self._lm = lm
+        self._tracker = tracker
+        self._cost_log: list[dict[str, Any]] = []
+        self._log_path: Path | None = None
+        if output_dir is not None:
+            self._log_path = Path(output_dir) / "reflection_cost_log.jsonl"
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def cost_log(self) -> list[dict[str, Any]]:
+        return list(self._cost_log)
+
+    def on_iteration_end(self, event: dict[str, Any]) -> None:
+        entry = {
+            "iteration": event["iteration"],
+            "reflection_cost": self._lm.total_cost,
+            "reflection_tokens_in": self._lm.total_tokens_in,
+            "reflection_tokens_out": self._lm.total_tokens_out,
+        }
+        self._cost_log.append(entry)
+        if self._log_path is not None:
+            with open(self._log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        if self._tracker is not None:
+            self._tracker.log_metrics(
+                {
+                    "reflection/cost": entry["reflection_cost"],
+                    "reflection/tokens_in": entry["reflection_tokens_in"],
+                    "reflection/tokens_out": entry["reflection_tokens_out"],
+                },
+                step=entry["iteration"],
+            )
+
+
+
+class _ProgressCallback:
+    """GEPA callback that logs val_score to progress_log.jsonl via the server."""
+
+    def __init__(self, server: Any) -> None:
+        self._server = server
+
+    def on_valset_evaluated(self, event: dict[str, Any]) -> None:
+        candidate_dict = event.get("candidate", {})
+        candidate_text = next(iter(candidate_dict.values()), None) if candidate_dict else None
+        self._server.log_progress(event["average_score"], candidate=candidate_text)
 
 
 def create_adapter(**kwargs: Any) -> GEPAAdapter:

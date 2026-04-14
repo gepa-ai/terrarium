@@ -30,8 +30,9 @@ class Task:
         description: What this task optimizes (shown to the evolution system).
         initial_candidate: Seed text to evolve from.
         eval_fn: Scoring function controlled by terrarium.
-        train_set: Optional training examples.
-        test_set: Optional held-out test examples.
+        train_set: Training examples (used for optimization).
+        val_set: Validation examples (used for candidate selection during optimization).
+        test_set: Held-out test examples (evaluated after optimization, never seen during search).
         metadata: Extra context (objective string, background, etc.).
     """
 
@@ -40,9 +41,10 @@ class Task:
     initial_candidate: str
     eval_fn: EvalFn
     train_set: list[Example] | None = None
+    val_set: list[Example] | None = None
     test_set: list[Example] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_dataset(self) -> bool:
-        return self.train_set is not None or self.test_set is not None
+        return self.train_set is not None or self.val_set is not None or self.test_set is not None

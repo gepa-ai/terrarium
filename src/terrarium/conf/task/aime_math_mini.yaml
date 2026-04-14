@@ -1,5 +1,5 @@
 # @package task
-name: aime_math
+name: aime_math_mini
 solver_lm: openai/gpt-4o-mini
 solver_temperature: 1.0
 solver_max_tokens: 8192

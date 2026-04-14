@@ -96,11 +96,11 @@ def _make_task() -> Task:
         initial_candidate=INITIAL_CANDIDATE,
         eval_fn=evaluate,
         train_set=train_set,
+        val_set=val_set,
         test_set=test_set,
         metadata={
             "type": "generalization",
             "candidate_type": "prompt",
-            "val_set": val_set,
             "objective": "Optimize a math-solving prompt that generalizes across AIME problems.",
         },
     )

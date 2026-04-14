@@ -77,14 +77,20 @@ class TerrariumTracker:
         self._tracker.start_run()
         self._tracker.log_config(run_config)
 
-    def log_eval(self, eval_num: int, score: float, best_score: float) -> None:
+    def log_eval(self, eval_num: int, score: float, best_score: float, cost: float = 0.0) -> None:
         """Log a single evaluation step."""
         if not self.active:
             return
-        self._tracker.log_metrics(
-            {"eval/score": score, "eval/best_score": best_score},
-            step=eval_num,
-        )
+        metrics: dict[str, float] = {"eval/score": score, "eval/best_score": best_score}
+        if cost:
+            metrics["eval/cost"] = cost
+        self._tracker.log_metrics(metrics, step=eval_num)
+
+    def log_metrics(self, metrics: dict[str, float], step: int) -> None:
+        """Log arbitrary metrics at a given step."""
+        if not self.active:
+            return
+        self._tracker.log_metrics(metrics, step=step)
 
     def log_summary(self, summary: dict[str, Any]) -> None:
         """Log final run summary."""
