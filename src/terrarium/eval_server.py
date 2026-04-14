@@ -232,7 +232,7 @@ class EvalServer:
 
         return self.log_progress(avg_score, candidate=candidate)
 
-    def log_progress(self, val_score: float, candidate: str | None = None) -> dict[str, Any]:
+    def log_progress(self, val_score: float, candidate: str | None = None, reflection_cost: float = 0.0) -> dict[str, Any]:
         """Record a progress checkpoint."""
         with self._lock:
             if val_score > self._best_val_score:
@@ -243,6 +243,7 @@ class EvalServer:
                 "train_evals": self.budget.used,
                 "wall_time": time.time() - self._start_time,
                 "total_cost": self.total_cost,
+                "reflection_cost": reflection_cost,
             }
             if candidate is not None:
                 entry["candidate_id"] = self._register_candidate(candidate)

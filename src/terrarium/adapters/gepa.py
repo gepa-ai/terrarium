@@ -119,7 +119,7 @@ class GEPAAdapter:
             callbacks.append(cost_callback)
 
         if task.val_set:
-            callbacks.append(_ProgressCallback(server))
+            callbacks.append(_ProgressCallback(server, reflection_lm=reflection_lm))
 
         # GEPAConfig.__post_init__ converts dict -> nested config dataclass.
         config = GEPAConfig(
@@ -226,13 +226,15 @@ class _ReflectionCostCallback:
 class _ProgressCallback:
     """GEPA callback that logs val_score to progress_log.jsonl via the server."""
 
-    def __init__(self, server: Any) -> None:
+    def __init__(self, server: Any, reflection_lm: Any = None) -> None:
         self._server = server
+        self._reflection_lm = reflection_lm
 
     def on_valset_evaluated(self, event: dict[str, Any]) -> None:
         candidate_dict = event.get("candidate", {})
         candidate_text = next(iter(candidate_dict.values()), None) if candidate_dict else None
-        self._server.log_progress(event["average_score"], candidate=candidate_text)
+        reflection_cost = self._reflection_lm.total_cost if self._reflection_lm else 0.0
+        self._server.log_progress(event["average_score"], candidate=candidate_text, reflection_cost=reflection_cost)
 
 
 def create_adapter(**kwargs: Any) -> GEPAAdapter:
