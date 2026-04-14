@@ -172,91 +172,115 @@ Iteratively improve the candidate to maximize the score. When you're done
 """
 
 
+# ── program.md templates ────────────────────────────────────────────────
+
+_PROGRAM_MD = """\
+# Task: {name}
+
+{optional_sections}\
+## Candidate
+Your task is to iteratively improve the candidate in `candidate.txt`.
+The initial candidate ({candidate_len} chars) is provided as a starting point.
+
+{eval_section}
+
+## Budget
+You have **{max_evals}** total evaluation units.
+{budget_details}
+
+## Strategy
+1. Read the training examples to understand the task.
+2. Start with the initial candidate and evaluate it.
+3. Analyze failures — read specific examples that scored 0.
+4. Improve the candidate and spot-check with `--ids`.
+5. Validate periodically to check generalization.
+6. Write your best candidate to `best_candidate.txt`.
+
+## Rules
+- You cannot modify eval.sh, validate.sh, or the server.
+- You cannot see the validation examples.
+- Focus on meaningful improvements each iteration.
+- When budget is exhausted, scripts return BUDGET_EXHAUSTED.
+"""
+
+_EVAL_GENERALIZATION = """\
+## Evaluation
+This is a **generalization** task with {train_size} training examples.
+Training examples are in `train/` as individual JSON files.
+
+### Train evaluation
+```bash
+# Evaluate on all training examples
+./eval.sh candidate.txt
+
+# Evaluate on specific examples
+./eval.sh candidate.txt --ids example_0,example_1,example_2
+```
+Each example costs 1 budget unit. A full train eval costs {train_size} units.
+{val_section}"""
+
+_EVAL_SINGLE = """\
+## Evaluation
+This is a **single-task** optimization.
+```bash
+./eval.sh candidate.txt
+```
+Each eval costs 1 budget unit."""
+
+_VAL_SECTION = """
+### Validation
+There is a hidden validation set ({val_size} examples).
+You cannot see individual val examples or their scores.
+```bash
+./validate.sh candidate.txt
+```
+Returns only the aggregate val_score. Costs {val_size} budget units."""
+
+
 def build_program_md(task: Task, max_evals: int) -> str:
     """Build structured program.md from task metadata.
 
     Mirrors what GEPA receives (objective, background, dataset info)
     but in a format an agent can read and act on.
     """
-    sections = []
-
-    # Header
-    sections.append(f"# Task: {task.name}\n")
-
-    # Objective — same as what GEPA's reflection prompt gets
-    objective = task.metadata.get("objective", "")
-    if objective:
-        sections.append(f"## Objective\n{objective}\n")
-
-    # Background — same as what GEPA's reflection prompt gets
-    background = task.metadata.get("background", "")
-    if background:
-        sections.append(f"## Background\n{background}\n")
-
-    # Description
+    # Optional header sections (objective, background, description)
+    optional = ""
+    for key, heading in [("objective", "Objective"), ("background", "Background")]:
+        value = task.metadata.get(key, "")
+        if value:
+            optional += f"## {heading}\n{value}\n\n"
     if task.description:
-        sections.append(f"## Description\n{task.description}\n")
+        optional += f"## Description\n{task.description}\n\n"
 
-    # Candidate info
-    sections.append("## Candidate")
-    sections.append("Your task is to iteratively improve the candidate in `candidate.txt`.")
-    sections.append(f"The initial candidate ({len(task.initial_candidate)} chars) is provided as a starting point.\n")
-
-    # Evaluation protocol
-    sections.append("## Evaluation")
+    # Evaluation section
     if task.has_dataset and task.train_set:
-        sections.append(f"This is a **generalization** task with {len(task.train_set)} training examples.")
-        sections.append("Training examples are in `train/` as individual JSON files.\n")
-        sections.append("### Train evaluation")
-        sections.append("```bash")
-        sections.append("# Evaluate on all training examples")
-        sections.append("./eval.sh candidate.txt")
-        sections.append("")
-        sections.append("# Evaluate on specific examples")
-        sections.append("./eval.sh candidate.txt --ids example_0,example_1,example_2")
-        sections.append("```")
-        sections.append(f"Each example costs 1 budget unit. A full train eval costs {len(task.train_set)} units.\n")
-
+        train_size = len(task.train_set)
+        val_section = ""
         if task.val_set:
-            sections.append("### Validation")
-            sections.append(f"There is a hidden validation set ({len(task.val_set)} examples).")
-            sections.append("You cannot see individual val examples or their scores.")
-            sections.append("```bash")
-            sections.append("./validate.sh candidate.txt")
-            sections.append("```")
-            sections.append(f"Returns only the aggregate val_score. Costs {len(task.val_set)} budget units.\n")
+            val_section = _VAL_SECTION.format(val_size=len(task.val_set))
+        eval_section = _EVAL_GENERALIZATION.format(
+            train_size=train_size, val_section=val_section,
+        )
     else:
-        sections.append("This is a **single-task** optimization.")
-        sections.append("```bash")
-        sections.append("./eval.sh candidate.txt")
-        sections.append("```")
-        sections.append("Each eval costs 1 budget unit.\n")
+        eval_section = _EVAL_SINGLE
 
-    # Budget
-    sections.append("## Budget")
-    sections.append(f"You have **{max_evals}** total evaluation units.")
+    # Budget details
+    budget_details = ""
     if task.val_set:
-        sections.append(f"- Full train eval = {len(task.train_set)} units")
-        sections.append(f"- Validation = {len(task.val_set)} units")
-        sections.append("- Use train evals to iterate cheaply, validate when confident.\n")
+        budget_details = (
+            f"- Full train eval = {len(task.train_set)} units\n"
+            f"- Validation = {len(task.val_set)} units\n"
+            f"- Use train evals to iterate cheaply, validate when confident."
+        )
 
-    # Strategy
-    sections.append("## Strategy")
-    sections.append("1. Read the training examples to understand the task.")
-    sections.append("2. Start with the initial candidate and evaluate it.")
-    sections.append("3. Analyze failures — read specific examples that scored 0.")
-    sections.append("4. Improve the candidate and spot-check with `--ids`.")
-    sections.append("5. Validate periodically to check generalization.")
-    sections.append("6. Write your best candidate to `best_candidate.txt`.\n")
-
-    # Rules
-    sections.append("## Rules")
-    sections.append("- You cannot modify eval.sh, validate.sh, or the server.")
-    sections.append("- You cannot see the validation examples.")
-    sections.append("- Focus on meaningful improvements each iteration.")
-    sections.append("- When budget is exhausted, scripts return BUDGET_EXHAUSTED.\n")
-
-    return "\n".join(sections)
+    return _PROGRAM_MD.format(
+        name=task.name,
+        optional_sections=optional,
+        candidate_len=len(task.initial_candidate),
+        eval_section=eval_section,
+        max_evals=max_evals,
+        budget_details=budget_details,
+    )
 
 
 def materialize_sandbox(work_dir: Path, task: Task, server_url: str, max_evals: int) -> None:
