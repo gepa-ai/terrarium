@@ -366,6 +366,12 @@ def _run_proposer(
     # Strip CLAUDECODE so a claude-running-claude situation doesn't confuse
     # the CLI (same workaround the reference proposer uses).
     env.pop("CLAUDECODE", None)
+    # Raise the per-response output-token cap. Default 32000 bites on tasks
+    # where the proposer emits long candidate bodies (frontier_cs \u2014 big
+    # C++ files) and aborts the session with "Claude's response exceeded
+    # the 32000 output token maximum". 64k keeps the proposer alive while
+    # still bounded. Honor any user override already set in the environment.
+    env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
 
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"iter{iteration}_stdout.json"
@@ -690,6 +696,7 @@ class MetaHarnessAdapter:
         max_iterations: int | None = None,
         max_candidates_per_iter: int = 3,
         proposer_timeout: int = 2400,
+        stop_at_score: float | None = None,
     ) -> None:
         self.model = model
         self.effort = effort
@@ -697,6 +704,7 @@ class MetaHarnessAdapter:
         self.max_iterations = max_iterations
         self.max_candidates_per_iter = max(1, int(max_candidates_per_iter))
         self.proposer_timeout = int(proposer_timeout)
+        self.stop_at_score = stop_at_score
         self._pending_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     # ---- main entry ----
@@ -944,6 +952,11 @@ class MetaHarnessAdapter:
                     except Exception:
                         pass
 
+                if self.stop_at_score is not None and score >= self.stop_at_score:
+                    _log(f"    {_green('perfect score reached')}: {score:.4f} >= {self.stop_at_score}")
+                    stop_reason = "perfect_score"
+                    break
+
                 # Tracker integration (wandb/mlflow): piggy-back on the
                 # server's tracker so meta-harness iterations appear alongside
                 # other adapters' per-iteration metrics.
@@ -972,7 +985,7 @@ class MetaHarnessAdapter:
                 + (f" {_green('IMPROVED')}" if iter_improved else "")
             )
 
-            if stop_reason == "eval_budget_exhausted":
+            if stop_reason in ("eval_budget_exhausted", "perfect_score"):
                 break
 
         _log(

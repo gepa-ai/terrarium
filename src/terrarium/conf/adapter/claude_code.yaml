@@ -9,3 +9,7 @@ run_dir: null
 # null = CLI default. Set per experiment to match the reflection LM's
 # ``reasoning_effort`` for fair GEPA-vs-CC comparisons.
 effort: null
+# Early-stop threshold. When set, the program.md prompt tells the agent to
+# stop once it reaches this score. The runner threads the top-level
+# ``perfect_score`` here when the user hasn't set it explicitly.
+stop_at_score: null

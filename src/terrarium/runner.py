@@ -170,6 +170,18 @@ def load_adapter(path: str, **_: Any) -> Adapter:
     return mod.create_adapter()
 
 
+def _apply_perfect_score(adapter: Any, perfect_score: float | None) -> None:
+    """Thread the top-level ``perfect_score`` into adapters that support early stopping.
+
+    Sets ``adapter.stop_at_score`` when the adapter declares it and hasn't
+    already been given a non-null value (user overrides win).
+    """
+    if perfect_score is None:
+        return
+    if hasattr(adapter, "stop_at_score") and getattr(adapter, "stop_at_score", None) is None:
+        adapter.stop_at_score = float(perfect_score)
+
+
 def _apply_effort(adapter: Any, effort: str | None) -> None:
     """Thread the top-level ``effort`` into whichever adapter knob exists.
 
@@ -230,6 +242,7 @@ def main(cfg: DictConfig) -> None:
     # ``reflection_lm_kwargs`` (a dict of litellm kwargs — gepa). Adapter-level
     # overrides already set by the user win (we never clobber).
     _apply_effort(adapter, cfg.get("effort"))
+    _apply_perfect_score(adapter, cfg.get("perfect_score"))
 
     tracking = _build_tracking_config(cfg.tracking) if "tracking" in cfg else None
 

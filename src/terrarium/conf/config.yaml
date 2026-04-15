@@ -38,6 +38,15 @@ max_concurrency: 8
 # win over this top-level default.
 effort: null
 
+# Early-stop threshold shared across adapters. When set, adapters terminate
+# once the best score reaches/exceeds this value:
+#   - GEPAAdapter: sets ``stop_at_score`` (callback raises BudgetExhausted)
+#   - MetaHarnessAdapter: sets ``stop_at_score`` (checked after each benchmark)
+#   - ClaudeCodeAdapter: already sees it in the task prompt.
+# Adapter-level overrides (``adapter.stop_at_score=...``) win.
+#   python -m terrarium perfect_score=100
+perfect_score: null
+
 # If set, write full result JSON (including best_candidate) to this path.
 output: null
 

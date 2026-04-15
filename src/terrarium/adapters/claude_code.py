@@ -232,6 +232,16 @@ def _strategy_section(task: Task) -> str:
     )
 
 
+def _perfect_score_section(perfect_score: float | None) -> str:
+    if perfect_score is None:
+        return ""
+    return (
+        f"\n## Perfect Score\n"
+        f"The maximum achievable score is **{perfect_score}**. "
+        f"Once you reach this score, stop iterating — further improvements are impossible.\n"
+    )
+
+
 def _rules_section(task: Task, budget: BudgetTracker) -> str:
     scripts = "eval.sh, validate.sh" if task.val_set else "eval.sh"
     val_rule = "\n- You cannot see the validation examples." if task.val_set else ""
@@ -245,7 +255,7 @@ def _rules_section(task: Task, budget: BudgetTracker) -> str:
     )
 
 
-def build_program_md(task: Task, budget: BudgetTracker) -> str:
+def build_program_md(task: Task, budget: BudgetTracker, *, perfect_score: float | None = None) -> str:
     """Build structured program.md from task metadata.
 
     Mirrors what GEPA receives (``task.objective``, ``task.background``,
@@ -280,18 +290,27 @@ def build_program_md(task: Task, budget: BudgetTracker) -> str:
         cost_line = "\nEach eval costs 1 budget unit." if has_eval_budget else ""
         eval_section = _EVAL_SINGLE.format(cost_line=cost_line)
 
+    perfect_score_md = _perfect_score_section(perfect_score)
+
     return _PROGRAM_MD.format(
         name=task.name,
         optional_sections=optional,
         candidate_len=len(task.initial_candidate),
         eval_section=eval_section,
-        budget_section=_budget_section(budget),
+        budget_section=_budget_section(budget) + perfect_score_md,
         strategy_section=_strategy_section(task),
         rules_section=_rules_section(task, budget),
     )
 
 
-def materialize_sandbox(work_dir: Path, task: Task, server_url: str, budget: BudgetTracker) -> None:
+def materialize_sandbox(
+    work_dir: Path,
+    task: Task,
+    server_url: str,
+    budget: BudgetTracker,
+    *,
+    perfect_score: float | None = None,
+) -> None:
     """Set up the agent's sandbox workspace.
 
     Creates:
@@ -306,7 +325,7 @@ def materialize_sandbox(work_dir: Path, task: Task, server_url: str, budget: Bud
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # program.md — structured instructions
-    (work_dir / "program.md").write_text(build_program_md(task, budget))
+    (work_dir / "program.md").write_text(build_program_md(task, budget, perfect_score=perfect_score))
 
     # Candidate files
     (work_dir / "candidate.txt").write_text(task.initial_candidate)
@@ -354,9 +373,11 @@ class ClaudeCodeAdapter:
         max_turns: int | None = None,
         run_dir: str | None = None,
         effort: str | None = None,
+        stop_at_score: float | None = None,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
+        self.stop_at_score = stop_at_score
         # When set, artifacts (candidate.txt, eval.sh, best_candidate.txt,
         # plus anything Claude writes) persist under this dir. Otherwise a
         # tempdir is used and cleaned up on exit. The terrarium runner
@@ -382,7 +403,7 @@ class ClaudeCodeAdapter:
             work_dir = Path(self._pending_tempdir.name)
 
         # Set up the sandbox workspace
-        materialize_sandbox(work_dir, task, server.url, budget)
+        materialize_sandbox(work_dir, task, server.url, budget, perfect_score=self.stop_at_score)
 
         candidate_file = work_dir / "candidate.txt"
         best_file = work_dir / "best_candidate.txt"
