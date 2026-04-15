@@ -1,0 +1,8 @@
+# @package task
+# GSO performance optimization smoke subset — 3 pydantic instances.
+# Use this to validate the adapter → Docker → eval pipeline end-to-end
+# before targeting a single instance or the full subset.
+#
+# For a specific instance, override the name directly:
+#   python -m terrarium task.name=gso_numpy__numpy-ee75c87 adapter=gepa
+name: gso_smoke
