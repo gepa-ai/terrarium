@@ -22,6 +22,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import json
+
 from terrarium.adapter import Result
 from terrarium.task import Task
 
@@ -69,6 +71,35 @@ else
 fi
 
 RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/evaluate_examples" \\
+    -H "Content-Type: application/json" \\
+    -d "$BODY")
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | head -n -1)
+
+echo "$BODY"
+
+if [ "$HTTP_CODE" = "429" ]; then
+    echo "BUDGET_EXHAUSTED" >&2
+    exit 1
+fi
+"""
+
+VALIDATE_SCRIPT = """\
+#!/usr/bin/env bash
+# Usage: ./validate.sh <candidate_file>
+# Evaluates the candidate on the held-out validation set.
+# Returns aggregate val_score only (individual scores hidden).
+# Exit code 1 if budget exhausted.
+set -euo pipefail
+
+CANDIDATE_FILE="$1"
+SERVER_URL="{server_url}"
+
+CANDIDATE=$(cat "$CANDIDATE_FILE")
+BODY=$(jq -n --arg c "$CANDIDATE" '{{candidate: $c}}')
+
+RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/validate" \\
     -H "Content-Type: application/json" \\
     -d "$BODY")
 
@@ -141,6 +172,161 @@ Iteratively improve the candidate to maximize the score. When you're done
 """
 
 
+# ── program.md templates ────────────────────────────────────────────────
+
+_PROGRAM_MD = """\
+# Task: {name}
+
+{optional_sections}\
+## Candidate
+Your task is to iteratively improve the candidate in `candidate.txt`.
+The initial candidate ({candidate_len} chars) is provided as a starting point.
+
+{eval_section}
+
+## Budget
+You have **{max_evals}** total evaluation units.
+{budget_details}
+
+## Strategy
+1. Read the training examples to understand the task.
+2. Start with the initial candidate and evaluate it.
+3. Analyze failures — read specific examples that scored 0.
+4. Improve the candidate and spot-check with `--ids`.
+5. Validate periodically to check generalization.
+6. Write your best candidate to `best_candidate.txt`.
+
+## Rules
+- You cannot modify eval.sh, validate.sh, or the server.
+- You cannot see the validation examples.
+- Focus on meaningful improvements each iteration.
+- When budget is exhausted, scripts return BUDGET_EXHAUSTED.
+"""
+
+_EVAL_GENERALIZATION = """\
+## Evaluation
+This is a **generalization** task with {train_size} training examples.
+Training examples are in `train/` as individual JSON files.
+
+### Train evaluation
+```bash
+# Evaluate on all training examples
+./eval.sh candidate.txt
+
+# Evaluate on specific examples
+./eval.sh candidate.txt --ids example_0,example_1,example_2
+```
+Each example costs 1 budget unit. A full train eval costs {train_size} units.
+{val_section}"""
+
+_EVAL_SINGLE = """\
+## Evaluation
+This is a **single-task** optimization.
+```bash
+./eval.sh candidate.txt
+```
+Each eval costs 1 budget unit."""
+
+_VAL_SECTION = """
+### Validation
+There is a hidden validation set ({val_size} examples).
+You cannot see individual val examples or their scores.
+```bash
+./validate.sh candidate.txt
+```
+Returns only the aggregate val_score. Costs {val_size} budget units."""
+
+
+def build_program_md(task: Task, max_evals: int) -> str:
+    """Build structured program.md from task metadata.
+
+    Mirrors what GEPA receives (objective, background, dataset info)
+    but in a format an agent can read and act on.
+    """
+    # Optional header sections (objective, background, description)
+    optional = ""
+    for key, heading in [("objective", "Objective"), ("background", "Background")]:
+        value = task.metadata.get(key, "")
+        if value:
+            optional += f"## {heading}\n{value}\n\n"
+    if task.description:
+        optional += f"## Description\n{task.description}\n\n"
+
+    # Evaluation section
+    if task.has_dataset and task.train_set:
+        train_size = len(task.train_set)
+        val_section = ""
+        if task.val_set:
+            val_section = _VAL_SECTION.format(val_size=len(task.val_set))
+        eval_section = _EVAL_GENERALIZATION.format(
+            train_size=train_size, val_section=val_section,
+        )
+    else:
+        eval_section = _EVAL_SINGLE
+
+    # Budget details
+    budget_details = ""
+    if task.val_set:
+        budget_details = (
+            f"- Full train eval = {len(task.train_set)} units\n"
+            f"- Validation = {len(task.val_set)} units\n"
+            f"- Use train evals to iterate cheaply, validate when confident."
+        )
+
+    return _PROGRAM_MD.format(
+        name=task.name,
+        optional_sections=optional,
+        candidate_len=len(task.initial_candidate),
+        eval_section=eval_section,
+        max_evals=max_evals,
+        budget_details=budget_details,
+    )
+
+
+def materialize_sandbox(work_dir: Path, task: Task, server_url: str, max_evals: int) -> None:
+    """Set up the agent's sandbox workspace.
+
+    Creates:
+        work_dir/
+            program.md          — structured task instructions
+            candidate.txt       — initial candidate
+            best_candidate.txt  — agent writes best here
+            eval.sh             — train evaluation script
+            validate.sh         — val evaluation script (generalization only)
+            train/              — materialized training examples (generalization only)
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # program.md — structured instructions
+    (work_dir / "program.md").write_text(build_program_md(task, max_evals))
+
+    # Candidate files
+    (work_dir / "candidate.txt").write_text(task.initial_candidate)
+    (work_dir / "best_candidate.txt").write_text(task.initial_candidate)
+
+    # eval.sh
+    eval_script = work_dir / "eval.sh"
+    eval_script.write_text(EVAL_SCRIPT.format(server_url=server_url))
+    eval_script.chmod(0o755)
+
+    # validate.sh (generalization mode only)
+    if task.val_set:
+        validate_script = work_dir / "validate.sh"
+        validate_script.write_text(VALIDATE_SCRIPT.format(server_url=server_url))
+        validate_script.chmod(0o755)
+
+    # Materialize train examples
+    if task.train_set:
+        train_dir = work_dir / "train"
+        train_dir.mkdir(exist_ok=True)
+        for ex in task.train_set:
+            data = {"id": ex.id, "inputs": ex.inputs}
+            if ex.expected is not None:
+                data["expected"] = ex.expected
+            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+
+
+
 class ClaudeCodeAdapter:
     """Adapter that runs Claude Code as a black-box evolution subprocess.
 
@@ -172,57 +358,23 @@ class ClaudeCodeAdapter:
         with work_ctx as work_dir:
             work = Path(work_dir)
 
-            # Write initial candidate
+            # Set up the sandbox workspace
+            materialize_sandbox(work, task, server.url, budget.max_evals or 0)
+
             candidate_file = work / "candidate.txt"
-            candidate_file.write_text(task.initial_candidate)
-
             best_file = work / "best_candidate.txt"
-            best_file.write_text(task.initial_candidate)
-
-            # Write eval script
             eval_script = work / "eval.sh"
-            eval_script.write_text(EVAL_SCRIPT.format(server_url=server.url))
-            eval_script.chmod(0o755)
 
-            # Build dataset info section for the prompt
-            if task.has_dataset:
-                example_ids = []
-                if task.train_set:
-                    example_ids = [ex.id for ex in task.train_set]
-                lines = [f"## Dataset\nThis is a dataset task with {len(example_ids)} training examples."]
-                if example_ids:
-                    lines.append(f"Example IDs: {', '.join(example_ids[:20])}")
-                    if len(example_ids) > 20:
-                        lines.append(f"... and {len(example_ids) - 20} more.")
-                if task.test_set:
-                    lines.append(f"Test set: {len(task.test_set)} examples (use split='test' to evaluate).")
-                dataset_info = "\n".join(lines)
-            else:
-                dataset_info = "## Task Type\nThis is a single-task problem (no dataset). Each eval call costs 1 budget unit."
-
-            # Build budget info for the system prompt
-            budget_lines: list[str] = []
-            if budget.max_evals is not None:
-                budget_lines.append(
-                    f"You have a maximum of {budget.max_evals} individual example evaluations.\n"
-                    "Each example = 1 budget unit. A full train split of N examples costs N units."
-                )
-            if budget.max_token_cost is not None:
-                budget_lines.append(
-                    f"You have a maximum token budget of ${budget.max_token_cost:.2f} USD "
-                    "(enforced via --max-budget-usd)."
-                )
-            budget_info = "\n".join(budget_lines) if budget_lines else "No explicit budget limits set."
-
-            # Build the prompt for Claude Code
-            prompt = CLAUDE_CODE_SYSTEM.format(
-                task_description=task.description,
-                candidate_file=str(candidate_file),
-                eval_script=str(eval_script),
-                best_file=str(best_file),
-                dataset_info=dataset_info,
-                budget_info=budget_info,
+            # Build the prompt — point at program.md for full context
+            prompt = (
+                f"Read program.md for full task instructions. "
+                f"The candidate to improve is in {candidate_file}. "
+                f"Write your best candidate to {best_file}. "
+                f"Use {eval_script} to evaluate."
+            
             )
+            if task.val_set:
+                prompt += f" Use {work / 'validate.sh'} to check validation score."
 
             # Launch Claude Code
             cmd = ["claude", "--print", "--model", self.model]

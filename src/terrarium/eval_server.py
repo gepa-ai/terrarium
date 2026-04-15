@@ -25,7 +25,7 @@ POST /evaluate_examples
     Status 429 when budget is insufficient to evaluate all requested examples.
 
 GET /status
-    Response: {"budget": {...}, "task": "<name>", "best_score": 1.23}
+    Response: {"budget": {...}, "task": "<name>", "best_score": 1.23, "total_evals": 5, "total_cost": 0.42}
 
 GET /task
     Response: {"name": "...", "description": "...", "initial_candidate": "...", ...}
@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 from terrarium.budget import BudgetExhausted, BudgetTracker
@@ -68,6 +70,7 @@ class EvalServer:
         budget: BudgetTracker,
         tracker: TerrariumTracker | None = None,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        output_dir: str | Path | None = None,
     ) -> None:
         self.task = task
         self.budget = budget
@@ -75,13 +78,24 @@ class EvalServer:
         self.max_concurrency = max_concurrency
         self.best_score: float = float("-inf")
         self.best_candidate: str = task.initial_candidate
+        self.total_cost: float = 0.0
         self.eval_log: list[dict[str, Any]] = []
+        self._start_time: float = time.time()
+        self._best_val_score: float = float("-inf")
+        self._progress_log: list[dict[str, Any]] = []
+        self._candidate_registry: dict[str, int] = {}
+        self._next_candidate_id: int = 0
         self._lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._output_dir: Path | None = None
+        if output_dir is not None:
+            self._output_dir = Path(output_dir)
+            self._output_dir.mkdir(parents=True, exist_ok=True)
         self._eval_semaphore = threading.Semaphore(max_concurrency)
 
         # Build example lookup for dataset tasks
         self._examples: dict[str, Example] = {}
-        for dataset in [task.train_set, task.test_set]:
+        for dataset in [task.train_set, task.val_set, task.test_set]:
             if dataset:
                 for ex in dataset:
                     self._examples[ex.id] = ex
@@ -111,7 +125,7 @@ class EvalServer:
                 score, info = self.task.eval_fn(candidate)
 
             self.budget.record(score)
-            self._track(candidate, score)
+            self._track(candidate, score, info)
 
             info["_budget"] = self.budget.status()
             return score, info
@@ -153,6 +167,8 @@ class EvalServer:
         elif split is not None:
             if split in ("train", "all") and self.task.train_set:
                 examples.extend(self.task.train_set)
+            if split in ("val", "all") and self.task.val_set:
+                examples.extend(self.task.val_set)
             if split in ("test", "all") and self.task.test_set:
                 examples.extend(self.task.test_set)
         else:
@@ -205,6 +221,63 @@ class EvalServer:
 
         return avg, info
 
+
+    def validate(self, candidate: str) -> dict[str, Any]:
+        """Evaluate candidate on the full hidden val_set, return aggregate score only."""
+        if not self.task.val_set:
+            raise ValueError("validate() requires a task with val_set")
+
+        val_ids = [ex.id for ex in self.task.val_set]
+        avg_score, _ = self.evaluate_examples(candidate, example_ids=val_ids)
+
+        return self.log_progress(avg_score, candidate=candidate)
+
+    def log_progress(self, val_score: float, candidate: str | None = None, reflection_cost: float = 0.0) -> dict[str, Any]:
+        """Record a progress checkpoint."""
+        # Register candidate outside _lock to avoid _lock → _io_lock nesting.
+        candidate_id: int | None = None
+        if candidate is not None:
+            candidate_id = self._register_candidate(candidate)
+
+        with self._lock:
+            if val_score > self._best_val_score:
+                self._best_val_score = val_score
+            entry: dict[str, Any] = {
+                "val_score": val_score,
+                "best_val_score": self._best_val_score,
+                "total_evals": self.budget.used,
+                "wall_time": time.time() - self._start_time,
+                "total_cost": self.total_cost,
+                "reflection_cost": reflection_cost,
+            }
+            if candidate_id is not None:
+                entry["candidate_id"] = candidate_id
+            self._progress_log.append(entry)
+
+        if self._output_dir is not None:
+            with self._io_lock:
+                self._append_progress_log(entry)
+
+        return {"val_score": val_score, "best_val_score": self._best_val_score}
+
+    def _register_candidate(self, candidate: str) -> int:
+        """Return a stable integer ID for a candidate, registering it if new."""
+        if candidate in self._candidate_registry:
+            return self._candidate_registry[candidate]
+        cid = self._next_candidate_id
+        self._next_candidate_id += 1
+        self._candidate_registry[candidate] = cid
+        if self._output_dir is not None:
+            with self._io_lock:
+                with open(self._output_dir / "candidates.jsonl", "a") as f:
+                    f.write(json.dumps({"candidate_id": cid, "candidate": candidate}) + "\n")
+        return cid
+
+    @property
+    def progress_log(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._progress_log)
+
     # ── HTTP server (used by external/black-box adapters) ───────────────
 
     @property
@@ -227,6 +300,8 @@ class EvalServer:
                     server_ref._handle_evaluate(self)
                 elif self.path == "/evaluate_examples":
                     server_ref._handle_evaluate_examples(self)
+                elif self.path == "/validate":
+                    server_ref._handle_validate(self)
                 else:
                     self.send_error(404)
 
@@ -254,14 +329,64 @@ class EvalServer:
 
     # ── Internal ────────────────────────────────────────────────────────
 
-    def _track(self, candidate: str, score: float) -> None:
+    def _track(self, candidate: str, score: float, info: dict[str, Any] | None = None) -> None:
+        cost = float(info.get("cost", 0.0)) if info else 0.0
         with self._lock:
-            self.eval_log.append({"eval": self.budget.used, "score": score, "candidate_len": len(candidate)})
+            self.total_cost += cost
+            entry: dict[str, Any] = {
+                "eval": self.budget.used,
+                "score": score,
+                "candidate_len": len(candidate),
+                "wall_time": time.time() - self._start_time,
+                "cumulative_cost": self.total_cost,
+            }
+            if cost:
+                entry["cost"] = cost
+            self.eval_log.append(entry)
             if score > self.best_score:
                 self.best_score = score
                 self.best_candidate = candidate
             if self.tracker:
-                self.tracker.log_eval(self.budget.used, score, self.best_score)
+                self.tracker.log_eval(self.budget.used, score, self.best_score, cost)
+            snapshot = self._snapshot()
+
+        if self._output_dir is not None:
+            with self._io_lock:
+                self._append_eval_log(entry)
+                self._write_summary(snapshot)
+
+    def _snapshot(self) -> dict[str, Any]:
+        """Capture current run state. Must be called inside ``_lock``."""
+        return {
+            "best_score": self.best_score,
+            "total_evals": self.budget.used,
+            "total_cost": self.total_cost,
+            "budget": self.budget.status(),
+        }
+
+    def _append_eval_log(self, entry: dict[str, Any]) -> None:
+        assert self._output_dir is not None
+        with open(self._output_dir / "eval_log.jsonl", "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+    def _append_progress_log(self, entry: dict[str, Any]) -> None:
+        assert self._output_dir is not None
+        with open(self._output_dir / "progress_log.jsonl", "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def _write_summary(self, snapshot: dict[str, Any]) -> None:
+        """Atomically write a lightweight progress snapshot to summary.json.
+
+        Does NOT include eval_log (already in eval_log.jsonl) or
+        best_candidate (can be large).  The runner writes the complete
+        summary at the end.
+        """
+        assert self._output_dir is not None
+        summary_path = self._output_dir / "summary.json"
+        tmp = summary_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2, default=str))
+        tmp.replace(summary_path)
 
     def _handle_evaluate(self, handler: BaseHTTPRequestHandler) -> None:
         content_length = int(handler.headers.get("Content-Length", 0))
@@ -317,12 +442,37 @@ class EvalServer:
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
 
+    def _handle_validate(self, handler: BaseHTTPRequestHandler) -> None:
+        content_length = int(handler.headers.get("Content-Length", 0))
+        body = json.loads(handler.rfile.read(content_length)) if content_length else {}
+
+        candidate = body.get("candidate", "")
+
+        if not self.task.val_set:
+            self._send_json(handler, {"error": "Task has no validation set"}, status=400)
+            return
+
+        if self.budget.exhausted:
+            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            return
+
+        try:
+            result = self.validate(candidate)
+            self._send_json(handler, {**result, "budget": self.budget.status()})
+
+        except BudgetExhausted:
+            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+
+        except Exception as e:
+            self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
+
     def _handle_status(self, handler: BaseHTTPRequestHandler) -> None:
         self._send_json(handler, {
             "budget": self.budget.status(),
             "task": self.task.name,
             "best_score": self.best_score,
             "total_evals": self.budget.used,
+            "total_cost": self.total_cost,
         })
 
     def _handle_task_info(self, handler: BaseHTTPRequestHandler) -> None:
@@ -332,6 +482,7 @@ class EvalServer:
             "initial_candidate": self.task.initial_candidate,
             "has_dataset": self.task.has_dataset,
             "train_size": len(self.task.train_set) if self.task.train_set else 0,
+            "val_size": len(self.task.val_set) if self.task.val_set else 0,
             "test_size": len(self.task.test_set) if self.task.test_set else 0,
             "metadata": {k: v for k, v in self.task.metadata.items() if isinstance(v, (str, int, float, bool))},
         })

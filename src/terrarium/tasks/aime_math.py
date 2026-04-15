@@ -53,7 +53,11 @@ def _load_dataset() -> tuple[list[Example], list[Example], list[Example]]:
 
 
 def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
-    """Evaluate a prompt on a single AIME math example."""
+    """Evaluate a prompt on a single AIME math example.
+
+    Uses richer feedback including the full solution when available,
+    matching the working examples/aime_math setup.
+    """
     import dspy
 
     class MathSolverSignature(dspy.Signature):
@@ -65,25 +69,43 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
     prediction = predictor(input=example.inputs["input"])
 
     correct_answer = int(example.expected)
+    written_solution = example.inputs.get("solution", "")
+    solution_suffix = (
+        f" Here\'s the full step-by-step solution:\n{written_solution}\n\n"
+        "Think about what takeaways you can learn from this solution to improve "
+        "your future answers and approach to similar problems"
+        if written_solution
+        else ""
+    )
+
     try:
         llm_answer = int(prediction.answer)
     except (ValueError, TypeError):
+        feedback = (
+            f"The final answer must be a valid integer and nothing else. "
+            f"You responded with \'{prediction.answer}\', which couldn\'t be parsed as a python integer. "
+            f"Please ensure your answer is a valid integer without any additional text or formatting. "
+            f"The correct answer is \'{correct_answer}\'.{solution_suffix}"
+            f"{' and ensure your final answer is a valid integer.' if written_solution else ''}"
+        )
         return 0.0, {
             "score": 0.0,
             "input": example.inputs["input"],
             "prompt": candidate,
             "output": prediction.answer,
-            "feedback": f"Could not parse '{prediction.answer}' as integer. Correct: {correct_answer}.",
+            "feedback": feedback,
         }
 
     score = float(correct_answer == llm_answer)
+    status = "correct" if score == 1.0 else "incorrect"
+    feedback = f"Your answer is {status}. The correct answer is \'{correct_answer}\'.{solution_suffix}"
     return score, {
         "score": score,
         "input": example.inputs["input"],
         "prompt": candidate,
         "output": prediction.answer,
         "reasoning": getattr(prediction, "reasoning", ""),
-        "feedback": f"{'Correct' if score else 'Incorrect'}. Expected: {correct_answer}.",
+        "feedback": feedback,
     }
 
 
@@ -96,11 +118,11 @@ def _make_task() -> Task:
         initial_candidate=INITIAL_CANDIDATE,
         eval_fn=evaluate,
         train_set=train_set,
+        val_set=val_set,
         test_set=test_set,
         metadata={
             "type": "generalization",
             "candidate_type": "prompt",
-            "val_set": val_set,
             "objective": "Optimize a math-solving prompt that generalizes across AIME problems.",
         },
     )
