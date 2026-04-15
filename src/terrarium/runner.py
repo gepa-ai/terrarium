@@ -67,8 +67,9 @@ def run(
             ``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
         max_concurrency: Max parallel evaluations in the server.
         tracking: Optional wandb/mlflow tracking config.
-        output_dir: Directory where incremental log files (``eval_log.jsonl``,
-            ``reflection_cost_log.jsonl``) are written during the run.
+        output_dir: Directory where incremental log files (``evals/<i>.json``,
+            ``summary.json``, ``reflection_cost_log.jsonl``) are written during
+            the run.
 
     Returns:
         :class:`Result` with ``best_score``, ``best_candidate``, ``total_evals``,

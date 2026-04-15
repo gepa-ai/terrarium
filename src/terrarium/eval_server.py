@@ -62,6 +62,9 @@ class EvalServer:
         max_concurrency: Maximum number of parallel evaluations.
             Controls the thread pool size for batch/parallel eval methods.
             Defaults to 8.
+        output_dir: If set, each eval is persisted as ``<dir>/evals/<i>.json``
+            (0-indexed) with full score/info/candidate for later analysis,
+            alongside a progress ``summary.json``.
     """
 
     def __init__(
@@ -88,9 +91,12 @@ class EvalServer:
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
         self._output_dir: Path | None = None
+        self._evals_dir: Path | None = None
         if output_dir is not None:
             self._output_dir = Path(output_dir)
             self._output_dir.mkdir(parents=True, exist_ok=True)
+            self._evals_dir = self._output_dir / "evals"
+            self._evals_dir.mkdir(exist_ok=True)
         self._eval_semaphore = threading.Semaphore(max_concurrency)
 
         # Build example lookup for dataset tasks
@@ -333,6 +339,7 @@ class EvalServer:
         cost = float(info.get("cost", 0.0)) if info else 0.0
         with self._lock:
             self.total_cost += cost
+            idx = len(self.eval_log)  # 0-indexed file name for per-eval JSON
             entry: dict[str, Any] = {
                 "eval": self.budget.used,
                 "score": score,
@@ -352,8 +359,8 @@ class EvalServer:
 
         if self._output_dir is not None:
             with self._io_lock:
-                self._append_eval_log(entry)
                 self._write_summary(snapshot)
+                self._write_eval_record(idx, entry, candidate, info)
 
     def _snapshot(self) -> dict[str, Any]:
         """Capture current run state. Must be called inside ``_lock``."""
@@ -364,12 +371,6 @@ class EvalServer:
             "budget": self.budget.status(),
         }
 
-    def _append_eval_log(self, entry: dict[str, Any]) -> None:
-        assert self._output_dir is not None
-        with open(self._output_dir / "eval_log.jsonl", "a") as f:
-            f.write(json.dumps(entry) + "\n")
-
-
     def _append_progress_log(self, entry: dict[str, Any]) -> None:
         assert self._output_dir is not None
         with open(self._output_dir / "progress_log.jsonl", "a") as f:
@@ -378,7 +379,7 @@ class EvalServer:
     def _write_summary(self, snapshot: dict[str, Any]) -> None:
         """Atomically write a lightweight progress snapshot to summary.json.
 
-        Does NOT include eval_log (already in eval_log.jsonl) or
+        Does NOT include eval_log (already in ``evals/<i>.json``) or
         best_candidate (can be large).  The runner writes the complete
         summary at the end.
         """
@@ -387,6 +388,27 @@ class EvalServer:
         tmp = summary_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(snapshot, indent=2, default=str))
         tmp.replace(summary_path)
+
+    def _write_eval_record(
+        self,
+        idx: int,
+        entry: dict[str, Any],
+        candidate: str,
+        info: dict[str, Any] | None,
+    ) -> None:
+        """Write the full per-eval record (candidate + info) to ``evals/{idx}.json``."""
+        assert self._evals_dir is not None
+        record = {
+            **entry,
+            "timestamp": time.time(),
+            "candidate": candidate,
+            "info": info,
+        }
+        try:
+            (self._evals_dir / f"{idx}.json").write_text(json.dumps(record, indent=2, default=str))
+        except Exception:
+            # Never let logging failure break an eval.
+            pass
 
     def _handle_evaluate(self, handler: BaseHTTPRequestHandler) -> None:
         content_length = int(handler.headers.get("Content-Length", 0))

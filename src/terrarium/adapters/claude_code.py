@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -376,14 +378,29 @@ class ClaudeCodeAdapter:
             if task.val_set:
                 prompt += f" Use {work / 'validate.sh'} to check validation score."
 
-            # Launch Claude Code
-            cmd = ["claude", "--print", "--model", self.model]
+            # Launch Claude Code. Under the default permission mode, ``--print``
+            # auto-denies Read/Bash tool calls (no human to approve), so Claude
+            # can never actually run ``eval.sh`` and just burns budget retrying.
+            # Use ``auto`` permission mode, and disallow WebSearch so Claude
+            # stays focused on local evaluation instead of browsing the web.
+            # ``--disallowedTools`` is variadic; pass with ``=`` so it doesn't
+            # swallow the trailing positional prompt.
+            cmd = [
+                "claude",
+                "--print",
+                "--model",
+                self.model,
+                "--permission-mode",
+                "bypassPermissions",
+                "--disallowedTools=WebSearch",
+            ]
             if budget.max_token_cost is not None:
                 cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
             cmd.append(prompt)
 
             env = {**os.environ, "TERRARIUM_WORK_DIR": str(work)}
 
+            launch_time = time.time()
             try:
                 subprocess.run(
                     cmd,
@@ -396,6 +413,13 @@ class ClaudeCodeAdapter:
             except subprocess.TimeoutExpired:
                 pass
 
+            # Claude Code writes session transcripts to a global per-project
+            # directory (~/.claude/projects/<cwd-slug>/<uuid>.jsonl). Copy any
+            # files modified during this subprocess run into <work_dir>/sessions/
+            # so the full reasoning trace ships with the rest of the run's
+            # artifacts.
+            _copy_session_transcripts(work, launch_time)
+
             # Read the best candidate
             best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
 
@@ -405,6 +429,30 @@ class ClaudeCodeAdapter:
                 total_evals=server.budget.used,
                 eval_log=server.eval_log,
             )
+
+
+def _copy_session_transcripts(work: Path, since: float) -> None:
+    """Copy claude session JSONL files into ``<work>/sessions/``.
+
+    Claude Code persists a transcript per session under
+    ``~/.claude/projects/<cwd-slug>/<uuid>.jsonl``, where ``cwd-slug`` is the
+    absolute cwd with every ``/`` replaced by ``-``. We pull every JSONL in
+    that directory whose mtime is >= ``since`` (the subprocess launch time),
+    so concurrent runs in sibling cwds don't clobber each other.
+    """
+    project_slug = str(work.resolve()).replace("/", "-")
+    src_dir = Path.home() / ".claude" / "projects" / project_slug
+    if not src_dir.is_dir():
+        return
+    dst_dir = work / "sessions"
+    dst_dir.mkdir(exist_ok=True)
+    for jsonl in src_dir.glob("*.jsonl"):
+        try:
+            if jsonl.stat().st_mtime >= since - 1.0:
+                shutil.copy2(jsonl, dst_dir / jsonl.name)
+        except OSError:
+            # Never let transcript capture break an otherwise-successful run.
+            pass
 
 
 def create_adapter(**kwargs: Any) -> ClaudeCodeAdapter:
