@@ -52,6 +52,19 @@ def _load_dataset() -> tuple[list[Example], list[Example], list[Example]]:
     return train_split[:mid], train_split[mid:], test_split
 
 
+def _extract_lm_cost(lm: Any, history_start: int) -> tuple[float, dict[str, int]]:
+    """Sum cost and token usage from dspy LM history entries added since history_start."""
+    cost = 0.0
+    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    if lm and hasattr(lm, "history"):
+        for entry in lm.history[history_start:]:
+            cost += entry.get("cost") or 0.0
+            u = entry.get("usage", {})
+            usage["prompt_tokens"] += u.get("prompt_tokens", 0)
+            usage["completion_tokens"] += u.get("completion_tokens", 0)
+    return cost, usage
+
+
 def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
     """Evaluate a prompt on a single AIME math example.
 
@@ -60,6 +73,9 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
     """
     import dspy
 
+    lm = dspy.settings.lm
+    history_before = len(lm.history) if lm and hasattr(lm, "history") else 0
+
     class MathSolverSignature(dspy.Signature):
         input = dspy.InputField(desc="The math problem to solve.")
         answer = dspy.OutputField(desc="The final numerical answer.")
@@ -67,6 +83,8 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
     predictor = dspy.ChainOfThought(MathSolverSignature)
     predictor.predict.signature.instructions = candidate
     prediction = predictor(input=example.inputs["input"])
+
+    cost, token_usage = _extract_lm_cost(lm, history_before)
 
     correct_answer = int(example.expected)
     written_solution = example.inputs.get("solution", "")
@@ -94,6 +112,8 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
             "prompt": candidate,
             "output": prediction.answer,
             "feedback": feedback,
+            "cost": cost,
+            "usage": token_usage,
         }
 
     score = float(correct_answer == llm_answer)
@@ -106,6 +126,8 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         "output": prediction.answer,
         "reasoning": getattr(prediction, "reasoning", ""),
         "feedback": feedback,
+        "cost": cost,
+        "usage": token_usage,
     }
 
 
