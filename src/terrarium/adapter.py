@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from terrarium.task import Task
@@ -23,6 +24,12 @@ class Adapter(Protocol):
     ``max_evals`` is enforced centrally by the server. ``max_token_cost`` must
     be enforced by each adapter in its own way (e.g. GEPA via
     ``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
+
+    The runner calls :meth:`evolve`, then :meth:`process_result`. Adapters that
+    need to write artifacts to a known on-disk location (logs, transcripts,
+    workspace contents) should stash any required state in ``result.metadata``
+    during ``evolve`` and do the actual file IO in ``process_result`` — that
+    way ``evolve`` stays focused on running the evolution.
 
     Example::
 
@@ -58,6 +65,22 @@ class Adapter(Protocol):
             Result containing the best candidate and metadata.
         """
         ...
+
+    def process_result(self, result: Result, output_dir: Path) -> None:
+        """Persist adapter-specific artifacts to ``output_dir`` after evolution.
+
+        Called by the runner immediately after :meth:`evolve` completes (and
+        after the runner has filled in ``result.eval_log`` and standard
+        metadata) — but only when an output directory is configured for the
+        run. Adapters that produced files, transcripts, or workspaces during
+        ``evolve`` should override this to copy/write them under ``output_dir``.
+
+        Args:
+            result: The :class:`Result` returned by ``evolve`` — read
+                ``result.metadata`` for any handoff state stashed there.
+            output_dir: Run output directory.
+        """
+        return
 
 
 @dataclass

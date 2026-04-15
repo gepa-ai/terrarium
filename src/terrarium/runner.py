@@ -121,6 +121,11 @@ def run(
     result.metadata["total_cost"] = server.total_cost
     result.metadata["progress_log"] = server.progress_log
 
+    # Hand the result back to the adapter for any artifact persistence
+    # (logs, transcripts, workspace mirroring, tempdir cleanup, etc.).
+    if output_dir is not None:
+        adapter.process_result(result, Path(output_dir))
+
     # Evaluate best candidate on held-out test set (outside budget).
     if isinstance(task, Task) and task.test_set and result.best_candidate:
         test_scores: dict[str, float] = {}

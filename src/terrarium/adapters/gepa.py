@@ -183,6 +183,10 @@ class GEPAAdapter:
             metadata=reflection_meta,
         )
 
+    def process_result(self, result: Result, output_dir: Path) -> None:
+        """No-op: GEPA writes its own artifacts via callbacks during ``evolve``."""
+        return
+
 
 class _ReflectionCostCallback:
     """GEPA callback that snapshots reflection LM cost at each iteration."""

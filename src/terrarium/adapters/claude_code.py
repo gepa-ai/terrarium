@@ -15,16 +15,14 @@ When budget is exhausted, the server returns HTTP 429.
 
 from __future__ import annotations
 
-import contextlib
+import json
 import os
 import shutil
 import subprocess
 import tempfile
-import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-
-import json
 
 from terrarium.adapter import Result
 from terrarium.task import Task
@@ -333,6 +331,11 @@ class ClaudeCodeAdapter:
     """Adapter that runs Claude Code as a black-box evolution subprocess.
 
     Uses the same EvalServer that the runner creates — just its HTTP endpoint.
+
+    ``evolve`` runs the subprocess and stashes ``session_id`` and ``work_dir``
+    in ``result.metadata``; ``process_result`` reads them back and copies the
+    session transcript (and the work dir, if it lives outside ``output_dir``)
+    into the run's output directory.
     """
 
     def __init__(
@@ -348,113 +351,133 @@ class ClaudeCodeAdapter:
         # tempdir is used and cleaned up on exit. The terrarium runner
         # injects <hydra_run_dir>/<adapter_name> at run time.
         self.run_dir = run_dir
+        # Tempdir whose lifetime spans evolve → process_result, so the
+        # adapter's workspace is still readable when process_result runs.
+        # Cleaned up by process_result; on an evolve error we let
+        # TemporaryDirectory's finalizer reclaim it.
+        self._pending_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
         budget = server.budget
 
         if self.run_dir:
-            Path(self.run_dir).mkdir(parents=True, exist_ok=True)
-            work_ctx: Any = contextlib.nullcontext(self.run_dir)
+            work_dir = Path(self.run_dir)
+            work_dir.mkdir(parents=True, exist_ok=True)
         else:
-            work_ctx = tempfile.TemporaryDirectory(prefix="terrarium_cc_")
-        with work_ctx as work_path_str:
-            work_dir = Path(work_path_str)
+            self._pending_tempdir = tempfile.TemporaryDirectory(prefix="terrarium_cc_")
+            work_dir = Path(self._pending_tempdir.name)
 
-            # Set up the sandbox workspace
-            materialize_sandbox(work_dir, task, server.url, budget.max_evals or 0)
+        # Set up the sandbox workspace
+        materialize_sandbox(work_dir, task, server.url, budget.max_evals or 0)
 
-            candidate_file = work_dir / "candidate.txt"
-            best_file = work_dir / "best_candidate.txt"
-            eval_script = work_dir / "eval.sh"
-            validate_script = work_dir / "validate.sh"
+        candidate_file = work_dir / "candidate.txt"
+        best_file = work_dir / "best_candidate.txt"
+        eval_script = work_dir / "eval.sh"
+        validate_script = work_dir / "validate.sh"
 
-            # Build the prompt — point at program.md for full context
-            prompt = (
-                f"Read program.md for full task instructions. "
-                f"The candidate to improve is in {candidate_file}. "
-                f"Write your best candidate to {best_file}. "
-                f"Use {eval_script} to evaluate."
+        # Build the prompt — point at program.md for full context
+        prompt = (
+            f"Read program.md for full task instructions. "
+            f"The candidate to improve is in {candidate_file}. "
+            f"Write your best candidate to {best_file}. "
+            f"Use {eval_script} to evaluate."
+        )
+        if task.val_set:
+            prompt += f" Use {validate_script} to check validation score."
+
+        # Launch Claude Code. Under the default permission mode, ``--print``
+        # auto-denies Read/Bash tool calls (no human to approve), so Claude
+        # can never actually run ``eval.sh`` and just burns budget retrying.
+        # Use ``bypassPermissions``, and disallow WebSearch so Claude stays
+        # focused on local evaluation instead of browsing the web.
+        # ``--session-id`` pins the UUID of the transcript file Claude
+        # writes (~/.claude/projects/<cwd-slug>/<session_id>.jsonl) so we
+        # can locate it deterministically — no race, no directory diff.
+        # ``--disallowedTools`` is variadic; pass with ``=`` so it doesn't
+        # swallow the trailing positional prompt.
+        session_id = str(uuid.uuid4())
+        cmd = [
+            "claude",
+            "--print",
+            "--model", self.model,
+            "--permission-mode", "bypassPermissions",
+            "--session-id", session_id,
+            "--disallowedTools=WebSearch",
+        ]
+        if budget.max_token_cost is not None:
+            cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
+        cmd.append(prompt)
+
+        env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+
+        try:
+            subprocess.run(
+                cmd,
+                cwd=str(work_dir),
+                env=env,
+                timeout=3600,
+                capture_output=True,
+                text=True,
             )
-            if task.val_set:
-                prompt += f" Use {validate_script} to check validation score."
+        except subprocess.TimeoutExpired:
+            pass
 
-            # Launch Claude Code. Under the default permission mode, ``--print``
-            # auto-denies Read/Bash tool calls (no human to approve), so Claude
-            # can never actually run ``eval.sh`` and just burns budget retrying.
-            # Use ``bypassPermissions``, and disallow WebSearch so Claude stays
-            # focused on local evaluation instead of browsing the web.
-            # ``--disallowedTools`` is variadic; pass with ``=`` so it doesn't
-            # swallow the trailing positional prompt.
-            cmd = [
-                "claude",
-                "--print",
-                "--model", self.model,
-                "--permission-mode", "bypassPermissions",
-                "--disallowedTools=WebSearch",
-            ]
-            if budget.max_token_cost is not None:
-                cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
-            cmd.append(prompt)
+        best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
 
-            env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+        return Result(
+            best_candidate=best_candidate,
+            best_score=server.best_score,
+            total_evals=server.budget.used,
+            eval_log=server.eval_log,
+            metadata={
+                "session_id": session_id,
+                "work_dir": str(work_dir),
+            },
+        )
 
-            launch_time = time.time()
-            try:
-                subprocess.run(
-                    cmd,
-                    cwd=str(work_dir),
-                    env=env,
-                    timeout=3600,
-                    capture_output=True,
-                    text=True,
-                )
-            except subprocess.TimeoutExpired:
-                pass
-
-            # Claude Code writes session transcripts to a global per-project
-            # directory (~/.claude/projects/<cwd-slug>/<uuid>.jsonl). Copy any
-            # files modified during this subprocess run into <output_dir>/sessions/
-            # (falling back to <work_dir>/sessions/ when running outside the
-            # hydra runner) so the full reasoning trace ships with the rest of
-            # the run's artifacts.
-            sessions_parent = server.output_dir if server.output_dir is not None else work_dir
-            _copy_session_transcripts(cwd=work_dir, dst_root=sessions_parent, since=launch_time)
-
-            # Read the best candidate
-            best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
-
-            return Result(
-                best_candidate=best_candidate,
-                best_score=server.best_score,
-                total_evals=server.budget.used,
-                eval_log=server.eval_log,
-            )
+    def process_result(self, result: Result, output_dir: Path) -> None:
+        """Copy the session transcript and (when work dir lives outside
+        ``output_dir``) mirror the work dir into ``output_dir``, then release
+        the workspace tempdir.
+        """
+        work_dir = Path(result.metadata["work_dir"])
+        session_id = result.metadata["session_id"]
+        _copy_session_transcript(work_dir, session_id, output_dir / "sessions")
+        if not _is_under(work_dir, output_dir):
+            shutil.copytree(work_dir, output_dir / "work", dirs_exist_ok=True)
+        if self._pending_tempdir is not None:
+            self._pending_tempdir.cleanup()
+            self._pending_tempdir = None
 
 
-def _copy_session_transcripts(cwd: Path, dst_root: Path, since: float) -> None:
-    """Copy claude session JSONL files into ``<dst_root>/sessions/``.
+def _copy_session_transcript(cwd: Path, session_id: str, dst_dir: Path) -> None:
+    """Copy the transcript for ``session_id`` (passed to ``claude --session-id``)
+    into ``dst_dir``.
 
-    Claude Code persists a transcript per session under
-    ``~/.claude/projects/<cwd-slug>/<uuid>.jsonl``, where ``cwd-slug`` is the
-    absolute subprocess cwd with every ``/`` replaced by ``-``. ``dst_root``
-    is where the copies should land — typically the run's output_dir, so
-    transcripts persist even when ``cwd`` is a tempdir. Only JSONLs whose
-    mtime is >= ``since`` (the subprocess launch time) are copied, so
-    concurrent runs in sibling cwds don't clobber each other.
+    Claude writes ``~/.claude/projects/<cwd-slug>/<session_id>.jsonl``, where
+    ``cwd-slug`` is the absolute subprocess cwd with every ``/`` replaced by
+    ``-``. Because we pinned the UUID at launch, there is no ambiguity about
+    which file belongs to this run — concurrent processes get distinct UUIDs.
     """
     project_slug = str(cwd.resolve()).replace("/", "-")
-    src_dir = Path.home() / ".claude" / "projects" / project_slug
-    if not src_dir.is_dir():
+    src = Path.home() / ".claude" / "projects" / project_slug / f"{session_id}.jsonl"
+    if not src.exists():
         return
-    dst_dir = dst_root / "sessions"
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for jsonl in src_dir.glob("*.jsonl"):
-        try:
-            if jsonl.stat().st_mtime >= since - 1.0:
-                shutil.copy2(jsonl, dst_dir / jsonl.name)
-        except OSError:
-            # Never let transcript capture break an otherwise-successful run.
-            pass
+    try:
+        shutil.copy2(src, dst_dir / src.name)
+    except OSError:
+        # Never let transcript capture break an otherwise-successful run.
+        pass
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    """True if ``child`` is the same as or nested inside ``parent`` (after
+    resolving symlinks)."""
+    try:
+        return child.resolve().is_relative_to(parent.resolve())
+    except OSError:
+        return False
 
 
 def create_adapter(**kwargs: Any) -> ClaudeCodeAdapter:
