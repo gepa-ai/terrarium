@@ -67,3 +67,9 @@ refiner: null
 # the claude_code adapter renders into program.md.
 objective: null
 background: null
+
+# Extra kwargs spread into ``gepa.lm.LM(model_str, ...)`` when ``reflection.
+# reflection_lm`` is a string. Default null → vanilla LM defaults. Set per
+# experiment (e.g. ``adapter.reflection_lm_kwargs='{timeout: 3600, num_retries: 2}'``)
+# when extended-thinking responses risk hitting LiteLLM's ~600s httpx cap.
+reflection_lm_kwargs: null

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
+from terrarium.budget import BudgetTracker
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -157,22 +158,13 @@ The initial candidate ({candidate_len} chars) is provided as a starting point.
 {eval_section}
 
 ## Budget
-You have **{max_evals}** total evaluation units.
-{budget_details}
+{budget_section}
 
 ## Strategy
-1. Read the training examples to understand the task.
-2. Start with the initial candidate and evaluate it.
-3. Analyze failures — read specific examples that scored 0.
-4. Improve the candidate and spot-check with `--ids`.
-5. Validate periodically to check generalization.
-6. Write your best candidate to `best_candidate.txt`.
+{strategy_section}
 
 ## Rules
-- You cannot modify eval.sh, validate.sh, or the server.
-- You cannot see the validation examples.
-- Focus on meaningful improvements each iteration.
-- When budget is exhausted, scripts return BUDGET_EXHAUSTED.
+{rules_section}
 """
 
 _EVAL_GENERALIZATION = """\
@@ -209,51 +201,81 @@ You cannot see individual val examples or their scores.
 Returns only the aggregate val_score. Costs {val_size} budget units."""
 
 
-def build_program_md(task: Task, max_evals: int) -> str:
+def _budget_section(budget: BudgetTracker) -> str:
+    lines: list[str] = []
+    if budget.max_evals is not None:
+        lines.append(f"- **Evaluation cap:** {budget.max_evals} calls (each eval = 1 unit).")
+    if budget.max_token_cost is not None:
+        lines.append(
+            f"- **LLM token budget:** ${budget.max_token_cost:.2f} "
+            "(enforced by the Claude CLI; you'll stop automatically when exhausted)."
+        )
+    if not lines:
+        lines.append("- No hard budget limit — iterate freely.")
+    return "\n".join(lines)
+
+
+def _strategy_section(task: Task) -> str:
+    if task.has_dataset and task.train_set:
+        val_step = "5. Validate periodically with `./validate.sh candidate.txt`.\n" if task.val_set else ""
+        final_n = 6 if task.val_set else 5
+        return (
+            "1. Read the training examples in `train/` to understand the task.\n"
+            "2. Run `./eval.sh candidate.txt` for a baseline.\n"
+            "3. Analyze failures — inspect examples that scored 0.\n"
+            "4. Improve the candidate; spot-check with `--ids`.\n"
+            f"{val_step}{final_n}. Write your best candidate to `best_candidate.txt`."
+        )
+    return (
+        "1. Read the candidate (`candidate.txt`) and the problem description above.\n"
+        "2. Run `./eval.sh candidate.txt` for a baseline score and any judge feedback.\n"
+        "3. Revise the candidate based on what you learned.\n"
+        "4. Iterate; write your best solution to `best_candidate.txt` as you improve."
+    )
+
+
+def _rules_section(task: Task) -> str:
+    scripts = "eval.sh, validate.sh" if task.val_set else "eval.sh"
+    val_rule = "\n- You cannot see the validation examples." if task.val_set else ""
+    return (
+        f"- You cannot modify {scripts} or the server.{val_rule}\n"
+        "- Focus on meaningful improvements each iteration.\n"
+        "- When the budget is exhausted, scripts return BUDGET_EXHAUSTED."
+    )
+
+
+def build_program_md(task: Task, budget: BudgetTracker) -> str:
     """Build structured program.md from task metadata.
 
     Mirrors what GEPA receives (``task.objective``, ``task.background``,
     dataset info) but in a format an agent can read and act on.
     """
-    # Same two fields the GEPA adapter forwards into reflection prompts.
     optional = ""
     if task.objective:
         optional += f"## Objective\n{task.objective}\n\n"
     if task.background:
         optional += f"## Background\n{task.background}\n\n"
 
-    # Evaluation section
     if task.has_dataset and task.train_set:
-        train_size = len(task.train_set)
-        val_section = ""
-        if task.val_set:
-            val_section = _VAL_SECTION.format(val_size=len(task.val_set))
+        val_section = _VAL_SECTION.format(val_size=len(task.val_set)) if task.val_set else ""
         eval_section = _EVAL_GENERALIZATION.format(
-            train_size=train_size, val_section=val_section,
+            train_size=len(task.train_set), val_section=val_section,
         )
     else:
         eval_section = _EVAL_SINGLE
-
-    # Budget details
-    budget_details = ""
-    if task.val_set:
-        budget_details = (
-            f"- Full train eval = {len(task.train_set)} units\n"
-            f"- Validation = {len(task.val_set)} units\n"
-            f"- Use train evals to iterate cheaply, validate when confident."
-        )
 
     return _PROGRAM_MD.format(
         name=task.name,
         optional_sections=optional,
         candidate_len=len(task.initial_candidate),
         eval_section=eval_section,
-        max_evals=max_evals,
-        budget_details=budget_details,
+        budget_section=_budget_section(budget),
+        strategy_section=_strategy_section(task),
+        rules_section=_rules_section(task),
     )
 
 
-def materialize_sandbox(work_dir: Path, task: Task, server_url: str, max_evals: int) -> None:
+def materialize_sandbox(work_dir: Path, task: Task, server_url: str, budget: BudgetTracker) -> None:
     """Set up the agent's sandbox workspace.
 
     Creates:
@@ -268,7 +290,7 @@ def materialize_sandbox(work_dir: Path, task: Task, server_url: str, max_evals: 
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # program.md — structured instructions
-    (work_dir / "program.md").write_text(build_program_md(task, max_evals))
+    (work_dir / "program.md").write_text(build_program_md(task, budget))
 
     # Candidate files
     (work_dir / "candidate.txt").write_text(task.initial_candidate)
@@ -340,7 +362,7 @@ class ClaudeCodeAdapter:
             work_dir = Path(self._pending_tempdir.name)
 
         # Set up the sandbox workspace
-        materialize_sandbox(work_dir, task, server.url, budget.max_evals or 0)
+        materialize_sandbox(work_dir, task, server.url, budget)
 
         candidate_file = work_dir / "candidate.txt"
         best_file = work_dir / "best_candidate.txt"

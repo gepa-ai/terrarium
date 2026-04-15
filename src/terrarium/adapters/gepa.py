@@ -81,6 +81,7 @@ class GEPAAdapter:
         objective: str | None = None,
         background: str | None = None,
         callbacks: list[Any] | None = None,
+        reflection_lm_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.run_dir = run_dir
         self.engine = dict(engine) if engine else {}
@@ -90,6 +91,11 @@ class GEPAAdapter:
         self.objective = objective
         self.background = background
         self.callbacks = callbacks or []
+        # Extra kwargs passed to ``gepa.lm.LM(...)`` when wrapping a string
+        # ``reflection.reflection_lm``. ``timeout`` is forwarded to litellm
+        # (its httpx default ~600s otherwise cuts off long extended-thinking
+        # responses); ``num_retries`` controls retry on transient failures.
+        self.reflection_lm_kwargs = dict(reflection_lm_kwargs) if reflection_lm_kwargs else {}
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
         from gepa.lm import LM
@@ -100,7 +106,7 @@ class GEPAAdapter:
         reflection_kwargs = dict(self.reflection)
         reflection_lm: LM | None = None
         if "reflection_lm" in reflection_kwargs:
-            reflection_lm = LM(reflection_kwargs["reflection_lm"])
+            reflection_lm = LM(reflection_kwargs["reflection_lm"], **self.reflection_lm_kwargs)
             reflection_kwargs["reflection_lm"] = reflection_lm
 
         # Runner-controlled engine fields override whatever the user set.

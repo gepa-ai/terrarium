@@ -158,6 +158,7 @@ class EvalServer:
             score, info = self.evaluate(candidate)
             return score, {
                 "scores": {"_single": score},
+                "infos": {"_single": info},
                 "num_evaluated": 1,
                 "num_total": 1,
                 "partial": False,
@@ -185,6 +186,7 @@ class EvalServer:
             score, info = self.evaluate(candidate)
             return score, {
                 "scores": {"_single": score},
+                "infos": {"_single": info},
                 "num_evaluated": 1,
                 "num_total": 1,
                 "partial": False,
@@ -197,28 +199,32 @@ class EvalServer:
             )
 
         scores: dict[str, float] = {}
+        infos: dict[str, dict[str, Any]] = {}
         errors: dict[str, str] = {}
 
-        def _eval_one(ex: Example) -> tuple[str, float, str | None]:
+        def _eval_one(ex: Example) -> tuple[str, float, dict[str, Any] | None, str | None]:
             try:
-                score, _ = self.evaluate(candidate, ex)
-                return (ex.id, score, None)
+                score, info = self.evaluate(candidate, ex)
+                return (ex.id, score, info, None)
             except Exception as e:
-                return (ex.id, 0.0, str(e))
+                return (ex.id, 0.0, None, str(e))
 
         futures = {self._pool.submit(_eval_one, ex): ex for ex in examples}
 
         for future in as_completed(futures):
-            eid, score, err = future.result()
+            eid, score, ex_info, err = future.result()
             if err is not None:
                 errors[eid] = err
             else:
                 scores[eid] = score
+                if ex_info is not None:
+                    infos[eid] = ex_info
 
         all_scores = {**scores, **{eid: 0.0 for eid in errors}}
         avg = sum(all_scores.values()) / len(all_scores)
         info: dict[str, Any] = {
             "scores": all_scores,
+            "infos": infos,
             "num_evaluated": len(examples),
             "_budget": self.budget.status(),
         }
@@ -453,6 +459,7 @@ class EvalServer:
             self._send_json(handler, {
                 "average_score": avg_score,
                 "scores": info.get("scores", {}),
+                "infos": info.get("infos", {}),
                 "num_evaluated": info.get("num_evaluated", 1),
                 "errors": info.get("errors", {}),
                 "budget": self.budget.status(),
