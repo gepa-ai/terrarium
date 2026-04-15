@@ -76,8 +76,8 @@ int main() {
     // TODO: Read from stdin, compute the answer, write to stdout per the
     // problem statement. The judge will compile this file with g++ and run
     // it against the problem's testdata; a custom checker scores the output
-    // in [0, 1] (higher is better). Optimization problems interpolate
-    // between a baseline and best value.
+    // in [0, 100] (higher is better; 100 = perfect). Optimization problems
+    // interpolate between a baseline and best value.
     return 0;
 }
 """

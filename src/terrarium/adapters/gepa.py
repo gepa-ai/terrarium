@@ -82,6 +82,7 @@ class GEPAAdapter:
         background: str | None = None,
         callbacks: list[Any] | None = None,
         reflection_lm_kwargs: dict[str, Any] | None = None,
+        stop_at_score: float | None = None,
     ) -> None:
         self.run_dir = run_dir
         self.engine = dict(engine) if engine else {}
@@ -96,6 +97,11 @@ class GEPAAdapter:
         # (its httpx default ~600s otherwise cuts off long extended-thinking
         # responses); ``num_retries`` controls retry on transient failures.
         self.reflection_lm_kwargs = dict(reflection_lm_kwargs) if reflection_lm_kwargs else {}
+        # When set, terminate the GEPA loop once the best valset score
+        # reaches/exceeds this threshold. Implemented via a callback that
+        # raises ``BudgetExhausted`` from ``on_iteration_end``; the
+        # terrarium runner already catches that and returns the current best.
+        self.stop_at_score = stop_at_score
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
         from gepa.lm import LM
@@ -126,6 +132,9 @@ class GEPAAdapter:
 
         if task.val_set:
             callbacks.append(_ProgressCallback(server, reflection_lm=reflection_lm))
+
+        if self.stop_at_score is not None:
+            callbacks.append(_PerfectScoreEarlyStop(self.stop_at_score))
 
         # GEPAConfig.__post_init__ converts dict -> nested config dataclass.
         config = GEPAConfig(
@@ -247,6 +256,32 @@ class _ProgressCallback:
         candidate_text = next(iter(candidate_dict.values()), None) if candidate_dict else None
         reflection_cost = self._reflection_lm.total_cost if self._reflection_lm else 0.0
         self._server.log_progress(event["average_score"], candidate=candidate_text, reflection_cost=reflection_cost)
+
+
+class _PerfectScoreEarlyStop:
+    """GEPA callback: terminate the loop once the best valset score reaches a threshold.
+
+    GEPA itself has no whole-loop early-stop signal \u2014 ``skip_perfect_score``
+    only suppresses the reflection step on already-perfect minibatches. This
+    callback raises ``BudgetExhausted`` from ``on_iteration_end`` when the
+    best aggregate valset score has reached ``perfect_score``; the terrarium
+    runner already catches that and returns the current best candidate, so
+    nothing else has to change.
+    """
+
+    def __init__(self, perfect_score: float) -> None:
+        self._perfect = float(perfect_score)
+
+    def on_iteration_end(self, event: dict[str, Any]) -> None:
+        state = event.get("state")
+        scores = getattr(state, "val_aggregate_scores", None)
+        if not scores:
+            return
+        best = max(s for s in scores if s is not None)
+        if best >= self._perfect:
+            raise BudgetExhausted(
+                f"perfect score reached: best valset score {best:.4f} >= {self._perfect}"
+            )
 
 
 def create_adapter(**kwargs: Any) -> GEPAAdapter:

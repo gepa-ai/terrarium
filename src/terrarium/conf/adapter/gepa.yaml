@@ -73,3 +73,11 @@ background: null
 # experiment (e.g. ``adapter.reflection_lm_kwargs='{timeout: 3600, num_retries: 2}'``)
 # when extended-thinking responses risk hitting LiteLLM's ~600s httpx cap.
 reflection_lm_kwargs: null
+
+# Whole-loop early-stop threshold. When set, terminate the GEPA run once the
+# best valset aggregate score reaches/exceeds this value. Implemented via a
+# callback that raises BudgetExhausted (terrarium runner catches it and
+# returns the current best). Distinct from ``reflection.skip_perfect_score``,
+# which only skips the reflection step on already-perfect minibatches.
+#   python -m terrarium adapter=gepa adapter.stop_at_score=100
+stop_at_score: null
