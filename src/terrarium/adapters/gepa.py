@@ -259,14 +259,14 @@ class _ProgressCallback:
 
 
 class _PerfectScoreEarlyStop:
-    """GEPA callback: terminate the loop once the best valset score reaches a threshold.
+    """GEPA callback: terminate the loop once the best score reaches a threshold.
 
-    GEPA itself has no whole-loop early-stop signal \u2014 ``skip_perfect_score``
+    GEPA itself has no whole-loop early-stop signal — ``skip_perfect_score``
     only suppresses the reflection step on already-perfect minibatches. This
     callback raises ``BudgetExhausted`` from ``on_iteration_end`` when the
-    best aggregate valset score has reached ``perfect_score``; the terrarium
-    runner already catches that and returns the current best candidate, so
-    nothing else has to change.
+    best aggregate score has reached ``perfect_score``; the terrarium runner
+    already catches that and returns the current best candidate, so nothing
+    else has to change.
     """
 
     def __init__(self, perfect_score: float) -> None:
@@ -274,13 +274,15 @@ class _PerfectScoreEarlyStop:
 
     def on_iteration_end(self, event: dict[str, Any]) -> None:
         state = event.get("state")
-        scores = getattr(state, "val_aggregate_scores", None)
+        if state is None:
+            return
+        scores = getattr(state, "program_full_scores_val_set", None)
         if not scores:
             return
         best = max(s for s in scores if s is not None)
         if best >= self._perfect:
             raise BudgetExhausted(
-                f"perfect score reached: best valset score {best:.4f} >= {self._perfect}"
+                f"perfect score reached: best score {best:.4f} >= {self._perfect}"
             )
 
 
