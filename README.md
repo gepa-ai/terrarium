@@ -144,6 +144,7 @@ class DatasetEvolver:
 
 - **`terrarium/adapters/gepa.py`** — Uses GEPA's `optimize_anything`. Calls `server.evaluate()` (in-process, no HTTP).
 - **`terrarium/adapters/claude_code.py`** — Launches Claude Code as a subprocess. Gives it a shell script that POSTs to `server.url` (HTTP, budget enforced server-side).
+- **`terrarium/adapters/meta_harness.py`** — Meta-Harness loop ([arXiv:2603.28052](https://arxiv.org/abs/2603.28052)): repeatedly spawns a Claude proposer that writes candidate files, then benchmarks each through `server.evaluate()`. Budget counter (`max_evals`, `max_token_cost`) shared with every other adapter; per-iteration proposer spend capped via `claude --max-budget-usd`.
 
 ### Black-box / external system adapters
 

@@ -1,0 +1,38 @@
+# @package adapter
+#
+# Meta-Harness adapter (https://arxiv.org/abs/2603.28052): runs an outer
+# evolution loop where a Claude Code subprocess proposes new candidates each
+# iteration and the adapter benchmarks them through the Terrarium eval server
+# (same budget counter as every other adapter).
+#
+# Typical CLI usage:
+#
+#   python -m terrarium adapter=meta_harness budget.max_evals=200 budget.max_token_cost=5.0
+#   python -m terrarium adapter=meta_harness adapter.max_iterations=10 adapter.model=opus
+#
+# Runner injects:
+#   - adapter.run_dir := <hydra_run_dir>/meta_harness/   (when null)
+#   - adapter.effort  := cfg.effort                       (when null)
+
+_target_: terrarium.adapters.meta_harness.MetaHarnessAdapter
+
+# Proposer model. Reference paper uses Opus for the proposer; override per
+# experiment (e.g. ``adapter.model=sonnet`` for cheaper ablations).
+model: opus
+
+# ``claude --effort low|medium|high|max``. Left null so the top-level
+# ``effort`` config can populate it. Set here to pin per-adapter.
+effort: null
+
+# Workspace for candidate files, state files, and session transcripts.
+# Runner injects ``<hydra_run_dir>/meta_harness/`` when null.
+run_dir: null
+
+# Outer-loop controls. ``max_iterations: null`` means "keep going until the
+# eval or token-cost budget is exhausted"; we clamp to a generous default
+# internally so a null iteration cap still terminates.
+max_iterations: 10
+max_candidates_per_iter: 3
+
+# Hard timeout (seconds) per proposer subprocess.
+proposer_timeout: 2400
