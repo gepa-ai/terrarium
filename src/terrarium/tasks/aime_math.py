@@ -114,7 +114,8 @@ def _make_task() -> Task:
     train_set, val_set, test_set = _load_dataset()
     return Task(
         name="aime_math",
-        description=DESCRIPTION,
+        objective="Optimize a math-solving prompt that generalizes across AIME problems.",
+        background=DESCRIPTION,
         initial_candidate=INITIAL_CANDIDATE,
         eval_fn=evaluate,
         train_set=train_set,
@@ -123,7 +124,6 @@ def _make_task() -> Task:
         metadata={
             "type": "generalization",
             "candidate_type": "prompt",
-            "objective": "Optimize a math-solving prompt that generalizes across AIME problems.",
         },
     )
 

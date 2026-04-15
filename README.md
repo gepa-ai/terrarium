@@ -73,8 +73,8 @@ class MyEvolver:
     def evolve(self, task, server, max_evals):
         """
         Args:
-            task: Task definition — use task.description, task.initial_candidate,
-                  task.train_set, task.test_set as needed.
+            task: Task definition — use task.objective, task.background,
+                  task.initial_candidate, task.train_set, task.test_set as needed.
             server: EvalServer — the single eval + budget choke point.
                 - server.evaluate(candidate) -> (score, info)
                 - server.evaluate(candidate, example) -> (score, info)
@@ -160,7 +160,7 @@ class ExternalSystemAdapter:
         #   Response: {"score": 1.23, "info": {...}, "budget": {...}}
         #   HTTP 429 when budget exhausted
 
-        run_my_system(eval_url=server.url, task_desc=task.description)
+        run_my_system(eval_url=server.url, task_desc=task.background)
 
         return Result(
             best_candidate=server.best_candidate,
@@ -197,7 +197,8 @@ def evaluate(candidate: str) -> tuple[float, dict]:
 
 TASK = register_task(Task(
     name="my_task",
-    description=DESCRIPTION,
+    objective="One-line objective for the evolution system.",
+    background=DESCRIPTION,
     initial_candidate=INITIAL_CANDIDATE,
     eval_fn=evaluate,
     # train_set=train_set,   # for dataset tasks
@@ -205,7 +206,6 @@ TASK = register_task(Task(
     metadata={
         "type": "single_task",  # or "generalization"
         "candidate_type": "code",  # or "prompt"
-        "objective": "One-line objective for the evolution system.",
     },
 ))
 ```

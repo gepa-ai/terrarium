@@ -27,19 +27,24 @@ class Task:
 
     Attributes:
         name: Unique identifier (e.g. "circle_packing").
-        description: What this task optimizes (shown to the evolution system).
+        objective: Short goal statement (e.g. "Maximize sum of circle radii").
+            Surfaced by both adapters as the optimization goal.
+        background: Long-form context — problem statement, evaluation rules,
+            domain notes — shown to the evolution system as the canonical
+            "what is this problem" prompt.
         initial_candidate: Seed text to evolve from.
         eval_fn: Scoring function controlled by terrarium.
         train_set: Training examples (used for optimization).
         val_set: Validation examples (used for candidate selection during optimization).
         test_set: Held-out test examples (evaluated after optimization, never seen during search).
-        metadata: Extra context (objective string, background, etc.).
+        metadata: Extra typed context (run mode, candidate type, etc.).
     """
 
     name: str
-    description: str
     initial_candidate: str
     eval_fn: EvalFn
+    objective: str = ""
+    background: str = ""
     train_set: list[Example] | None = None
     val_set: list[Example] | None = None
     test_set: list[Example] | None = None

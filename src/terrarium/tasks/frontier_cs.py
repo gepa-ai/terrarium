@@ -82,27 +82,7 @@ int main() {
 }
 """
 
-_DESCRIPTION_TEMPLATE = """\
-Frontier-CS algorithmic problem {problem_id}.
-
-The candidate is a complete C++ program compiled and run by the Frontier-CS
-Docker judge. It reads from stdin and writes to stdout per the problem
-statement below. A custom checker scores the output in [0, 1] (higher is
-better); for optimization problems the score is interpolated between a
-baseline and best value baked into the test data.
-
-Use `#include <bits/stdc++.h>` freely — the judge uses a standard g++ toolchain.
-
-## Problem Statement
-
-{statement}
-
-## Judge Config
-
-```yaml
-{config}
-```
-"""
+_OBJECTIVE = "Solve an algorithmic problem by writing a C++ program."
 
 # Curated small subset for fast adapter smoke tests. Picks small numeric IDs
 # (which tend to be earlier, shorter problems). Override by editing this list
@@ -164,7 +144,6 @@ def _algorithmic_rows() -> dict[str, dict[str, Any]]:
             continue
         rows[str(row["problem_id"])] = {
             "statement": row.get("statement", ""),
-            "config": row.get("config", ""),
         }
     return rows
 
@@ -312,11 +291,8 @@ def _make_problem_task(problem_id: str) -> Task:
 
     return Task(
         name=f"frontier_cs_algo_{problem_id}",
-        description=_DESCRIPTION_TEMPLATE.format(
-            problem_id=problem_id,
-            statement=row["statement"],
-            config=row["config"],
-        ),
+        objective=_OBJECTIVE,
+        background=row["statement"],
         initial_candidate=_INITIAL_CANDIDATE,
         eval_fn=eval_fn,
         metadata={
@@ -325,11 +301,6 @@ def _make_problem_task(problem_id: str) -> Task:
             "language": "cpp",
             "frontier_cs_track": "algorithmic",
             "frontier_cs_problem_id": problem_id,
-            "objective": (
-                f"Write a C++ program that maximizes the score "
-                f"on algorithmic problem {problem_id}."
-            ),
-            "background": row["statement"],
         },
     )
 
@@ -365,18 +336,10 @@ def _make_smoke_task() -> Task:
     statements = "\n\n---\n\n".join(
         f"### Problem {pid}\n\n{rows[pid]['statement']}" for pid in available
     )
-    description = (
-        "Smoke-test subset of Frontier-CS algorithmic problems. The candidate "
-        "is a C++ program evaluated independently on each problem in this "
-        "subset; the final score is the average. A single candidate is "
-        "unlikely to generalize since each problem has its own statement — "
-        "use this task to smoke-test the adapter→judge pipeline, then target "
-        "a single problem with frontier_cs_algo_<id> for real optimization.\n\n"
-        f"## Problems in this subset\n\n{statements}"
-    )
     return Task(
         name="frontier_cs_algo_smoke",
-        description=description,
+        objective=_OBJECTIVE,
+        background=statements,
         initial_candidate=_INITIAL_CANDIDATE,
         eval_fn=eval_fn,
         train_set=examples,
@@ -385,8 +348,6 @@ def _make_smoke_task() -> Task:
             "candidate_type": "code",
             "language": "cpp",
             "frontier_cs_track": "algorithmic",
-            "objective": "Write a C++ program that maximizes the score on the given problem.",
-            "background": statements,
         },
     )
 

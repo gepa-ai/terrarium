@@ -63,6 +63,7 @@ merge: null
 refiner: null
 
 # optimize_anything top-level args (forwarded into the reflection prompt).
-# null falls back to task.metadata["objective"] / ["background"].
+# null falls back to ``task.objective`` / ``task.background`` — same fields
+# the claude_code adapter renders into program.md.
 objective: null
 background: null

@@ -84,12 +84,12 @@ def evaluate(candidate: str) -> tuple[float, dict[str, Any]]:
 
 TASK = register_task(Task(
     name="circle_packing",
-    description=DESCRIPTION,
+    objective="Maximize sum of circle radii for 26 circles in a unit square.",
+    background=DESCRIPTION,
     initial_candidate=INITIAL_CANDIDATE,
     eval_fn=evaluate,
     metadata={
         "type": "single_task",
         "candidate_type": "code",
-        "objective": "Maximize sum of circle radii for 26 circles in a unit square.",
     },
 ))

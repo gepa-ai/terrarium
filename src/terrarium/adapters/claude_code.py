@@ -30,12 +30,42 @@ from terrarium.task import Task
 if TYPE_CHECKING:
     from terrarium.eval_server import EvalServer
 
-# Unified eval script: supports full-split eval, specific example IDs, or single-task.
+# Single-task eval script: one POST per call, returns one score.
+# Usage: ./eval.sh <candidate_file>
+EVAL_SCRIPT_SINGLE = """\
+#!/usr/bin/env bash
+# Usage: ./eval.sh <candidate_file>
+# Evaluates the candidate once. Returns {{score, info, budget}}.
+# Exit code 1 if budget exhausted.
+set -euo pipefail
+
+CANDIDATE_FILE="$1"
+SERVER_URL="{server_url}"
+
+CANDIDATE=$(cat "$CANDIDATE_FILE")
+BODY=$(jq -n --arg c "$CANDIDATE" '{{candidate: $c}}')
+
+RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/evaluate" \\
+    -H "Content-Type: application/json" \\
+    -d "$BODY")
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | head -n -1)
+
+echo "$BODY"
+
+if [ "$HTTP_CODE" = "429" ]; then
+    echo "BUDGET_EXHAUSTED" >&2
+    exit 1
+fi
+"""
+
+# Dataset eval script: full-split eval or specific example IDs.
 # Usage:
 #   ./eval.sh <candidate_file>                     → eval on train split (default)
 #   ./eval.sh <candidate_file> test                → eval on test split
 #   ./eval.sh <candidate_file> --ids id1,id2,id3   → eval on specific examples
-EVAL_SCRIPT = """\
+EVAL_SCRIPT_DATASET = """\
 #!/usr/bin/env bash
 # Usage: ./eval.sh <candidate_file> [split]
 #        ./eval.sh <candidate_file> --ids id1,id2,id3
@@ -114,64 +144,6 @@ if [ "$HTTP_CODE" = "429" ]; then
 fi
 """
 
-# System prompt given to Claude Code describing the task and eval protocol.
-CLAUDE_CODE_SYSTEM = """\
-You are an AI research system tasked with evolving and improving a candidate solution.
-
-## Task
-{task_description}
-
-## Initial Candidate
-The initial candidate is in: {candidate_file}
-
-## How to Evaluate
-
-`{eval_script} <candidate_file> [split | --ids id1,id2,id3]`
-
-One script, flexible usage:
-
-- **Full split** (default): `{eval_script} candidate.txt` or `{eval_script} candidate.txt train`
-  Evaluates across ALL examples in the split. Examples run in parallel server-side.
-  Costs N budget units (one per example).
-
-- **Specific examples**: `{eval_script} candidate.txt --ids example_1,example_5,example_12`
-  Evaluates only the listed examples. Costs 1 budget unit per example listed.
-  Useful for targeted debugging after seeing which examples score low.
-
-- **Single-task** (no dataset): `{eval_script} candidate.txt`
-  Just evaluates the candidate. Costs 1 budget unit.
-
-Response fields:
-- `average_score`: Mean score across evaluated examples.
-- `scores`: Per-example scores (dict of example_id → score).
-- `num_evaluated` / `num_total`: How many examples were evaluated vs total in split.
-- `partial`: True if budget ran out mid-evaluation.
-- `errors`: Per-example errors, if any.
-- `budget`: Remaining eval budget.
-
-{dataset_info}
-
-## Budget
-{budget_info}
-If budget runs out mid-evaluation, you get partial results.
-
-## Strategy Tips
-- Start with a full eval to see overall performance and identify weak examples.
-- Use `--ids` to cheaply iterate on specific failing examples.
-- Once you've improved on the weak examples, do another full eval to confirm.
-- For single-task problems, each eval call costs exactly 1 budget unit.
-
-## Goal
-Iteratively improve the candidate to maximize the score. When you're done
-(or budget is exhausted), write your best candidate to: {best_file}
-
-## Rules
-- Each example evaluation counts as one budget unit.
-- You cannot modify the eval script or the server.
-- Focus on making meaningful improvements each iteration.
-"""
-
-
 # ── program.md templates ────────────────────────────────────────────────
 
 _PROGRAM_MD = """\
@@ -240,17 +212,15 @@ Returns only the aggregate val_score. Costs {val_size} budget units."""
 def build_program_md(task: Task, max_evals: int) -> str:
     """Build structured program.md from task metadata.
 
-    Mirrors what GEPA receives (objective, background, dataset info)
-    but in a format an agent can read and act on.
+    Mirrors what GEPA receives (``task.objective``, ``task.background``,
+    dataset info) but in a format an agent can read and act on.
     """
-    # Optional header sections (objective, background, description)
+    # Same two fields the GEPA adapter forwards into reflection prompts.
     optional = ""
-    for key, heading in [("objective", "Objective"), ("background", "Background")]:
-        value = task.metadata.get(key, "")
-        if value:
-            optional += f"## {heading}\n{value}\n\n"
-    if task.description:
-        optional += f"## Description\n{task.description}\n\n"
+    if task.objective:
+        optional += f"## Objective\n{task.objective}\n\n"
+    if task.background:
+        optional += f"## Background\n{task.background}\n\n"
 
     # Evaluation section
     if task.has_dataset and task.train_set:
@@ -304,9 +274,11 @@ def materialize_sandbox(work_dir: Path, task: Task, server_url: str, max_evals: 
     (work_dir / "candidate.txt").write_text(task.initial_candidate)
     (work_dir / "best_candidate.txt").write_text(task.initial_candidate)
 
-    # eval.sh
+    # eval.sh — minimal one-shot script for single-task; full split/--ids
+    # script for dataset tasks.
+    eval_template = EVAL_SCRIPT_DATASET if task.has_dataset else EVAL_SCRIPT_SINGLE
     eval_script = work_dir / "eval.sh"
-    eval_script.write_text(EVAL_SCRIPT.format(server_url=server_url))
+    eval_script.write_text(eval_template.format(server_url=server_url))
     eval_script.chmod(0o755)
 
     # validate.sh (generalization mode only)

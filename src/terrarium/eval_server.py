@@ -28,7 +28,7 @@ GET /status
     Response: {"budget": {...}, "task": "<name>", "best_score": 1.23, "total_evals": 5, "total_cost": 0.42}
 
 GET /task
-    Response: {"name": "...", "description": "...", "initial_candidate": "...", ...}
+    Response: {"name": "...", "objective": "...", "background": "...", "initial_candidate": "...", ...}
 """
 
 from __future__ import annotations
@@ -500,7 +500,8 @@ class EvalServer:
     def _handle_task_info(self, handler: BaseHTTPRequestHandler) -> None:
         self._send_json(handler, {
             "name": self.task.name,
-            "description": self.task.description,
+            "objective": self.task.objective,
+            "background": self.task.background,
             "initial_candidate": self.task.initial_candidate,
             "has_dataset": self.task.has_dataset,
             "train_size": len(self.task.train_set) if self.task.train_set else 0,

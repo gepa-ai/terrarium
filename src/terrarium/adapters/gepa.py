@@ -149,12 +149,14 @@ class GEPAAdapter:
             if "val_set" in task.metadata:
                 oa_kwargs.setdefault("valset", task.metadata["val_set"])
 
-        # Prefer adapter-level objective/background; fall back to task metadata.
-        objective = self.objective or task.metadata.get("objective")
-        background = self.background or task.metadata.get("background")
-        if objective is not None:
+        # Both adapters pass the same two task fields through to the
+        # evolution system. yaml-level ``adapter.objective`` /
+        # ``adapter.background`` overrides win.
+        objective = self.objective or task.objective
+        background = self.background or task.background
+        if objective:
             oa_kwargs["objective"] = objective
-        if background is not None:
+        if background:
             oa_kwargs["background"] = background
 
         try:

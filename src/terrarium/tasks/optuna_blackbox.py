@@ -57,12 +57,12 @@ def evaluate(candidate: str, problem_index: int = 46, budget: int = 200) -> tupl
 
 TASK = register_task(Task(
     name="optuna_blackbox",
-    description=DESCRIPTION,
+    objective="Minimize a blackbox objective function using the evaluation budget efficiently.",
+    background=DESCRIPTION,
     initial_candidate=INITIAL_CANDIDATE,
     eval_fn=evaluate,
     metadata={
         "type": "single_task",
         "candidate_type": "code",
-        "objective": "Minimize a blackbox objective function using the evaluation budget efficiently.",
     },
 ))

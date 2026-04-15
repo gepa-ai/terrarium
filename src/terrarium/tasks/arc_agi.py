@@ -97,7 +97,8 @@ def _make_task() -> Task:
     train_set, val_set, test_set = _load_dataset()
     return Task(
         name="arc_agi",
-        description=DESCRIPTION,
+        objective="Build an ARC-AGI agent that maximizes test accuracy.",
+        background=DESCRIPTION,
         initial_candidate=INITIAL_CANDIDATE,
         eval_fn=evaluate,
         train_set=train_set,
@@ -106,7 +107,6 @@ def _make_task() -> Task:
             "type": "generalization",
             "candidate_type": "code",
             "val_set": val_set,
-            "objective": "Build an ARC-AGI agent that maximizes test accuracy.",
         },
     )
 
