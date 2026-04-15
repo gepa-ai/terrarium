@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -179,17 +180,14 @@ Training examples are in `train/` as individual JSON files.
 
 # Evaluate on specific examples
 ./eval.sh candidate.txt --ids example_0,example_1,example_2
-```
-Each example costs 1 budget unit. A full train eval costs {train_size} units.
-{val_section}"""
+```{cost_line}{val_section}"""
 
 _EVAL_SINGLE = """\
 ## Evaluation
 This is a **single-task** optimization.
 ```bash
 ./eval.sh candidate.txt
-```
-Each eval costs 1 budget unit."""
+```{cost_line}"""
 
 _VAL_SECTION = """
 ### Validation
@@ -198,7 +196,7 @@ You cannot see individual val examples or their scores.
 ```bash
 ./validate.sh candidate.txt
 ```
-Returns only the aggregate val_score. Costs {val_size} budget units."""
+Returns only the aggregate val_score.{val_cost}"""
 
 
 def _budget_section(budget: BudgetTracker) -> str:
@@ -234,13 +232,16 @@ def _strategy_section(task: Task) -> str:
     )
 
 
-def _rules_section(task: Task) -> str:
+def _rules_section(task: Task, budget: BudgetTracker) -> str:
     scripts = "eval.sh, validate.sh" if task.val_set else "eval.sh"
     val_rule = "\n- You cannot see the validation examples." if task.val_set else ""
+    exhaust_rule = (
+        "\n- When the budget is exhausted, scripts return BUDGET_EXHAUSTED."
+        if budget.max_evals is not None else ""
+    )
     return (
         f"- You cannot modify {scripts} or the server.{val_rule}\n"
-        "- Focus on meaningful improvements each iteration.\n"
-        "- When the budget is exhausted, scripts return BUDGET_EXHAUSTED."
+        f"- Focus on meaningful improvements each iteration.{exhaust_rule}"
     )
 
 
@@ -256,13 +257,28 @@ def build_program_md(task: Task, budget: BudgetTracker) -> str:
     if task.background:
         optional += f"## Background\n{task.background}\n\n"
 
+    has_eval_budget = budget.max_evals is not None
+
     if task.has_dataset and task.train_set:
-        val_section = _VAL_SECTION.format(val_size=len(task.val_set)) if task.val_set else ""
+        train_size = len(task.train_set)
+        cost_line = (
+            f"\nEach example costs 1 budget unit. A full train eval costs {train_size} units."
+            if has_eval_budget else ""
+        )
+        if task.val_set:
+            val_size = len(task.val_set)
+            val_cost = f" Costs {val_size} budget units." if has_eval_budget else ""
+            # Prepend a newline so the validation block is separated from whatever
+            # came before (cost line in eval-budget mode, closing fence otherwise).
+            val_section = "\n" + _VAL_SECTION.format(val_size=val_size, val_cost=val_cost)
+        else:
+            val_section = ""
         eval_section = _EVAL_GENERALIZATION.format(
-            train_size=len(task.train_set), val_section=val_section,
+            train_size=train_size, cost_line=cost_line, val_section=val_section,
         )
     else:
-        eval_section = _EVAL_SINGLE
+        cost_line = "\nEach eval costs 1 budget unit." if has_eval_budget else ""
+        eval_section = _EVAL_SINGLE.format(cost_line=cost_line)
 
     return _PROGRAM_MD.format(
         name=task.name,
@@ -271,7 +287,7 @@ def build_program_md(task: Task, budget: BudgetTracker) -> str:
         eval_section=eval_section,
         budget_section=_budget_section(budget),
         strategy_section=_strategy_section(task),
-        rules_section=_rules_section(task),
+        rules_section=_rules_section(task, budget),
     )
 
 
@@ -337,6 +353,7 @@ class ClaudeCodeAdapter:
         model: str = "sonnet",
         max_turns: int | None = None,
         run_dir: str | None = None,
+        effort: str | None = None,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
@@ -345,6 +362,9 @@ class ClaudeCodeAdapter:
         # tempdir is used and cleaned up on exit. The terrarium runner
         # injects <hydra_run_dir>/<adapter_name> at run time.
         self.run_dir = run_dir
+        # ``--effort low|medium|high|max`` passed to ``claude --print``.
+        # Controls extended-thinking budget. ``None`` = CLI default.
+        self.effort = effort
         # Tempdir whose lifetime spans evolve → process_result, so the
         # adapter's workspace is still readable when process_result runs.
         # Cleaned up by process_result; on an evolve error we let
@@ -398,6 +418,8 @@ class ClaudeCodeAdapter:
             "--session-id", session_id,
             "--disallowedTools=WebSearch",
         ]
+        if self.effort is not None:
+            cmd.extend(["--effort", self.effort])
         if budget.max_token_cost is not None:
             cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
         cmd.append(prompt)
@@ -444,17 +466,29 @@ class ClaudeCodeAdapter:
             self._pending_tempdir = None
 
 
+_SLUG_RE = re.compile(r"[^A-Za-z0-9-]")
+
+
+def _claude_project_slug(cwd: Path) -> str:
+    """Compute the slug Claude Code uses for its per-project session dir.
+
+    Claude writes ``~/.claude/projects/<slug>/<session_id>.jsonl`` where
+    ``<slug>`` is the absolute cwd with every non-alphanumeric character
+    (``/``, ``_``, ``.``, etc.) replaced by ``-``. A naive ``replace("/","-")``
+    misses underscores — e.g. ``cc_run_1`` → ``cc_run_1`` (wrong) instead of
+    ``cc-run-1`` (right) — which is why transcripts silently weren't being
+    captured.
+    """
+    return _SLUG_RE.sub("-", str(cwd.resolve()))
+
+
 def _copy_session_transcript(cwd: Path, session_id: str, dst_dir: Path) -> None:
     """Copy the transcript for ``session_id`` (passed to ``claude --session-id``)
-    into ``dst_dir``.
-
-    Claude writes ``~/.claude/projects/<cwd-slug>/<session_id>.jsonl``, where
-    ``cwd-slug`` is the absolute subprocess cwd with every ``/`` replaced by
-    ``-``. Because we pinned the UUID at launch, there is no ambiguity about
-    which file belongs to this run — concurrent processes get distinct UUIDs.
+    into ``dst_dir``. Because we pinned the UUID at launch, there is no
+    ambiguity about which file belongs to this run — concurrent processes get
+    distinct UUIDs.
     """
-    project_slug = str(cwd.resolve()).replace("/", "-")
-    src = Path.home() / ".claude" / "projects" / project_slug / f"{session_id}.jsonl"
+    src = Path.home() / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
     if not src.exists():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)

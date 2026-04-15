@@ -27,6 +27,17 @@ budget:
 # Max parallel evaluations in the server.
 max_concurrency: 8
 
+# Extended-thinking / reasoning effort, shared by both adapters. One of
+# ``low|medium|high|max`` (or null for the provider default). The runner
+# threads this into whichever knob each adapter uses:
+#   - ClaudeCodeAdapter: sets ``effort`` → ``claude --effort <value>``
+#   - GEPAAdapter: adds ``reasoning_effort: <value>`` to
+#     ``reflection_lm_kwargs``, which litellm translates to Anthropic's
+#     ``thinking={type: adaptive, ...}`` for Sonnet-4.6.
+# Adapter-level overrides (adapter.effort=..., adapter.reflection_lm_kwargs=...)
+# win over this top-level default.
+effort: null
+
 # If set, write full result JSON (including best_candidate) to this path.
 output: null
 

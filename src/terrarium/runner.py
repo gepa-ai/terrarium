@@ -170,6 +170,22 @@ def load_adapter(path: str, **_: Any) -> Adapter:
     return mod.create_adapter()
 
 
+def _apply_effort(adapter: Any, effort: str | None) -> None:
+    """Thread the top-level ``effort`` into whichever adapter knob exists.
+
+    - ``adapter.effort`` (claude_code): set if currently ``None``.
+    - ``adapter.reflection_lm_kwargs`` (gepa): ``setdefault`` the
+      ``reasoning_effort`` key so user-supplied overrides still win.
+    """
+    if not effort:
+        return
+    if hasattr(adapter, "effort") and getattr(adapter, "effort", None) is None:
+        adapter.effort = effort
+    kwargs = getattr(adapter, "reflection_lm_kwargs", None)
+    if isinstance(kwargs, dict):
+        kwargs.setdefault("reasoning_effort", effort)
+
+
 def _build_tracking_config(cfg: DictConfig) -> TrackingConfig | None:
     if not cfg.get("enabled", False):
         return None
@@ -208,6 +224,12 @@ def main(cfg: DictConfig) -> None:
     # set a non-null value (explicit user override wins).
     if hasattr(adapter, "run_dir") and not getattr(adapter, "run_dir", None):
         adapter.run_dir = str(adapter_dir)
+
+    # Inject the top-level ``effort`` into whichever knob the adapter exposes.
+    # Adapters opt in by declaring ``effort`` (a plain field — claude_code) or
+    # ``reflection_lm_kwargs`` (a dict of litellm kwargs — gepa). Adapter-level
+    # overrides already set by the user win (we never clobber).
+    _apply_effort(adapter, cfg.get("effort"))
 
     tracking = _build_tracking_config(cfg.tracking) if "tracking" in cfg else None
 

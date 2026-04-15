@@ -5,3 +5,7 @@ max_turns: null
 # Work dir for candidate/eval-script files. Runner injects
 # <hydra_run_dir>/claude_code/ when null. Set to keep artifacts elsewhere.
 run_dir: null
+# ``claude --effort low|medium|high|max``. Controls extended-thinking budget.
+# null = CLI default. Set per experiment to match the reflection LM's
+# ``reasoning_effort`` for fair GEPA-vs-CC comparisons.
+effort: null
