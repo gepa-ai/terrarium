@@ -90,12 +90,12 @@ class EvalServer:
         self._next_candidate_id: int = 0
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
-        self._output_dir: Path | None = None
+        self.output_dir: Path | None = None
         self._evals_dir: Path | None = None
         if output_dir is not None:
-            self._output_dir = Path(output_dir)
-            self._output_dir.mkdir(parents=True, exist_ok=True)
-            self._evals_dir = self._output_dir / "evals"
+            self.output_dir = Path(output_dir)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self._evals_dir = self.output_dir / "evals"
             self._evals_dir.mkdir(exist_ok=True)
         self._eval_semaphore = threading.Semaphore(max_concurrency)
 
@@ -260,7 +260,7 @@ class EvalServer:
                 entry["candidate_id"] = candidate_id
             self._progress_log.append(entry)
 
-        if self._output_dir is not None:
+        if self.output_dir is not None:
             with self._io_lock:
                 self._append_progress_log(entry)
 
@@ -273,9 +273,9 @@ class EvalServer:
         cid = self._next_candidate_id
         self._next_candidate_id += 1
         self._candidate_registry[candidate] = cid
-        if self._output_dir is not None:
+        if self.output_dir is not None:
             with self._io_lock:
-                with open(self._output_dir / "candidates.jsonl", "a") as f:
+                with open(self.output_dir / "candidates.jsonl", "a") as f:
                     f.write(json.dumps({"candidate_id": cid, "candidate": candidate}) + "\n")
         return cid
 
@@ -357,7 +357,7 @@ class EvalServer:
                 self.tracker.log_eval(self.budget.used, score, self.best_score, cost)
             snapshot = self._snapshot()
 
-        if self._output_dir is not None:
+        if self.output_dir is not None:
             with self._io_lock:
                 self._write_summary(snapshot)
                 self._write_eval_record(idx, entry, candidate, info)
@@ -372,8 +372,8 @@ class EvalServer:
         }
 
     def _append_progress_log(self, entry: dict[str, Any]) -> None:
-        assert self._output_dir is not None
-        with open(self._output_dir / "progress_log.jsonl", "a") as f:
+        assert self.output_dir is not None
+        with open(self.output_dir / "progress_log.jsonl", "a") as f:
             f.write(json.dumps(entry) + "\n")
 
     def _write_summary(self, snapshot: dict[str, Any]) -> None:
@@ -383,8 +383,8 @@ class EvalServer:
         best_candidate (can be large).  The runner writes the complete
         summary at the end.
         """
-        assert self._output_dir is not None
-        summary_path = self._output_dir / "summary.json"
+        assert self.output_dir is not None
+        summary_path = self.output_dir / "summary.json"
         tmp = summary_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(snapshot, indent=2, default=str))
         tmp.replace(summary_path)
