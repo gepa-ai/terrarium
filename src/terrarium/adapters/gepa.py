@@ -133,8 +133,10 @@ class GEPAAdapter:
         if task.val_set:
             callbacks.append(_ProgressCallback(server, reflection_lm=reflection_lm))
 
+        stop_callbacks: list[Any] = []
         if self.stop_at_score is not None:
-            callbacks.append(_PerfectScoreEarlyStop(self.stop_at_score))
+            from gepa.utils.stop_condition import ScoreThresholdStopper
+            stop_callbacks.append(ScoreThresholdStopper(self.stop_at_score))
 
         # GEPAConfig.__post_init__ converts dict -> nested config dataclass.
         config = GEPAConfig(
@@ -143,6 +145,7 @@ class GEPAAdapter:
             merge=self.merge,
             refiner=self.refiner,
             callbacks=callbacks or None,
+            stop_callbacks=stop_callbacks or None,
         )
 
         # Bridge: optimize_anything calls this evaluator, which goes through
@@ -257,33 +260,6 @@ class _ProgressCallback:
         reflection_cost = self._reflection_lm.total_cost if self._reflection_lm else 0.0
         self._server.log_progress(event["average_score"], candidate=candidate_text, reflection_cost=reflection_cost)
 
-
-class _PerfectScoreEarlyStop:
-    """GEPA callback: terminate the loop once the best score reaches a threshold.
-
-    GEPA itself has no whole-loop early-stop signal — ``skip_perfect_score``
-    only suppresses the reflection step on already-perfect minibatches. This
-    callback raises ``BudgetExhausted`` from ``on_iteration_end`` when the
-    best aggregate score has reached ``perfect_score``; the terrarium runner
-    already catches that and returns the current best candidate, so nothing
-    else has to change.
-    """
-
-    def __init__(self, perfect_score: float) -> None:
-        self._perfect = float(perfect_score)
-
-    def on_iteration_end(self, event: dict[str, Any]) -> None:
-        state = event.get("state")
-        if state is None:
-            return
-        scores = getattr(state, "program_full_scores_val_set", None)
-        if not scores:
-            return
-        best = max(s for s in scores if s is not None)
-        if best >= self._perfect:
-            raise BudgetExhausted(
-                f"perfect score reached: best score {best:.4f} >= {self._perfect}"
-            )
 
 
 def create_adapter(**kwargs: Any) -> GEPAAdapter:
