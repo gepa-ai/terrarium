@@ -374,6 +374,7 @@ class ClaudeCodeAdapter:
         run_dir: str | None = None,
         effort: str | None = None,
         stop_at_score: float | None = None,
+        max_thinking_tokens: int | None = None,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
@@ -386,6 +387,7 @@ class ClaudeCodeAdapter:
         # ``--effort low|medium|high|max`` passed to ``claude --print``.
         # Controls extended-thinking budget. ``None`` = CLI default.
         self.effort = effort
+        self.max_thinking_tokens = max_thinking_tokens
         # Tempdir whose lifetime spans evolve → process_result, so the
         # adapter's workspace is still readable when process_result runs.
         # Cleaned up by process_result; on an evolve error we let
@@ -434,21 +436,26 @@ class ClaudeCodeAdapter:
         cmd = [
             "claude",
             "--print",
+            "--output-format", "json",
             "--model", self.model,
             "--permission-mode", "bypassPermissions",
             "--session-id", session_id,
             "--disallowedTools=WebSearch",
         ]
-        if self.effort is not None:
+        if self.max_thinking_tokens is None and self.effort is not None:
             cmd.extend(["--effort", self.effort])
         if budget.max_token_cost is not None:
             cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
         cmd.append(prompt)
 
         env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+        if self.max_thinking_tokens is not None:
+            env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
+            env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
+        adapter_cost = 0.0
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 cmd,
                 cwd=str(work_dir),
                 env=env,
@@ -456,6 +463,7 @@ class ClaudeCodeAdapter:
                 capture_output=True,
                 text=True,
             )
+            adapter_cost = _extract_claude_cost(proc.stdout)
         except subprocess.TimeoutExpired:
             pass
 
@@ -467,6 +475,7 @@ class ClaudeCodeAdapter:
             total_evals=server.budget.used,
             eval_log=server.eval_log,
             metadata={
+                "adapter_cost": adapter_cost,
                 "session_id": session_id,
                 "work_dir": str(work_dir),
             },
@@ -527,6 +536,18 @@ def _is_under(child: Path, parent: Path) -> bool:
         return child.resolve().is_relative_to(parent.resolve())
     except OSError:
         return False
+
+
+def _extract_claude_cost(stdout: str) -> float:
+    """Extract ``total_cost_usd`` from ``claude --output-format json`` stdout."""
+    stdout = (stdout or "").strip()
+    if not stdout:
+        return 0.0
+    try:
+        payload = json.loads(stdout)
+        return float(payload.get("total_cost_usd", 0.0) or 0.0)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return 0.0
 
 
 def create_adapter(**kwargs: Any) -> ClaudeCodeAdapter:

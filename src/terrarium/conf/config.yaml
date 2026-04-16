@@ -38,6 +38,19 @@ max_concurrency: 8
 # win over this top-level default.
 effort: null
 
+# Fixed thinking-token budget, shared across adapters. Mutually exclusive
+# with ``effort`` — when both are set, max_thinking_tokens wins and effort
+# is ignored. Disables adaptive reasoning and uses a fixed budget:
+#   - ClaudeCodeAdapter / MetaHarnessAdapter: sets env vars
+#     CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 and MAX_THINKING_TOKENS=<value>
+#     on the subprocess (--effort is omitted).
+#   - GEPAAdapter: passes ``thinking={"type": "enabled", "budget_tokens": <value>}``
+#     to litellm (reasoning_effort is dropped).
+# null = provider default (adaptive thinking on supported models).
+# Adapter-level overrides (``adapter.max_thinking_tokens=...``) win.
+#   python -m terrarium max_thinking_tokens=10000
+max_thinking_tokens: null
+
 # Early-stop threshold shared across adapters. When set, adapters terminate
 # once the best score reaches/exceeds this value:
 #   - GEPAAdapter: sets ``stop_at_score`` (callback raises BudgetExhausted)

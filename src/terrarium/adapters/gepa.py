@@ -83,6 +83,7 @@ class GEPAAdapter:
         callbacks: list[Any] | None = None,
         reflection_lm_kwargs: dict[str, Any] | None = None,
         stop_at_score: float | None = None,
+        max_thinking_tokens: int | None = None,
     ) -> None:
         self.run_dir = run_dir
         self.engine = dict(engine) if engine else {}
@@ -102,6 +103,7 @@ class GEPAAdapter:
         # raises ``BudgetExhausted`` from ``on_iteration_end``; the
         # terrarium runner already catches that and returns the current best.
         self.stop_at_score = stop_at_score
+        self.max_thinking_tokens = max_thinking_tokens
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
         from gepa.lm import LM
@@ -112,7 +114,11 @@ class GEPAAdapter:
         reflection_kwargs = dict(self.reflection)
         reflection_lm: LM | None = None
         if "reflection_lm" in reflection_kwargs:
-            reflection_lm = LM(reflection_kwargs["reflection_lm"], **self.reflection_lm_kwargs)
+            lm_kwargs = dict(self.reflection_lm_kwargs)
+            if self.max_thinking_tokens is not None:
+                lm_kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.max_thinking_tokens}
+                lm_kwargs.pop("reasoning_effort", None)
+            reflection_lm = LM(reflection_kwargs["reflection_lm"], **lm_kwargs)
             reflection_kwargs["reflection_lm"] = reflection_lm
 
         # Runner-controlled engine fields override whatever the user set.
@@ -183,8 +189,11 @@ class GEPAAdapter:
             gepa_result = None
 
         reflection_meta: dict[str, Any] = {}
+        adapter_cost = 0.0
         if cost_callback is not None:
             reflection_meta = {"reflection_cost_log": cost_callback.cost_log}
+            if cost_callback.cost_log:
+                adapter_cost = cost_callback.cost_log[-1]["reflection_cost"]
 
         if gepa_result is not None:
             return Result(
@@ -192,7 +201,7 @@ class GEPAAdapter:
                 best_score=gepa_result.val_aggregate_scores[gepa_result.best_idx],
                 total_evals=server.budget.used,
                 eval_log=server.eval_log,
-                metadata={"gepa_result": gepa_result, **reflection_meta},
+                metadata={"gepa_result": gepa_result, "adapter_cost": adapter_cost, **reflection_meta},
             )
 
         return Result(
@@ -200,7 +209,7 @@ class GEPAAdapter:
             best_score=server.best_score,
             total_evals=server.budget.used,
             eval_log=server.eval_log,
-            metadata=reflection_meta,
+            metadata={"adapter_cost": adapter_cost, **reflection_meta},
         )
 
     def process_result(self, result: Result, output_dir: Path) -> None:

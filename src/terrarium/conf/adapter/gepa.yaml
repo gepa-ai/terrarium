@@ -81,3 +81,8 @@ reflection_lm_kwargs: null
 # which only skips the reflection step on already-perfect minibatches.
 #   python -m terrarium adapter=gepa adapter.stop_at_score=100
 stop_at_score: null
+# Fixed thinking-token budget for the reflection LM. When set, passes
+# ``thinking={"type": "enabled", "budget_tokens": <value>}`` to litellm,
+# overriding adaptive/effort-based thinking. null = adaptive (provider default).
+# The runner threads the top-level ``max_thinking_tokens`` here.
+max_thinking_tokens: null

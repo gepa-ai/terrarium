@@ -321,6 +321,7 @@ def _run_proposer(
     timeout: int,
     pending_path: Path,
     log_dir: Path,
+    max_thinking_tokens: int | None = None,
 ) -> tuple[int, float, str]:
     """Launch one proposer session. Returns (exit_code, cost_usd, session_id).
 
@@ -357,7 +358,7 @@ def _run_proposer(
         # Keep the proposer focused locally; never let it browse.
         "--disallowedTools=WebSearch",
     ]
-    if effort is not None:
+    if max_thinking_tokens is None and effort is not None:
         cmd.extend(["--effort", effort])
     if max_budget_usd is not None:
         cmd.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
@@ -372,6 +373,9 @@ def _run_proposer(
     # the 32000 output token maximum". 64k keeps the proposer alive while
     # still bounded. Honor any user override already set in the environment.
     env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
+    if max_thinking_tokens is not None:
+        env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
+        env["MAX_THINKING_TOKENS"] = str(max_thinking_tokens)
 
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"iter{iteration}_stdout.json"
@@ -697,6 +701,7 @@ class MetaHarnessAdapter:
         max_candidates_per_iter: int = 3,
         proposer_timeout: int = 2400,
         stop_at_score: float | None = None,
+        max_thinking_tokens: int | None = None,
     ) -> None:
         self.model = model
         self.effort = effort
@@ -705,6 +710,7 @@ class MetaHarnessAdapter:
         self.max_candidates_per_iter = max(1, int(max_candidates_per_iter))
         self.proposer_timeout = int(proposer_timeout)
         self.stop_at_score = stop_at_score
+        self.max_thinking_tokens = max_thinking_tokens
         self._pending_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     # ---- main entry ----
@@ -782,6 +788,7 @@ class MetaHarnessAdapter:
                 timeout=self.proposer_timeout,
                 pending_path=pending_path,
                 log_dir=sessions_dir,
+                max_thinking_tokens=self.max_thinking_tokens,
             )
             propose_time = time.time() - propose_start
             total_proposer_cost += cost
@@ -807,10 +814,7 @@ class MetaHarnessAdapter:
                     budget_used=budget.used,
                     propose_time=propose_time,
                 )
-                # Don't hammer the API if something is systemically wrong:
-                # break out after a failed proposer call rather than retrying.
                 stop_reason = "proposer_failed"
-                break
 
             candidates = _read_pending(pending_path)
             if not candidates:
@@ -985,7 +989,7 @@ class MetaHarnessAdapter:
                 + (f" {_green('IMPROVED')}" if iter_improved else "")
             )
 
-            if stop_reason in ("eval_budget_exhausted", "perfect_score"):
+            if stop_reason in ("eval_budget_exhausted", "perfect_score", "proposer_failed"):
                 break
 
         _log(
@@ -1016,6 +1020,7 @@ class MetaHarnessAdapter:
             total_evals=budget.used,
             eval_log=server.eval_log,
             metadata={
+                "adapter_cost": total_proposer_cost,
                 "meta_harness": {
                     "iterations_run": iteration,
                     "stop_reason": stop_reason,

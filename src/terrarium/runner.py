@@ -118,7 +118,8 @@ def run(
     result.eval_log = server.eval_log
     result.metadata["wall_time"] = time.time() - start
     result.metadata["budget"] = budget.status()
-    result.metadata["total_cost"] = server.total_cost
+    adapter_cost = float(result.metadata.get("adapter_cost", 0.0))
+    result.metadata["total_cost"] = server.total_cost + adapter_cost
     result.metadata["progress_log"] = server.progress_log
 
     # Hand the result back to the adapter for any artifact persistence
@@ -143,7 +144,7 @@ def run(
             "best_score": result.best_score,
             "total_evals": result.total_evals,
             "wall_time": result.metadata["wall_time"],
-            "total_cost": server.total_cost,
+            "total_cost": result.metadata["total_cost"],
         })
         tracker.end()
 
@@ -198,6 +199,18 @@ def _apply_effort(adapter: Any, effort: str | None) -> None:
         kwargs.setdefault("reasoning_effort", effort)
 
 
+def _apply_max_thinking_tokens(adapter: Any, max_thinking_tokens: int | None) -> None:
+    """Thread the top-level ``max_thinking_tokens`` into adapters that support it.
+
+    Sets ``adapter.max_thinking_tokens`` when the adapter declares it and
+    hasn't already been given a non-null value (user overrides win).
+    """
+    if max_thinking_tokens is None:
+        return
+    if hasattr(adapter, "max_thinking_tokens") and getattr(adapter, "max_thinking_tokens", None) is None:
+        adapter.max_thinking_tokens = int(max_thinking_tokens)
+
+
 def _build_tracking_config(cfg: DictConfig) -> TrackingConfig | None:
     if not cfg.get("enabled", False):
         return None
@@ -237,11 +250,23 @@ def main(cfg: DictConfig) -> None:
     if hasattr(adapter, "run_dir") and not getattr(adapter, "run_dir", None):
         adapter.run_dir = str(adapter_dir)
 
-    # Inject the top-level ``effort`` into whichever knob the adapter exposes.
-    # Adapters opt in by declaring ``effort`` (a plain field — claude_code) or
-    # ``reflection_lm_kwargs`` (a dict of litellm kwargs — gepa). Adapter-level
-    # overrides already set by the user win (we never clobber).
-    _apply_effort(adapter, cfg.get("effort"))
+    # Thinking budget: ``max_thinking_tokens`` (fixed) and ``effort``
+    # (adaptive) are mutually exclusive. When both are provided,
+    # max_thinking_tokens wins and effort is ignored.
+    max_thinking_tokens = cfg.get("max_thinking_tokens")
+    effort = cfg.get("effort")
+    if max_thinking_tokens is not None:
+        if effort is not None:
+            print(
+                f"[terrarium] max_thinking_tokens={max_thinking_tokens} overrides "
+                f"effort={effort} — using fixed thinking budget."
+            )
+        else:
+            print(f"[terrarium] Fixed thinking budget: max_thinking_tokens={max_thinking_tokens}")
+        _apply_max_thinking_tokens(adapter, max_thinking_tokens)
+    elif effort is not None:
+        _apply_effort(adapter, effort)
+
     _apply_perfect_score(adapter, cfg.get("perfect_score"))
 
     tracking = _build_tracking_config(cfg.tracking) if "tracking" in cfg else None

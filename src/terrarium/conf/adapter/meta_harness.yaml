@@ -41,3 +41,8 @@ proposer_timeout: 2400
 # reaches/exceeds this value. The runner threads the top-level
 # ``perfect_score`` here when the user hasn't set it explicitly.
 stop_at_score: null
+# Fixed thinking-token budget for the proposer subprocess. When set,
+# disables adaptive thinking (env vars CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1
+# and MAX_THINKING_TOKENS=<value>). null = adaptive (provider default).
+# The runner threads the top-level ``max_thinking_tokens`` here.
+max_thinking_tokens: null

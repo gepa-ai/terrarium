@@ -13,3 +13,8 @@ effort: null
 # stop once it reaches this score. The runner threads the top-level
 # ``perfect_score`` here when the user hasn't set it explicitly.
 stop_at_score: null
+# Fixed thinking-token budget. When set, disables adaptive thinking and uses
+# a fixed budget (env vars CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 and
+# MAX_THINKING_TOKENS=<value>). null = adaptive (provider default).
+# The runner threads the top-level ``max_thinking_tokens`` here.
+max_thinking_tokens: null
