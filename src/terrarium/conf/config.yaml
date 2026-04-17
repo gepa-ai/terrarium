@@ -51,6 +51,18 @@ effort: null
 #   python -m terrarium max_thinking_tokens=10000
 max_thinking_tokens: null
 
+# Sandbox all claude-code subprocesses (ClaudeCodeAdapter, MetaHarnessAdapter,
+# and GEPA's ClaudeCodeReflectionProposer). When true, each spawned
+# ``claude --print`` gets a ``--settings`` payload that:
+#   - filesystem-sandboxes Bash (bubblewrap on Linux, Seatbelt on macOS)
+#     so shell commands can't read/write outside the adapter's work_dir,
+#   - denies Claude's file tools (Read/Edit/Write/...) access to
+#     credentials / system paths via ``permissions.deny`` rules.
+# See ``terrarium.sandbox`` for details. Adapter-level overrides
+# (``adapter.sandbox=false``) win.
+#   python -m terrarium sandbox=false
+sandbox: false
+
 # Early-stop threshold shared across adapters. When set, adapters terminate
 # once the best score reaches/exceeds this value:
 #   - GEPAAdapter: sets ``stop_at_score`` (callback raises BudgetExhausted)
