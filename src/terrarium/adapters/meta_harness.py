@@ -140,7 +140,7 @@ Check the reports directory (path in the task prompt's "Run directories" section
 
 For each candidate:
 
-1. Write a sketch in `/tmp/` that exercises the core idea in isolation (run code candidates manually; for prompt candidates, at least re-read and self-critique).
+1. Write a sketch in `scratch/` (inside the run's work dir) that exercises the core idea in isolation (run code candidates manually; for prompt candidates, at least re-read and self-critique).
 2. Try 2-3 variants and compare before picking the best one.
 3. Delete sketches when done.
 
@@ -278,6 +278,11 @@ def _materialize_sandbox(work_dir: Path, task: Task, budget: BudgetTracker) -> N
     agents_dir.mkdir(exist_ok=True)
     (agents_dir / "baseline.txt").write_text(task.initial_candidate)
 
+    # Prototype-sketch scratch dir the SKILL directs the proposer to use.
+    # Keeping it inside work_dir means the sandbox allow-list doesn't have
+    # to grant /tmp.
+    (work_dir / "scratch").mkdir(exist_ok=True)
+
     state_dir = work_dir / "state"
     state_dir.mkdir(exist_ok=True)
     (state_dir / "reports").mkdir(exist_ok=True)
@@ -356,14 +361,15 @@ def _run_proposer(
         "--model", model,
         "--session-id", session_id,
     ]
-    # Sandbox whitelists file tools + Bash inside work_dir (+ /tmp for the
-    # SKILL's prototype-sketch step). Network stays off: the proposer only
-    # reads state files and writes new candidates — it never calls the eval
-    # server. Under the sandbox we stay in default permission mode so
-    # unlisted tool calls auto-deny in --print; when sandbox is off, fall
-    # back to bypassPermissions so --print doesn't deadlock on prompts.
+    # Sandbox whitelists file tools + Bash inside work_dir (which includes
+    # work_dir/scratch for the SKILL's prototype-sketch step). Network
+    # stays off: the proposer only reads state files and writes new
+    # candidates — it never calls the eval server. Under the sandbox we
+    # stay in default permission mode so unlisted tool calls auto-deny in
+    # --print; when sandbox is off, fall back to bypassPermissions so
+    # --print doesn't deadlock on prompts.
     if sandbox:
-        cmd.extend(sandbox_args(work_dir, extra_dirs=["/tmp"], allow_network=False))
+        cmd.extend(sandbox_args(work_dir, allow_network=False))
     else:
         cmd.extend(["--permission-mode", "bypassPermissions"])
     if max_thinking_tokens is None and effort is not None:
