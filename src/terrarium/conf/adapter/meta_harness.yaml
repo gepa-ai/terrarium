@@ -34,9 +34,6 @@ run_dir: null
 max_iterations: 10
 max_candidates_per_iter: 3
 
-# Hard timeout (seconds) per proposer subprocess.
-proposer_timeout: 2400
-
 # Whole-loop early-stop threshold. When set, terminate once the best score
 # reaches/exceeds this value. The runner threads the top-level
 # ``perfect_score`` here when the user hasn't set it explicitly.

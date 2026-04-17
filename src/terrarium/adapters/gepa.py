@@ -19,6 +19,10 @@ runner normally injects = ``<hydra_run_dir>/<adapter_name>``) and
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -112,13 +116,28 @@ class GEPAAdapter:
         budget = server.budget
 
         reflection_kwargs = dict(self.reflection)
-        reflection_lm: LM | None = None
+        reflection_lm: Any | None = None
         if "reflection_lm" in reflection_kwargs:
-            lm_kwargs = dict(self.reflection_lm_kwargs)
-            if self.max_thinking_tokens is not None:
-                lm_kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.max_thinking_tokens}
-                lm_kwargs.pop("reasoning_effort", None)
-            reflection_lm = LM(reflection_kwargs["reflection_lm"], **lm_kwargs)
+            lm_name = reflection_kwargs["reflection_lm"]
+            if isinstance(lm_name, str) and lm_name.startswith("claude_code/"):
+                # Run the Claude Code CLI as a subprocess per reflection call.
+                # Extracts ``reasoning_effort`` from reflection_lm_kwargs (claude
+                # uses ``--effort`` not the litellm kwarg); ignored when
+                # max_thinking_tokens is set (mutex — same rule as runner).
+                effort = self.reflection_lm_kwargs.get("reasoning_effort")
+                reflection_lm = ClaudeCodeProposer(
+                    model=lm_name.split("/", 1)[1],
+                    max_budget_usd=budget.max_token_cost,
+                    max_thinking_tokens=self.max_thinking_tokens,
+                    effort=effort,
+                    work_dir=self.run_dir,
+                )
+            else:
+                lm_kwargs = dict(self.reflection_lm_kwargs)
+                if self.max_thinking_tokens is not None:
+                    lm_kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.max_thinking_tokens}
+                    lm_kwargs.pop("reasoning_effort", None)
+                reflection_lm = LM(lm_name, **lm_kwargs)
             reflection_kwargs["reflection_lm"] = reflection_lm
 
         # Runner-controlled engine fields override whatever the user set.
@@ -269,6 +288,173 @@ class _ProgressCallback:
         reflection_cost = self._reflection_lm.total_cost if self._reflection_lm else 0.0
         self._server.log_progress(event["average_score"], candidate=candidate_text, reflection_cost=reflection_cost)
 
+
+
+class ClaudeCodeProposer:
+    """Drop-in replacement for ``gepa.lm.LM`` that routes reflection through
+    the Claude Code CLI instead of litellm.
+
+    Activated by setting ``reflection.reflection_lm=claude_code/<model>`` (e.g.
+    ``claude_code/claude-sonnet-4-6``). Each ``__call__`` spawns one
+    ``claude --print --output-format json`` subprocess with the reflection
+    prompt as a positional argument. Nothing is written to disk — the new
+    candidate text is read straight from the CLI's JSON ``result`` field.
+
+    Conforms to GEPA's LanguageModel protocol ``(str | list[dict]) -> str``
+    and exposes ``total_cost`` / ``total_tokens_in`` / ``total_tokens_out``
+    so ``_ReflectionCostCallback`` and ``_ProgressCallback`` plug in unchanged.
+
+    Budget stopper (same pattern as meta-harness):
+        Before every call, if ``max_budget_usd`` is set and cumulative spend
+        already meets/exceeds it, raise :class:`BudgetExhausted`. GEPA's
+        ``optimize_anything`` catches this at the top level and returns the
+        current best candidate; the terrarium runner re-catches it too.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        max_budget_usd: float | None = None,
+        max_thinking_tokens: int | None = None,
+        effort: str | None = None,
+        work_dir: str | None = None,
+    ) -> None:
+        self.model = model
+        self.max_budget_usd = max_budget_usd
+        self.max_thinking_tokens = max_thinking_tokens
+        self.effort = effort
+        # Anchors the ``claude`` cwd. When None, falls back to a per-call
+        # tempdir. Set to GEPAAdapter.run_dir by the adapter so reflection
+        # transcripts share the same dir.
+        self.work_dir = work_dir
+        self._total_cost: float = 0.0
+        self._total_tokens_in: int = 0
+        self._total_tokens_out: int = 0
+        self._lock = threading.Lock()
+
+    @property
+    def total_cost(self) -> float:
+        return self._total_cost
+
+    @property
+    def total_tokens_in(self) -> int:
+        return self._total_tokens_in
+
+    @property
+    def total_tokens_out(self) -> int:
+        return self._total_tokens_out
+
+    @staticmethod
+    def _flatten_prompt(prompt: str | list[dict[str, Any]]) -> str:
+        """Collapse GEPA's optional message-list prompt to a single string that
+        we can pass as a positional arg to ``claude --print``."""
+        if isinstance(prompt, str):
+            return prompt
+        parts: list[str] = []
+        for m in prompt:
+            if not isinstance(m, dict):
+                parts.append(str(m))
+                continue
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in content
+                )
+            parts.append(f"{role}: {content}" if role else str(content))
+        return "\n\n".join(parts)
+
+    def __call__(self, prompt: str | list[dict[str, Any]]) -> str:
+        # Stopper: refuse further calls once we've hit the token budget cap.
+        if self.max_budget_usd is not None and self._total_cost >= self.max_budget_usd:
+            raise BudgetExhausted(
+                f"claude_code proposer spent ${self._total_cost:.2f} "
+                f">= cap ${self.max_budget_usd:.2f}"
+            )
+
+        prompt_text = self._flatten_prompt(prompt)
+
+        # Same permission-mode / disallowedTools pattern as the other two
+        # claude-spawning adapters (``ClaudeCodeAdapter`` and meta-harness
+        # ``_run_proposer``).
+        cmd: list[str] = [
+            "claude",
+            "--print",
+            prompt_text,
+            "--output-format", "json",
+            "--model", self.model,
+            "--permission-mode", "bypassPermissions",
+            "--disallowedTools=WebSearch",
+        ]
+        # ``max_thinking_tokens`` takes precedence over ``--effort`` (same mutex
+        # rule the runner enforces for the claude_code / meta_harness adapters).
+        if self.max_thinking_tokens is None and self.effort is not None:
+            cmd.extend(["--effort", self.effort])
+        if self.max_budget_usd is not None:
+            remaining = max(0.01, self.max_budget_usd - self._total_cost)
+            cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
+        # ``work_dir`` anchors the ``claude`` cwd; falls back to a per-call
+        # tempdir when the GEPAAdapter didn't provide one.
+        if self.work_dir:
+            work_dir = Path(self.work_dir)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            cleanup: tempfile.TemporaryDirectory[str] | None = None
+        else:
+            cleanup = tempfile.TemporaryDirectory(prefix="terrarium_gepa_reflect_")
+            work_dir = Path(cleanup.name)
+
+        env = {**os.environ}
+        # Strip CLAUDECODE so nested claude-in-claude doesn't confuse the CLI
+        # (same workaround meta-harness uses).
+        env.pop("CLAUDECODE", None)
+        # Raise per-response output cap for long C++ candidate bodies.
+        env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
+        if self.max_thinking_tokens is not None:
+            env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
+            env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
+
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(work_dir), env=env, capture_output=True, text=True
+            )
+        finally:
+            if cleanup is not None:
+                cleanup.cleanup()
+
+        payload: dict[str, Any] = {}
+        stdout = (proc.stdout or "").strip()
+        if stdout:
+            try:
+                payload = json.loads(stdout)
+            except (json.JSONDecodeError, ValueError):
+                payload = {}
+
+        try:
+            cost = float(payload.get("total_cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        usage = payload.get("usage") or {}
+        try:
+            tokens_in = int(usage.get("input_tokens", 0) or 0)
+            tokens_out = int(usage.get("output_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            tokens_in = tokens_out = 0
+        result_text = payload.get("result", "") or ""
+
+        with self._lock:
+            self._total_cost += cost
+            self._total_tokens_in += tokens_in
+            self._total_tokens_out += tokens_out
+
+        return result_text
+
+    def __repr__(self) -> str:
+        return (
+            f"ClaudeCodeProposer(model={self.model!r}, "
+            f"cost=${self._total_cost:.2f})"
+        )
 
 
 def create_adapter(**kwargs: Any) -> GEPAAdapter:

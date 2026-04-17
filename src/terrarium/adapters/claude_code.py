@@ -454,18 +454,14 @@ class ClaudeCodeAdapter:
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
         adapter_cost = 0.0
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(work_dir),
-                env=env,
-                timeout=3600,
-                capture_output=True,
-                text=True,
-            )
-            adapter_cost = _extract_claude_cost(proc.stdout)
-        except subprocess.TimeoutExpired:
-            pass
+        proc = subprocess.run(
+            cmd,
+            cwd=str(work_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        adapter_cost = _extract_claude_cost(proc.stdout)
 
         best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
 

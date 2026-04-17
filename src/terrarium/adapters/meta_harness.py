@@ -318,7 +318,6 @@ def _run_proposer(
     effort: str | None,
     max_candidates: int,
     max_budget_usd: float | None,
-    timeout: int,
     pending_path: Path,
     log_dir: Path,
     max_thinking_tokens: int | None = None,
@@ -385,25 +384,18 @@ def _run_proposer(
     cost_usd = 0.0
     stderr_tail = ""
     result_payload: dict[str, Any] = {}
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(work_dir),
-            env=env,
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-        )
-        exit_code = proc.returncode
-        stdout_path.write_text(proc.stdout or "")
-        stderr_path.write_text(proc.stderr or "")
-        stderr_tail = (proc.stderr or "")[-2000:]
-        cost_usd, result_payload = _parse_proposer_result(proc.stdout or "", work_dir, session_id)
-    except subprocess.TimeoutExpired as e:
-        exit_code = 124
-        stderr_tail = f"Proposer timed out after {timeout}s: {e}"
-        # Even on timeout, the CLI may have written a partial transcript.
-        cost_usd, result_payload = _parse_proposer_result("", work_dir, session_id)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(work_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    exit_code = proc.returncode
+    stdout_path.write_text(proc.stdout or "")
+    stderr_path.write_text(proc.stderr or "")
+    stderr_tail = (proc.stderr or "")[-2000:]
+    cost_usd, result_payload = _parse_proposer_result(proc.stdout or "", work_dir, session_id)
 
     (log_dir / f"iter{iteration}_meta.json").write_text(json.dumps({
         "iteration": iteration,
@@ -677,8 +669,6 @@ class MetaHarnessAdapter:
             going until the eval or token-cost budget is exhausted".
         max_candidates_per_iter: Upper bound on candidates per iteration.
             The proposer may produce fewer.
-        proposer_timeout: Hard timeout (seconds) per proposer subprocess.
-
     Budget enforcement:
         - ``server.budget.max_evals`` is enforced server-side (each
           ``server.evaluate`` increments the counter and raises
@@ -699,7 +689,6 @@ class MetaHarnessAdapter:
         run_dir: str | None = None,
         max_iterations: int | None = None,
         max_candidates_per_iter: int = 3,
-        proposer_timeout: int = 2400,
         stop_at_score: float | None = None,
         max_thinking_tokens: int | None = None,
     ) -> None:
@@ -708,7 +697,6 @@ class MetaHarnessAdapter:
         self.run_dir = run_dir
         self.max_iterations = max_iterations
         self.max_candidates_per_iter = max(1, int(max_candidates_per_iter))
-        self.proposer_timeout = int(proposer_timeout)
         self.stop_at_score = stop_at_score
         self.max_thinking_tokens = max_thinking_tokens
         self._pending_tempdir: tempfile.TemporaryDirectory[str] | None = None
@@ -785,7 +773,6 @@ class MetaHarnessAdapter:
                 effort=self.effort,
                 max_candidates=self.max_candidates_per_iter,
                 max_budget_usd=per_session_cap,
-                timeout=self.proposer_timeout,
                 pending_path=pending_path,
                 log_dir=sessions_dir,
                 max_thinking_tokens=self.max_thinking_tokens,

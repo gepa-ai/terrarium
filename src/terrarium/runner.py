@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -240,6 +241,12 @@ def main(cfg: DictConfig) -> None:
     # Group name chosen from `defaults: - adapter: <name>` (or CLI override).
     adapter_name = hydra_cfg.runtime.choices.get("adapter", "adapter")
     adapter_dir = hydra_out / adapter_name
+
+    try:
+        hydra_out.mkdir(parents=True, exist_ok=True)
+        (hydra_out / "run.pid").write_text(str(os.getpid()))
+    except OSError:
+        pass
 
     adapter = instantiate(cfg.adapter)
 
