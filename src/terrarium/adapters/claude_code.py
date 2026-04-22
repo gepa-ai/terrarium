@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetTracker
+from terrarium.sandbox import sandbox_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -375,6 +376,7 @@ class ClaudeCodeAdapter:
         effort: str | None = None,
         stop_at_score: float | None = None,
         max_thinking_tokens: int | None = None,
+        sandbox: bool | None = None,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
@@ -388,6 +390,10 @@ class ClaudeCodeAdapter:
         # Controls extended-thinking budget. ``None`` = CLI default.
         self.effort = effort
         self.max_thinking_tokens = max_thinking_tokens
+        # Wrap the claude subprocess in ``terrarium.sandbox`` (Bash in
+        # bubblewrap/Seatbelt + file-tool deny rules). None = take the
+        # top-level ``sandbox:`` default from the runner.
+        self.sandbox = sandbox
         # Tempdir whose lifetime spans evolve → process_result, so the
         # adapter's workspace is still readable when process_result runs.
         # Cleaned up by process_result; on an evolve error we let
@@ -438,10 +444,18 @@ class ClaudeCodeAdapter:
             "--print",
             "--output-format", "json",
             "--model", self.model,
-            "--permission-mode", "bypassPermissions",
             "--session-id", session_id,
-            "--disallowedTools=WebSearch",
         ]
+        # Sandbox whitelists file tools + Bash inside work_dir; network stays
+        # on because eval.sh / validate.sh curl the local eval server. Under
+        # the sandbox we stay in default permission mode so anything not
+        # explicitly allowed auto-denies in --print. When sandbox is off,
+        # fall back to bypassPermissions so --print doesn't deadlock on
+        # permission prompts.
+        if self.sandbox:
+            cmd.extend(sandbox_args(work_dir))
+        else:
+            cmd.extend(["--permission-mode", "bypassPermissions"])
         if self.max_thinking_tokens is None and self.effort is not None:
             cmd.extend(["--effort", self.effort])
         if budget.max_token_cost is not None:

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted
+from terrarium.sandbox import sandbox_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -88,6 +89,7 @@ class GEPAAdapter:
         reflection_lm_kwargs: dict[str, Any] | None = None,
         stop_at_score: float | None = None,
         max_thinking_tokens: int | None = None,
+        sandbox: bool | None = None,
     ) -> None:
         self.run_dir = run_dir
         self.engine = dict(engine) if engine else {}
@@ -108,6 +110,10 @@ class GEPAAdapter:
         # terrarium runner already catches that and returns the current best.
         self.stop_at_score = stop_at_score
         self.max_thinking_tokens = max_thinking_tokens
+        # Propagates into ClaudeCodeReflectionProposer (only used when
+        # reflection_lm starts with ``claude_code/``). None = take the
+        # top-level ``sandbox:`` default from the runner.
+        self.sandbox = sandbox
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
         from gepa.lm import LM
@@ -125,12 +131,12 @@ class GEPAAdapter:
                 # uses ``--effort`` not the litellm kwarg); ignored when
                 # max_thinking_tokens is set (mutex — same rule as runner).
                 effort = self.reflection_lm_kwargs.get("reasoning_effort")
-                reflection_lm = ClaudeCodeProposer(
+                reflection_lm = ClaudeCodeReflectionProposer(
                     model=lm_name.split("/", 1)[1],
                     max_budget_usd=budget.max_token_cost,
                     max_thinking_tokens=self.max_thinking_tokens,
                     effort=effort,
-                    work_dir=self.run_dir,
+                    sandbox=bool(self.sandbox),
                 )
             else:
                 lm_kwargs = dict(self.reflection_lm_kwargs)
@@ -290,7 +296,7 @@ class _ProgressCallback:
 
 
 
-class ClaudeCodeProposer:
+class ClaudeCodeReflectionProposer:
     """Drop-in replacement for ``gepa.lm.LM`` that routes reflection through
     the Claude Code CLI instead of litellm.
 
@@ -318,16 +324,13 @@ class ClaudeCodeProposer:
         max_budget_usd: float | None = None,
         max_thinking_tokens: int | None = None,
         effort: str | None = None,
-        work_dir: str | None = None,
+        sandbox: bool = True,
     ) -> None:
         self.model = model
         self.max_budget_usd = max_budget_usd
         self.max_thinking_tokens = max_thinking_tokens
         self.effort = effort
-        # Anchors the ``claude`` cwd. When None, falls back to a per-call
-        # tempdir. Set to GEPAAdapter.run_dir by the adapter so reflection
-        # transcripts share the same dir.
-        self.work_dir = work_dir
+        self.sandbox = sandbox
         self._total_cost: float = 0.0
         self._total_tokens_in: int = 0
         self._total_tokens_out: int = 0
@@ -376,18 +379,32 @@ class ClaudeCodeProposer:
 
         prompt_text = self._flatten_prompt(prompt)
 
-        # Same permission-mode / disallowedTools pattern as the other two
-        # claude-spawning adapters (``ClaudeCodeAdapter`` and meta-harness
-        # ``_run_proposer``).
+        # Reflection is text-in / text-out — the subprocess has no reason to
+        # touch the filesystem or the network. Always spawn inside a fresh
+        # empty tempdir and sandbox it hard: no Bash, no file tools, no
+        # network.
+        cleanup = tempfile.TemporaryDirectory(prefix="terrarium_gepa_reflect_")
+        work_dir = Path(cleanup.name)
+
         cmd: list[str] = [
             "claude",
             "--print",
             prompt_text,
             "--output-format", "json",
             "--model", self.model,
-            "--permission-mode", "bypassPermissions",
-            "--disallowedTools=WebSearch",
         ]
+        if self.sandbox:
+            # Reflection only needs text in / text out: whitelist nothing
+            # (every tool call prompts → auto-denies in --print) and cut
+            # Bash + network at the CLI layer as belt-and-braces.
+            cmd.extend(sandbox_args(
+                work_dir,
+                allow_network=False,
+                allow_bash=False,
+                deny_tools=["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Task", "NotebookEdit"],
+            ))
+        else:
+            cmd.extend(["--permission-mode", "bypassPermissions"])
         # ``max_thinking_tokens`` takes precedence over ``--effort`` (same mutex
         # rule the runner enforces for the claude_code / meta_harness adapters).
         if self.max_thinking_tokens is None and self.effort is not None:
@@ -395,15 +412,6 @@ class ClaudeCodeProposer:
         if self.max_budget_usd is not None:
             remaining = max(0.01, self.max_budget_usd - self._total_cost)
             cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
-        # ``work_dir`` anchors the ``claude`` cwd; falls back to a per-call
-        # tempdir when the GEPAAdapter didn't provide one.
-        if self.work_dir:
-            work_dir = Path(self.work_dir)
-            work_dir.mkdir(parents=True, exist_ok=True)
-            cleanup: tempfile.TemporaryDirectory[str] | None = None
-        else:
-            cleanup = tempfile.TemporaryDirectory(prefix="terrarium_gepa_reflect_")
-            work_dir = Path(cleanup.name)
 
         env = {**os.environ}
         # Strip CLAUDECODE so nested claude-in-claude doesn't confuse the CLI
@@ -420,8 +428,7 @@ class ClaudeCodeProposer:
                 cmd, cwd=str(work_dir), env=env, capture_output=True, text=True
             )
         finally:
-            if cleanup is not None:
-                cleanup.cleanup()
+            cleanup.cleanup()
 
         payload: dict[str, Any] = {}
         stdout = (proc.stdout or "").strip()

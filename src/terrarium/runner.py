@@ -200,6 +200,18 @@ def _apply_effort(adapter: Any, effort: str | None) -> None:
         kwargs.setdefault("reasoning_effort", effort)
 
 
+def _apply_sandbox(adapter: Any, sandbox: bool | None) -> None:
+    """Thread the top-level ``sandbox`` flag into claude-code-based adapters.
+
+    Sets ``adapter.sandbox`` when the adapter declares it and the caller hasn't
+    already set a non-null value in the adapter yaml (user overrides win).
+    """
+    if sandbox is None:
+        return
+    if hasattr(adapter, "sandbox") and getattr(adapter, "sandbox", None) is None:
+        adapter.sandbox = bool(sandbox)
+
+
 def _apply_max_thinking_tokens(adapter: Any, max_thinking_tokens: int | None) -> None:
     """Thread the top-level ``max_thinking_tokens`` into adapters that support it.
 
@@ -275,6 +287,7 @@ def main(cfg: DictConfig) -> None:
         _apply_effort(adapter, effort)
 
     _apply_perfect_score(adapter, cfg.get("perfect_score"))
+    _apply_sandbox(adapter, cfg.get("sandbox"))
 
     tracking = _build_tracking_config(cfg.tracking) if "tracking" in cfg else None
 
