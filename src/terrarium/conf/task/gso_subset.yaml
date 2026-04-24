@@ -1,0 +1,8 @@
+# @package task
+# Curated GSO subset — ~33 instances across numpy, pandas, pillow, pydantic,
+# tornado, tokenizers, and datasets. Excludes repos with complex builds
+# (onnxruntime, llama-cpp-python) or very large images (transformers).
+#
+# For a specific instance, override the name directly:
+#   python -m terrarium task.name=gso_numpy__numpy-ee75c87 adapter=gepa
+name: gso_subset

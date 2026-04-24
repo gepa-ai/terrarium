@@ -20,6 +20,9 @@ frontier_cs = [
     "frontier-cs @ git+https://github.com/FrontierCS/Frontier-CS ; python_version >= '3.11'",
     "datasets>=2.14",
 ]
+gso = [
+    "datasets>=2.14",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
