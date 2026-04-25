@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetTracker
-from terrarium.sandbox import sandbox_args
+from terrarium.sandbox import bwrap_prefix, claude_sandbox_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -439,22 +439,23 @@ class ClaudeCodeAdapter:
         # ``--disallowedTools`` is variadic; pass with ``=`` so it doesn't
         # swallow the trailing positional prompt.
         session_id = str(uuid.uuid4())
-        cmd = [
+        claude_argv = [
             "claude",
             "--print",
             "--output-format", "json",
             "--model", self.model,
             "--session-id", session_id,
         ]
-        # Sandbox whitelists file tools + Bash inside work_dir; network stays
-        # on because eval.sh / validate.sh curl the local eval server. Under
-        # the sandbox we stay in default permission mode so anything not
-        # explicitly allowed auto-denies in --print. When sandbox is off,
-        # fall back to bypassPermissions so --print doesn't deadlock on
-        # permission prompts.
+        # External bwrap jail scopes writes to work_dir; network is shared
+        # so eval.sh / validate.sh can curl the local eval server (and
+        # claude can reach api.anthropic.com). WebFetch/WebSearch denied at
+        # the tool layer; bypassPermissions gives full file/Bash access
+        # inside the jail.
         if self.sandbox:
-            cmd.extend(sandbox_args(work_dir))
+            cmd: list[str] = bwrap_prefix(work_dir) + claude_argv
+            cmd.extend(claude_sandbox_args())
         else:
+            cmd = claude_argv
             cmd.extend(["--permission-mode", "bypassPermissions"])
         if self.max_thinking_tokens is None and self.effort is not None:
             cmd.extend(["--effort", self.effort])

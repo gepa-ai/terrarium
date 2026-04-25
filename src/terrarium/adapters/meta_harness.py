@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
-from terrarium.sandbox import sandbox_args
+from terrarium.sandbox import bwrap_prefix, claude_sandbox_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -353,7 +353,7 @@ def _run_proposer(
     prompt = _render_task_prompt(work_dir, iteration, max_candidates, pending_path)
 
     session_id = str(uuid.uuid4())
-    cmd: list[str] = [
+    claude_argv: list[str] = [
         "claude",
         "--print",
         prompt,
@@ -361,16 +361,17 @@ def _run_proposer(
         "--model", model,
         "--session-id", session_id,
     ]
-    # Sandbox whitelists file tools + Bash inside work_dir (which includes
-    # work_dir/scratch for the SKILL's prototype-sketch step). Network
-    # stays off: the proposer only reads state files and writes new
-    # candidates — it never calls the eval server. Under the sandbox we
-    # stay in default permission mode so unlisted tool calls auto-deny in
-    # --print; when sandbox is off, fall back to bypassPermissions so
-    # --print doesn't deadlock on prompts.
+    # External bwrap jail scopes writes to work_dir (which includes
+    # work_dir/scratch for the SKILL's prototype-sketch step). Network is
+    # shared so claude can reach api.anthropic.com; the proposer doesn't
+    # need to call the eval server itself. WebFetch/WebSearch denied at
+    # the tool layer; under bypassPermissions the agent has full file/Bash
+    # access inside the jail.
     if sandbox:
-        cmd.extend(sandbox_args(work_dir, allow_network=False))
+        cmd: list[str] = bwrap_prefix(work_dir) + claude_argv
+        cmd.extend(claude_sandbox_args())
     else:
+        cmd = claude_argv
         cmd.extend(["--permission-mode", "bypassPermissions"])
     if max_thinking_tokens is None and effort is not None:
         cmd.extend(["--effort", effort])
