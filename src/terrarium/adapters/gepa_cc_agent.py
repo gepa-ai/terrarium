@@ -70,7 +70,7 @@ from typing import Any
 
 from terrarium.adapters.claude_code import _copy_session_transcript
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import bwrap_prefix, claude_sandbox_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix
 
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
@@ -499,27 +499,22 @@ see your reasoning; keep it tight.
         )
 
         session_id = str(uuid.uuid4())
-        claude_argv: list[str] = [
+        # bwrap (when sandboxed) confines writes to run_dir; sibling algos /
+        # other proposers' run_dirs aren't bound, so their paths don't exist
+        # in the jail. Bash stays on so grep/diff/jq/python can analyze past
+        # candidates. Network is shared (claude needs api.anthropic.com);
+        # WebFetch/WebSearch denial is the only outbound brake.
+        cmd: list[str] = bwrap_prefix(self.run_dir) if self.sandbox else []
+        cmd += [
             "claude",
             "--print",
             wrapper,
             "--output-format", "json",
             "--model", self.model,
             "--session-id", session_id,
+            "--permission-mode", "bypassPermissions",
+            DENY_WEB_TOOLS,
         ]
-        if self.sandbox:
-            # External bwrap jail confines all writes to run_dir; sibling
-            # algos / other proposers' run_dirs aren't bound, so their
-            # paths simply don't exist in the jail. Bash stays on because
-            # grep/diff/jq/python make the agent far more effective at
-            # analyzing past candidates than the Claude file tools alone.
-            # Network is shared (claude needs api.anthropic.com); the
-            # WebFetch/WebSearch tool denial is the only outbound brake.
-            cmd: list[str] = bwrap_prefix(self.run_dir) + claude_argv
-            cmd.extend(claude_sandbox_args())
-        else:
-            cmd = claude_argv
-            cmd.extend(["--permission-mode", "bypassPermissions"])
         if self.max_thinking_tokens is None and self.effort is not None:
             cmd.extend(["--effort", self.effort])
         if self.max_budget_usd is not None:

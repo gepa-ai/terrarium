@@ -37,7 +37,10 @@ services.
 Used by every adapter that spawns ``claude``: ``ClaudeCodeAdapter``,
 ``MetaHarnessAdapter``, ``ClaudeCodeReflectionProposer``, and
 ``ClaudeCodeAgentProposer``. Each caller prepends :func:`bwrap_prefix` to
-its argv and appends :func:`claude_sandbox_args` to the ``claude`` flags.
+its argv when sandboxed; the rest of the ``claude`` flags
+(``--permission-mode bypassPermissions`` and the
+:data:`DENY_WEB_TOOLS` ``--disallowedTools=...`` string) are inlined and
+unconditional — they don't depend on whether bwrap wraps the call.
 
 TODO(sandbox-leak): binding ``$HOME/.claude`` writable exposes every prior
 session transcript under ``~/.claude/projects/<project>/<uuid>.jsonl`` to
@@ -79,10 +82,11 @@ _ETC_FILES: tuple[str, ...] = (
     "/etc/alternatives",
 )
 
-# Tools we always deny at the Claude Code layer. The OS jail can't see the
-# difference between ``WebFetch`` and ``curl http://internal``, so this is
-# the only way to keep the agent off the open web.
-_ALWAYS_DENIED_TOOLS: tuple[str, ...] = ("WebFetch", "WebSearch")
+# Always-denied Claude tool flag. WebFetch / WebSearch have no role in GEPA
+# and the OS jail can't tell them apart from arbitrary outbound HTTP, so we
+# stop them at the Claude layer. Reflection-only callers extend this with
+# their own ``--disallowedTools=...`` string instead of layering helpers.
+DENY_WEB_TOOLS: str = "--disallowedTools=WebFetch,WebSearch"
 
 
 def _system_bind_args() -> list[str]:
@@ -159,25 +163,3 @@ def bwrap_prefix(
     return args
 
 
-def claude_sandbox_args(*, deny_tools: list[str] | None = None) -> list[str]:
-    """CLI flags to append to a ``claude --print`` invocation inside bwrap.
-
-    Pairs with :func:`bwrap_prefix`. Always denies ``WebFetch`` and
-    ``WebSearch`` (no way to enforce this at the OS layer once Bash is on
-    the table). Caller can extend the deny list — e.g., reflection-only
-    paths can deny ``Bash``/``Read``/``Edit``/``Write`` to keep the agent
-    purely text-in / text-out.
-
-    Uses ``--permission-mode bypassPermissions`` because under the default
-    mode every unlisted tool call prompts for approval, which auto-denies
-    in ``--print`` (no human to say yes). The OS jail is the real fence;
-    Claude's per-tool allow-list is redundant once bwrap is in place.
-    """
-    disallow: list[str] = list(_ALWAYS_DENIED_TOOLS)
-    for t in deny_tools or ():
-        if t not in disallow:
-            disallow.append(t)
-    return [
-        "--permission-mode", "bypassPermissions",
-        f"--disallowedTools={','.join(disallow)}",
-    ]
