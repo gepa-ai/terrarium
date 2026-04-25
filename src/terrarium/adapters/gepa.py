@@ -123,13 +123,43 @@ class GEPAAdapter:
 
         reflection_kwargs = dict(self.reflection)
         reflection_lm: Any | None = None
+        agent_proposer: Any | None = None
         if "reflection_lm" in reflection_kwargs:
             lm_name = reflection_kwargs["reflection_lm"]
-            if isinstance(lm_name, str) and lm_name.startswith("claude_code/"):
-                # Run the Claude Code CLI as a subprocess per reflection call.
-                # Extracts ``reasoning_effort`` from reflection_lm_kwargs (claude
-                # uses ``--effort`` not the litellm kwarg); ignored when
-                # max_thinking_tokens is set (mutex — same rule as runner).
+            if isinstance(lm_name, str) and lm_name.startswith("claude_code_agent/"):
+                # File-based agent proposer: wired through GEPA's
+                # ``custom_candidate_proposer`` hook, NOT ``reflection_lm``, so
+                # claude receives the structured reflective_dataset (rather
+                # than a pre-rendered prompt). Needs
+                # ``engine.write_agent_state=True`` (set below) so the
+                # run_dir contains agent-readable state files.
+                from terrarium.adapters.gepa_cc_agent import ClaudeCodeAgentProposer
+
+                effort = self.reflection_lm_kwargs.get("reasoning_effort")
+                # Same resolution order other adapters use: adapter-level
+                # override wins, else fall back to the task's fields. These
+                # are what program.md-style proposers need to understand the
+                # scoring rubric — bypassing the reflection_lm path means
+                # we no longer get them for free via the GEPA prompt template.
+                agent_objective = self.objective or task.objective
+                agent_background = self.background or task.background
+                agent_proposer = ClaudeCodeAgentProposer(
+                    model=lm_name.split("/", 1)[1],
+                    run_dir=self.run_dir,
+                    objective=agent_objective,
+                    background=agent_background,
+                    max_budget_usd=budget.max_token_cost,
+                    max_thinking_tokens=self.max_thinking_tokens,
+                    effort=effort,
+                    sandbox=bool(self.sandbox) if self.sandbox is not None else True,
+                )
+                # Strip reflection_lm — GEPA's validation rejects custom_candidate_proposer
+                # when a reflection_lm is also set.
+                reflection_kwargs.pop("reflection_lm", None)
+                reflection_kwargs["custom_candidate_proposer"] = agent_proposer
+            elif isinstance(lm_name, str) and lm_name.startswith("claude_code/"):
+                # Text-only reflection LM: runs claude as a sandboxed subprocess
+                # per reflection call, no filesystem I/O beyond a scratch dir.
                 effort = self.reflection_lm_kwargs.get("reasoning_effort")
                 reflection_lm = ClaudeCodeReflectionProposer(
                     model=lm_name.split("/", 1)[1],
@@ -138,13 +168,14 @@ class GEPAAdapter:
                     effort=effort,
                     sandbox=bool(self.sandbox),
                 )
+                reflection_kwargs["reflection_lm"] = reflection_lm
             else:
                 lm_kwargs = dict(self.reflection_lm_kwargs)
                 if self.max_thinking_tokens is not None:
                     lm_kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.max_thinking_tokens}
                     lm_kwargs.pop("reasoning_effort", None)
                 reflection_lm = LM(lm_name, **lm_kwargs)
-            reflection_kwargs["reflection_lm"] = reflection_lm
+                reflection_kwargs["reflection_lm"] = reflection_lm
 
         # Runner-controlled engine fields override whatever the user set.
         engine_kwargs: dict[str, Any] = {
@@ -152,22 +183,45 @@ class GEPAAdapter:
             "run_dir": self.run_dir,
             "max_metric_calls": budget.max_evals,
         }
-        if budget.max_token_cost is not None:
+        # Agent proposer reads history from run_dir → needs the engine to write
+        # its state to disk as agent-readable files. Respect user override.
+        if agent_proposer is not None:
+            engine_kwargs.setdefault("write_agent_state", True)
+
+        cost_source = reflection_lm or agent_proposer
+        # GEPA's ``engine.max_reflection_cost`` wires a ``MaxReflectionCostStopper``
+        # against ``config.reflection.reflection_lm``. On the agent-proposer path
+        # that field is ``None`` (we stripped it for the custom_candidate_proposer
+        # contract), so the auto-wired stopper reads ``0.0`` forever and never
+        # fires. Meanwhile the proposer's own ``raise BudgetExhausted`` is
+        # swallowed by the blanket ``except Exception`` in
+        # ``reflective_mutation.execute_proposal`` — resulting in an infinite
+        # loop of no-op iterations. Wire the stopper ourselves, pointing at
+        # whichever cost source is active.
+        if budget.max_token_cost is not None and cost_source is None:
             engine_kwargs["max_reflection_cost"] = budget.max_token_cost
 
         cost_callback: _ReflectionCostCallback | None = None
         callbacks = list(self.callbacks)
-        if reflection_lm is not None:
-            cost_callback = _ReflectionCostCallback(reflection_lm, server.tracker, output_dir=self.run_dir)
+        if cost_source is not None:
+            cost_callback = _ReflectionCostCallback(cost_source, server.tracker, output_dir=self.run_dir)
             callbacks.append(cost_callback)
 
+        if agent_proposer is not None:
+            callbacks.append(_ReflectiveDatasetDumpCallback(self.run_dir))
+
         if task.val_set:
-            callbacks.append(_ProgressCallback(server, reflection_lm=reflection_lm))
+            callbacks.append(_ProgressCallback(server, reflection_lm=cost_source))
 
         stop_callbacks: list[Any] = []
         if self.stop_at_score is not None:
             from gepa.utils.stop_condition import ScoreThresholdStopper
             stop_callbacks.append(ScoreThresholdStopper(self.stop_at_score))
+        if budget.max_token_cost is not None and cost_source is not None:
+            from gepa.utils.stop_condition import MaxReflectionCostStopper
+            stop_callbacks.append(
+                MaxReflectionCostStopper(budget.max_token_cost, reflection_lm=cost_source)
+            )
 
         # GEPAConfig.__post_init__ converts dict -> nested config dataclass.
         config = GEPAConfig(
@@ -293,6 +347,38 @@ class _ProgressCallback:
         candidate_text = next(iter(candidate_dict.values()), None) if candidate_dict else None
         reflection_cost = self._reflection_lm.total_cost if self._reflection_lm else 0.0
         self._server.log_progress(event["average_score"], candidate=candidate_text, reflection_cost=reflection_cost)
+
+
+class _ReflectiveDatasetDumpCallback:
+    """Write each iteration's reflective_dataset to disk under run_dir.
+
+    GEPA core writes per-iteration meta / components / trace under
+    ``iterations/NNNNN/`` (with ``NNNNN = state.i + 1`` — seed owns id 0),
+    but the **adapter-curated** reflective_dataset (the thing the LM
+    normally sees as ``<side_info>``) is never persisted by core. This
+    callback closes that gap so the agent proposer can browse past
+    iterations' structured feedback via
+    ``iterations/NNNNN/reflective_dataset.json``.
+
+    Only installed when the file-based agent proposer is selected.
+    """
+
+    def __init__(self, run_dir: str | Path | None) -> None:
+        self._run_dir = Path(run_dir) if run_dir is not None else None
+
+    def on_reflective_dataset_built(self, event: dict[str, Any]) -> None:
+        if self._run_dir is None:
+            return
+        iteration = event.get("iteration")
+        dataset = event.get("dataset") or event.get("reflective_dataset")
+        if iteration is None or dataset is None:
+            return
+        # ``event["iteration"]`` is ``ctx.iteration`` — the 1-indexed
+        # on-disk iteration id (seed owns 0, first loop proposal is 1).
+        # No shifting needed.
+        target = self._run_dir / "iterations" / f"{int(iteration):05d}" / "reflective_dataset.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(dataset, indent=2, default=str))
 
 
 
