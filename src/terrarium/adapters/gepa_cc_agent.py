@@ -61,6 +61,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -302,80 +303,89 @@ class ClaudeCodeAgentProposer:
         copy of its parent iteration) so it can plan with full context
         without loading the whole ``iterations/`` tree.
         """
-        rel = subdir.relative_to(self.run_dir).as_posix()
+        # Absolute paths everywhere so the agent's reads/writes resolve
+        # regardless of its cwd. We deliberately spawn ``claude --print``
+        # from a tempdir OUTSIDE ``terrarium/`` (see ``propose_new_texts``)
+        # to prevent Claude Code's CLAUDE.md walk-up from disclosing the
+        # auto-memory pointer; that means the agent's cwd is no longer
+        # ``run_dir``, so prompt paths can't be ``run_dir``-relative.
+        run_abs = self.run_dir.resolve()
+        sub_abs = subdir.resolve()
         task_md_exists = (self.objective is not None) or (self.background is not None)
-        # Listed in the Outputs section below — carries both the stem (for
-        # reflection file lookup) and the write path. No sidecar
-        # ``components_to_update.json`` / ``_index.json`` needed.
         files_to_produce = "\n".join(
-            f"- `{rel}/new/{stems[name]}.md`  (component {name!r})"
+            f"- `{sub_abs}/new/{stems[name]}.md`  (component {name!r})"
             for name in components
         )
         task_section = (
-            "## Task\nThe problem statement and **scoring rubric** are in "
-            "`task.md` at the top of the working directory. Read it first — "
-            "it defines what a higher score means and, for graded problems, "
-            "what the achievable range actually is. Do not assume a score of "
-            "1.0 is perfect unless `task.md` says so.\n\n"
+            f"## Task\nThe problem statement and **scoring rubric** are in "
+            f"`{run_abs}/task.md`. Read it first — it defines what a higher "
+            "score means and, for graded problems, what the achievable range "
+            "actually is. Do not assume a score of 1.0 is perfect unless "
+            "`task.md` says so.\n\n"
             if task_md_exists
             else ""
         )
         if first_iteration:
             history_section = (
-                "## History\nThis is the first proposal in this run — there "
-                "is no `history.md` yet. Your `parent/` directory contains "
-                "the **seed program** (no `plan.md`).\n\n"
+                f"## History\nThis is the first proposal in this run — there "
+                f"is no `history.md` yet. Your `{sub_abs}/parent/` directory "
+                "contains the **seed program** (no `plan.md`).\n\n"
             )
         else:
             history_section = (
-                "## History\nRead `history.md` at the top of the working "
-                "directory **first**. It's a chronological log of every "
-                "prior iteration's short plan and score outcome (accepted "
-                "or rejected). Use it to avoid repeating strategies that "
-                "have already been tried and to build on what worked.\n\n"
+                f"## History\nRead `{run_abs}/history.md` **first**. It's a "
+                "chronological log of every prior iteration's short plan and "
+                "score outcome (accepted or rejected). Use it to avoid "
+                "repeating strategies that have already been tried and to "
+                "build on what worked.\n\n"
             )
         # Enumerate concrete input paths per component, same pattern the
         # Outputs section uses. Passing literal ``<stem>`` placeholders
         # confused the agent — it Read the placeholder filename verbatim and
         # errored out. We have the real filenames in ``stems``; use them.
         parent_component_lines = "\n".join(
-            f"   - `{rel}/parent/components/{stems[name]}.txt`  (component {name!r})"
+            f"   - `{sub_abs}/parent/components/{stems[name]}.txt`  (component {name!r})"
             for name in sorted(stems)
         )
         reflection_lines = "\n".join(
-            f"   - `{rel}/reflection/{stems[name]}.json`  (component {name!r})"
+            f"   - `{sub_abs}/reflection/{stems[name]}.json`  (component {name!r})"
             for name in components
         )
         parent_section = (
-            f"3. `{rel}/parent/` — parent iteration (`plan.md`, `meta.json`, "
-            f"`val_scores.json`, plus component files):\n{parent_component_lines}"
+            f"3. `{sub_abs}/parent/` — parent iteration (`plan.md`, "
+            f"`meta.json`, `val_scores.json`, plus component files):\n"
+            f"{parent_component_lines}"
         )
         if parent_iter_id is not None:
             parent_section += (
                 f"\n   For full rollout outputs see "
-                f"`iterations/{parent_iter_id:05d}/outputs/` + `trajectories/`."
+                f"`{run_abs}/iterations/{parent_iter_id:05d}/outputs/` + "
+                f"`{run_abs}/iterations/{parent_iter_id:05d}/trajectories/`."
             )
         return f"""\
 You are proposing improved text for one or more components of a program.
 Your goal is to raise the program's aggregate score on
 future evaluations, based on the reflective feedback from past runs.
 
-Your working directory is the shared run directory. All inputs and
-outputs for **this** proposal call live under:
-  `{rel}/`
+All inputs and outputs for **this** proposal call live under:
+  `{sub_abs}/`
+The shared run directory is at:
+  `{run_abs}/`
+Use these absolute paths in every Read/Write/Bash call — your cwd is
+an isolated tempdir, not the run directory.
 
 {task_section}{history_section}## Inputs (read in this order)
-1. `task.md` — problem statement + scoring rubric.
-2. `history.md` — chronological log of prior iterations' plans and scores.
+1. `{run_abs}/task.md` — problem statement + scoring rubric.
+2. `{run_abs}/history.md` — chronological log of prior iterations' plans and scores.
 {parent_section}
 4. Per-example feedback for each component to update:
 {reflection_lines}
 
 ## Wider state (browse when useful)
-- `iterations/NNNNN/` — every past iteration (accepted *and* rejected),
-  with `meta.json`, `components/`, `plan.md`, `reflective_dataset.json`,
-  `trace.json`. `00000/` is always the seed program.
-- `pareto/` — current Pareto frontier(s) keyed by iteration id.
+- `{run_abs}/iterations/NNNNN/` — every past iteration (accepted *and*
+  rejected), with `meta.json`, `components/`, `plan.md`,
+  `reflective_dataset.json`, `trace.json`. `00000/` is always the seed.
+- `{run_abs}/pareto/` — current Pareto frontier(s) keyed by iteration id.
 
 ## Outputs you must produce
 One improved-text file per component:
@@ -384,13 +394,13 @@ One improved-text file per component:
 Wrap the new component text in a single ```…``` fenced block. Anything
 outside the block is treated as rationale and discarded by the engine.
 
-**Also** write a short plan to `{rel}/plan.md` — **≤50 words**, plain prose.
-Describe what you're changing and why. This file is concatenated with
-every prior iteration's plan into `history.md` so future proposers can
-see your reasoning; keep it tight.
+**Also** write a short plan to `{sub_abs}/plan.md` — **≤50 words**, plain
+prose. Describe what you're changing and why. This file is concatenated
+with every prior iteration's plan into `history.md` so future proposers
+can see your reasoning; keep it tight.
 
 ## Rules
-- Write only inside `{rel}/new/` and `{rel}/plan.md`.
+- Write only inside `{sub_abs}/new/` and `{sub_abs}/plan.md`.
 - Do not modify other iterations, state files, `task.md`, `history.md`,
   or another proposal's directory.
 - Do not attempt to run any evaluations or verifications.
@@ -530,9 +540,19 @@ see your reasoning; keep it tight.
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
-        proc = subprocess.run(
-            cmd, cwd=str(self.run_dir), env=env, capture_output=True, text=True
-        )
+        # Outer cwd = a tempdir OUTSIDE the terrarium tree. Claude Code's
+        # CLAUDE.md walk-up (which discovers the auto-memory pointer at
+        # ~/.claude/projects/<terrarium-slug>/memory/*.md) follows the
+        # spawning process's cwd; if that's anywhere under terrarium/, the
+        # parent CLAUDE.md is found and the auto-memory file becomes
+        # readable from inside the jail — a real cheating channel for
+        # GEPA proposers (sibling proposers' notes leak in). Spawning from
+        # a tempdir breaks the walk-up. The agent reaches run_dir via the
+        # absolute paths embedded in ``_wrapper_prompt``.
+        with tempfile.TemporaryDirectory(prefix="terrarium_gepa_cc_agent_") as outer_cwd:
+            proc = subprocess.run(
+                cmd, cwd=outer_cwd, env=env, capture_output=True, text=True
+            )
         _copy_session_transcript(self.run_dir, session_id, subdir)
 
         payload: dict[str, Any] = {}
