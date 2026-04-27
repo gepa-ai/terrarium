@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import bwrap_prefix
+from terrarium.sandbox import bwrap_prefix, claude_settings_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -511,6 +511,8 @@ class ClaudeCodeReflectionProposer:
             "--permission-mode", "bypassPermissions",
             "--disallowedTools=WebFetch,WebSearch,Bash,Read,Edit,Write,Glob,Grep,Task,NotebookEdit",
         ]
+        if self.sandbox:
+            cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
         # ``max_thinking_tokens`` takes precedence over ``--effort`` (same mutex
         # rule the runner enforces for the claude_code / meta_harness adapters).
         if self.max_thinking_tokens is None and self.effort is not None:

@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -369,6 +369,8 @@ def _run_proposer(
         "--permission-mode", "bypassPermissions",
         DENY_WEB_TOOLS,
     ]
+    if sandbox:
+        cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
     if max_thinking_tokens is None and effort is not None:
         cmd.extend(["--effort", effort])
     if max_budget_usd is not None:

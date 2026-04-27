@@ -55,8 +55,23 @@ then update ``_copy_session_transcript`` to read from the per-job HOME.
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 from pathlib import Path
+from typing import Any
+
+# Linux uses bwrap (below); macOS has no bwrap, so we fall back to Claude
+# Code's built-in ``sandbox.enabled: true`` + Seatbelt — the same approach
+# we used before the upstream bwrap rewrite. The internal sandbox crashes
+# on Ubuntu 24.04 (the bug that motivated the bwrap rewrite) but works
+# fine on macOS, so we keep it as the macOS-only path.
+_IS_MACOS = sys.platform == "darwin"
+
+# Content-bearing file tools we whitelist per allowed directory on the
+# macOS Seatbelt path. Glob is deliberately excluded — it auto-allows
+# regardless of rules and only returns filenames (no content).
+_FILE_TOOLS: tuple[str, ...] = ("Read", "Grep", "Edit", "Write", "NotebookEdit")
 
 # System directories we expose read-only. For each, we check at runtime:
 # symlink → recreate with ``--symlink``; real dir → ``--ro-bind``; missing
@@ -115,10 +130,15 @@ def bwrap_prefix(
     extra_writable: list[Path | str] | None = None,
 ) -> list[str]:
     """Return the ``bwrap`` argv prefix that jails everything that follows.
+    Returns ``[]`` on macOS — that platform uses :func:`claude_settings_args`
+    as a fallback because ``bwrap`` is Linux-only.
 
-    Caller usage::
+    Caller usage (works on both platforms)::
 
-        cmd = bwrap_prefix(work_dir) + ["claude", "--print", ..., *claude_sandbox_args()]
+        cmd = bwrap_prefix(work_dir)               # Linux: bwrap argv. macOS: [].
+        cmd += ["claude", "--print", ...]
+        cmd += claude_settings_args(work_dir)      # macOS: --settings JSON. Linux: [].
+        cmd += ["--permission-mode", ..., DENY_WEB_TOOLS]
         subprocess.run(cmd, env=env, capture_output=True, text=True)
 
     ``--chdir`` is set to ``work_dir`` inside the jail, so ``cwd=`` on the
@@ -132,6 +152,10 @@ def bwrap_prefix(
         extra_writable: Additional paths to bind read-write (e.g., a shared
             cache directory).
     """
+    if _IS_MACOS:
+        # No bwrap on macOS — caller should use claude_settings_args() instead.
+        return []
+
     home = Path.home()
     work = Path(work_dir).resolve()
 
@@ -161,5 +185,75 @@ def bwrap_prefix(
         resolved = str(Path(p).resolve())
         args.extend(["--bind", resolved, resolved])
     return args
+
+
+# ---------------------------------------------------------------------------
+# macOS fallback: Claude Code's built-in sandbox via ``--settings`` JSON.
+# ---------------------------------------------------------------------------
+# Linux uses bwrap; macOS has no bwrap, so we route sandbox=True on macOS
+# through the pre-rewrite mechanism: ``sandbox.enabled: true`` (Seatbelt)
+# plus a tool allow-list. Same approach upstream replaced — but the bug
+# they replaced it for (``--tmpfs /sbin`` on Ubuntu 24.04) is Linux-only;
+# Seatbelt works fine on macOS.
+
+
+def _abs_glob(path: str) -> str:
+    """Format an absolute path as Claude's ``//<path>/**`` rule pattern."""
+    return f"/{path}/**"
+
+
+def _build_macos_sandbox_settings(
+    work_dir: Path | str,
+    *,
+    extra_writable: list[Path | str] | None = None,
+) -> dict[str, Any]:
+    """Build a settings.json dict that confines ``claude`` to ``work_dir``
+    via Claude Code's internal sandbox (Seatbelt on macOS).
+
+    Two layers:
+    - ``sandbox.filesystem.{allow,deny}{Read,Write}``: OS-level confinement
+      of Bash subprocesses.
+    - ``permissions.allow``: tool-level whitelist for Read/Grep/Edit/Write/
+      NotebookEdit. With ``--permission-mode bypassPermissions`` on the
+      caller side this is mostly advisory (Claude won't ask), but the OS
+      sandbox still enforces filesystem confinement.
+    """
+    paths = [str(Path(work_dir).resolve())]
+    paths.extend(str(Path(p).resolve()) for p in extra_writable or ())
+    allow_rules: list[str] = [
+        f"{tool}({_abs_glob(p)})" for p in paths for tool in _FILE_TOOLS
+    ]
+    allow_rules.append("Bash(*)")
+    return {
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": False,
+            "filesystem": {
+                "denyRead":  ["//", "~/"],
+                "allowRead":  paths,
+                "denyWrite": ["//", "~/"],
+                "allowWrite": paths,
+            },
+        },
+        "permissions": {"allow": allow_rules},
+    }
+
+
+def claude_settings_args(
+    work_dir: Path | str,
+    *,
+    extra_writable: list[Path | str] | None = None,
+) -> list[str]:
+    """Return ``--settings <json>`` claude args for the macOS Seatbelt path.
+
+    No-op on Linux: returns ``[]``, since :func:`bwrap_prefix` already
+    confines the process there. Callers should prepend ``bwrap_prefix(...)``
+    for the OS jail and append ``claude_settings_args(...)`` after the
+    ``claude`` binary; both are platform-correct.
+    """
+    if not _IS_MACOS:
+        return []
+    settings = _build_macos_sandbox_settings(work_dir, extra_writable=extra_writable)
+    return ["--settings", json.dumps(settings)]
 
 
