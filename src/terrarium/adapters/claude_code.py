@@ -27,16 +27,12 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetTracker
-from terrarium.sandbox import sandbox_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix
 from terrarium.task import Task
 
 if TYPE_CHECKING:
     from terrarium.eval_server import EvalServer
 
-
-def _abs_str(p: Path | str) -> str:
-    """Format an absolute path as Claude's ``//<path>`` permission-rule form."""
-    return f"/{Path(p).resolve()}"
 
 # Single-task eval script: one POST per call, returns one score.
 # Usage: ./eval.sh <candidate_file>
@@ -531,52 +527,21 @@ class ClaudeCodeAdapter:
         # ``--disallowedTools`` is variadic; pass with ``=`` so it doesn't
         # swallow the trailing positional prompt.
         session_id = str(uuid.uuid4())
-        cmd = [
+        # bwrap (when sandboxed) scopes writes to work_dir; network is
+        # shared so eval.sh / validate.sh can curl the local eval server
+        # (and claude can reach api.anthropic.com). WebFetch/WebSearch
+        # denied at the tool layer; bypassPermissions gives full file/Bash
+        # access inside the jail.
+        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
+        cmd += [
             "claude",
             "--print",
             "--output-format", "json",
             "--model", self.model,
             "--session-id", session_id,
+            "--permission-mode", "bypassPermissions",
+            DENY_WEB_TOOLS,
         ]
-        # Sandbox whitelists file tools + Bash inside work_dir; network stays
-        # on because eval.sh / validate.sh curl the local eval server. Under
-        # the sandbox we stay in default permission mode so anything not
-        # explicitly allowed auto-denies in --print. When sandbox is off,
-        # fall back to bypassPermissions so --print doesn't deadlock on
-        # permission prompts.
-        if self.sandbox:
-            # Claude Code's macOS sandbox blocks /dev/tcp and external binaries
-            # (cat, curl, jq), so eval.sh / validate.sh can't run inside it.
-            # Fix per https://code.claude.com/docs/en/sandboxing — list those
-            # scripts in ``excludedCommands`` so they run unsandboxed (with
-            # full network + system-tool access). To keep the escape hatch
-            # safe, simultaneously:
-            #   - deny the project source dir at the OS layer so other
-            #     sandboxed Bash calls can't ``cat`` it (anti-cheat),
-            #   - deny Read/Edit/Write of eval.sh + validate.sh through the
-            #     permission allow-list so claude can't rewrite the
-            #     unsandboxed scripts to do something else.
-            repo_src = Path(__file__).resolve().parents[3] / "src"
-            eval_sh = work_dir / "eval.sh"
-            validate_sh = work_dir / "validate.sh"
-            cmd.extend(sandbox_args(
-                work_dir,
-                excluded_commands=[
-                    "./eval.sh", "./eval.sh *",
-                    "bash ./eval.sh", "bash ./eval.sh *",
-                    "./validate.sh", "./validate.sh *",
-                    "bash ./validate.sh", "bash ./validate.sh *",
-                ],
-                deny_paths=[repo_src],
-                deny_tool_patterns=[
-                    f"Edit({_abs_str(eval_sh)})",
-                    f"Write({_abs_str(eval_sh)})",
-                    f"Edit({_abs_str(validate_sh)})",
-                    f"Write({_abs_str(validate_sh)})",
-                ],
-            ))
-        else:
-            cmd.extend(["--permission-mode", "bypassPermissions"])
         if self.max_thinking_tokens is None and self.effort is not None:
             cmd.extend(["--effort", self.effort])
         if budget.max_token_cost is not None:

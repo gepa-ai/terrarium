@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import sandbox_args
+from terrarium.sandbox import bwrap_prefix
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -496,25 +496,21 @@ class ClaudeCodeReflectionProposer:
         cleanup = tempfile.TemporaryDirectory(prefix="terrarium_gepa_reflect_")
         work_dir = Path(cleanup.name)
 
-        cmd: list[str] = [
+        # Reflection is text-in / text-out: deny every tool so even if the
+        # model tries to call Bash/Read/Edit it auto-fails. bwrap (when
+        # sandboxed) is belt; the deny list is braces. Network stays
+        # shared (claude needs api.anthropic.com); with no Bash there's
+        # nothing to curl from inside the jail anyway.
+        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
+        cmd += [
             "claude",
             "--print",
             prompt_text,
             "--output-format", "json",
             "--model", self.model,
+            "--permission-mode", "bypassPermissions",
+            "--disallowedTools=WebFetch,WebSearch,Bash,Read,Edit,Write,Glob,Grep,Task,NotebookEdit",
         ]
-        if self.sandbox:
-            # Reflection only needs text in / text out: whitelist nothing
-            # (every tool call prompts → auto-denies in --print) and cut
-            # Bash + network at the CLI layer as belt-and-braces.
-            cmd.extend(sandbox_args(
-                work_dir,
-                allow_network=False,
-                allow_bash=False,
-                deny_tools=["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Task", "NotebookEdit"],
-            ))
-        else:
-            cmd.extend(["--permission-mode", "bypassPermissions"])
         # ``max_thinking_tokens`` takes precedence over ``--effort`` (same mutex
         # rule the runner enforces for the claude_code / meta_harness adapters).
         if self.max_thinking_tokens is None and self.effort is not None:

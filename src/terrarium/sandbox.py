@@ -1,165 +1,165 @@
-"""Lightweight sandboxing for ``claude --print`` subprocesses.
+"""External bubblewrap jail for ``claude --print`` subprocesses.
 
-Builds the settings-JSON payload and CLI flags that confine a spawned
-``claude`` session to a specific working directory. Two layers:
+Wraps the whole ``claude`` invocation in our own ``bwrap`` namespace instead
+of relying on Claude Code's built-in ``sandbox.enabled: true`` settings. The
+internal sandbox crashes on Ubuntu 24.04 with
+``bwrap: Can't mount tmpfs on /newroot/sbin: No such file or directory``
+because it tries to mount tmpfs on top of ``/sbin``, which is a symlink in
+the merged-``/usr`` layout. We control the bwrap argv, so we can detect
+symlinks and emit ``--symlink`` instead of ``--tmpfs``.
 
-- **OS sandbox** (``sandbox.filesystem.*``) — bubblewrap on Linux, Seatbelt
-  on macOS. Wraps **Bash tool calls only**: shell commands spawned by the
-  session can read/write only inside ``work_dir`` (+ ``extra_dirs``).
-  See: https://code.claude.com/docs/en/sandboxing
+Layout we expose inside the jail:
 
-- **Tool permission allow-list** (``permissions.allow``) — whitelists the
-  content-bearing file tools (Read/Grep/Edit/Write/NotebookEdit) to
-  ``work_dir``. Because we **do not** pass ``--permission-mode
-  bypassPermissions``, Claude falls into the default mode, which prompts
-  for any unlisted tool call — and those prompts auto-deny in ``--print``
-  (no human to approve). So allow-only acts as a strict whitelist; no
-  deny rules are necessary.
-  Glob is left unrestricted: empirically it ignores the permission rules
-  and the OS sandbox, but it only returns file *names* (no content), so
-  leaking directory listings outside ``work_dir`` is an acceptable loss.
-  See: https://code.claude.com/docs/en/permissions#read-and-edit
+- ``/usr`` and friends: read-only bind, with symlinks recreated for
+  merged-``/usr`` distros (Ubuntu 24.04+, Fedora, Arch). On older Debian /
+  RHEL where ``/bin`` is a real directory, those paths get ``--ro-bind``
+  instead.
+- ``/etc``: only the handful of files needed for DNS, certs, and user
+  lookups (``resolv.conf``, ``hosts``, ``passwd``, ``group``, ``ssl``...).
+  The surrounding ``/etc`` is bwrap's auto-created tmpfs, so writes to
+  ``/etc`` succeed inside the jail but do not leak to the host.
+- ``/proc``, ``/dev``, ``/tmp``: standard mounts (``--proc``, ``--dev``,
+  fresh ``--tmpfs``).
+- ``$HOME/.claude``, ``$HOME/.claude.json``, ``$HOME/.cache``: writable —
+  Claude Code stores sessions, config, and caches here.
+- ``$HOME/.local``: read-only — ``claude`` itself lives under here.
+- ``work_dir``: the only writable path under ``/data``-style trees. Sibling
+  run dirs are completely invisible (their parent paths aren't bound, so
+  ``ls`` on the parent shows only the path stem leading to ``work_dir``).
+
+Network namespace is shared with the host (no ``--unshare-net``) so the
+agent can reach ``localhost:<eval-server-port>`` and ``api.anthropic.com``.
+``WebFetch`` / ``WebSearch`` are denied at the tool layer; arbitrary
+``curl`` from Bash inside the jail is *not* blocked — acceptable trade for
+the GEPA-proposer use case where there's no incentive to phone external
+services.
 
 Used by every adapter that spawns ``claude``: ``ClaudeCodeAdapter``,
-``MetaHarnessAdapter``, and ``GEPAAdapter``'s ``ClaudeCodeReflectionProposer``.
-Each caller just appends the output of :func:`sandbox_args` to its own
-``claude --print`` argv.
+``MetaHarnessAdapter``, ``ClaudeCodeReflectionProposer``, and
+``ClaudeCodeAgentProposer``. Each caller prepends :func:`bwrap_prefix` to
+its argv when sandboxed; the rest of the ``claude`` flags
+(``--permission-mode bypassPermissions`` and the
+:data:`DENY_WEB_TOOLS` ``--disallowedTools=...`` string) are inlined and
+unconditional — they don't depend on whether bwrap wraps the call.
+
+TODO(sandbox-leak): binding ``$HOME/.claude`` writable exposes every prior
+session transcript under ``~/.claude/projects/<project>/<uuid>.jsonl`` to
+the sandboxed agent. Confirmed reproducible: a probe ``grep -r SECRET /``
+inside the jail finds markers planted by the parent Claude Code session
+because the parent's transcript is in the same projects dir. For GEPA
+proposers this is a real cheating channel — sibling proposer transcripts
+contain their full code attempts and scores. Fix idea: per-job HOME with a
+copy of ``.claude.json`` (auth) and a fresh empty ``.claude/projects/``,
+then update ``_copy_session_transcript`` to read from the per-job HOME.
 """
 
 from __future__ import annotations
 
-import json
+import os
 from pathlib import Path
-from typing import Any
 
-# Tools we always deny: evolution is local, no reason to browse.
-_ALWAYS_DENIED_TOOLS: tuple[str, ...] = ("WebFetch", "WebSearch")
+# System directories we expose read-only. For each, we check at runtime:
+# symlink → recreate with ``--symlink``; real dir → ``--ro-bind``; missing
+# → skip. This handles both merged-/usr (Ubuntu 24.04+) and split layouts.
+_SYSTEM_PATHS: tuple[str, ...] = (
+    "/bin", "/sbin", "/lib", "/lib32", "/lib64",
+    "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64",
+    "/usr/local",
+)
 
-# Content-bearing file tools we whitelist per allowed directory. Glob is
-# deliberately excluded — it auto-allows regardless of rules, but only
-# returns filenames (no content), so listing escape is accepted.
-_FILE_TOOLS: tuple[str, ...] = ("Read", "Grep", "Edit", "Write", "NotebookEdit")
+# Individual /etc files needed for DNS, certs, and user/group lookups.
+# Bound individually so the rest of /etc stays a clean tmpfs in the jail.
+_ETC_FILES: tuple[str, ...] = (
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/ld.so.cache",
+    "/etc/localtime",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/alternatives",
+)
+
+# Always-denied Claude tool flag. WebFetch / WebSearch have no role in GEPA
+# and the OS jail can't tell them apart from arbitrary outbound HTTP, so we
+# stop them at the Claude layer. Reflection-only callers extend this with
+# their own ``--disallowedTools=...`` string instead of layering helpers.
+DENY_WEB_TOOLS: str = "--disallowedTools=WebFetch,WebSearch"
 
 
-def _abs_glob(path: str) -> str:
-    """Format an absolute path as Claude's ``//<path>/**`` rule pattern."""
-    return f"/{path}/**"
+def _system_bind_args() -> list[str]:
+    """Build ``--ro-bind`` / ``--symlink`` args for standard system dirs."""
+    args: list[str] = []
+    for path in _SYSTEM_PATHS:
+        if os.path.islink(path):
+            args.extend(["--symlink", os.readlink(path), path])
+        elif os.path.isdir(path):
+            args.extend(["--ro-bind", path, path])
+    return args
 
 
-def build_sandbox_settings(
+def _etc_bind_args() -> list[str]:
+    """Bind the small allow-list of ``/etc`` files read-only."""
+    args: list[str] = []
+    for path in _ETC_FILES:
+        if os.path.exists(path) or os.path.islink(path):
+            args.extend(["--ro-bind", path, path])
+    return args
+
+
+def bwrap_prefix(
     work_dir: Path | str,
     *,
-    extra_dirs: list[Path | str] | None = None,
-    allow_network: bool = True,
-    allow_bash: bool = True,
-    excluded_commands: list[str] | None = None,
-    deny_paths: list[Path | str] | None = None,
-    deny_tool_patterns: list[str] | None = None,
-) -> dict[str, Any]:
-    """Return a settings.json dict that confines ``claude`` to ``work_dir``.
+    extra_writable: list[Path | str] | None = None,
+) -> list[str]:
+    """Return the ``bwrap`` argv prefix that jails everything that follows.
+
+    Caller usage::
+
+        cmd = bwrap_prefix(work_dir) + ["claude", "--print", ..., *claude_sandbox_args()]
+        subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+    ``--chdir`` is set to ``work_dir`` inside the jail, so ``cwd=`` on the
+    subprocess call is unnecessary (but harmless if the caller still sets it
+    — it only affects where the bwrap process itself is launched).
 
     Args:
-        work_dir: Sole directory the agent can read/write by default.
-        extra_dirs: Additional directories to allow (e.g., ``/tmp``).
-        allow_network: When False, disables outbound network at the sandbox
-            layer. Leave True for adapters that POST to the local EvalServer.
-        allow_bash: When False, omits the ``Bash(*)`` allow rule so every
-            shell invocation is auto-denied. Use for LM-only flows that
-            have no reason to run commands.
-        excluded_commands: Bash command patterns that bypass the sandbox
-            entirely (run as normal subprocess with full filesystem +
-            network access). Claude Code's documented escape hatch — useful
-            when a script needs ``cat`` / ``curl`` / ``localhost``, none of
-            which work inside the sandbox. See
-            https://code.claude.com/docs/en/sandboxing
-        deny_paths: Specific paths added to ``filesystem.denyRead`` and
-            ``filesystem.denyWrite``. Use to pin a path closed even when
-            ``excluded_commands`` would otherwise let an unsandboxed
-            command see it (e.g., the project source tree).
-        deny_tool_patterns: Tool patterns added to ``permissions.deny``
-            (e.g., ``Edit(//path/to/eval.sh)``). Use to prevent Claude's
-            built-in Read/Edit/Write tools from modifying scripts that
-            ``excluded_commands`` lets run unsandboxed.
+        work_dir: The single ``/data``-tree path that becomes writable in
+            the jail. Its parent directories are auto-created as empty
+            stems by bwrap, so siblings stay invisible.
+        extra_writable: Additional paths to bind read-write (e.g., a shared
+            cache directory).
     """
-    paths = [str(Path(work_dir).resolve())]
-    paths.extend(str(Path(p).resolve()) for p in extra_dirs or ())
+    home = Path.home()
+    work = Path(work_dir).resolve()
 
-    allow_rules: list[str] = []
-    for p in paths:
-        for tool in _FILE_TOOLS:
-            allow_rules.append(f"{tool}({_abs_glob(p)})")
-    if allow_bash:
-        allow_rules.append("Bash(*)")
-
-    deny_read = ["//", "~/"]
-    deny_write = ["//", "~/"]
-    if deny_paths:
-        explicit = [str(Path(p).resolve()) for p in deny_paths]
-        deny_read.extend(explicit)
-        deny_write.extend(explicit)
-
-    settings: dict[str, Any] = {
-        "sandbox": {
-            "enabled": True,
-            # Degrade gracefully when bubblewrap/seatbelt isn't available
-            # instead of hard-failing the whole run.
-            "failIfUnavailable": False,
-            "filesystem": {
-                "denyRead": deny_read,
-                "allowRead": paths,
-                "denyWrite": deny_write,
-                "allowWrite": paths,
-            },
-        },
-        "permissions": {"allow": allow_rules},
-    }
-    if excluded_commands:
-        settings["sandbox"]["excludedCommands"] = list(excluded_commands)
-    if deny_tool_patterns:
-        settings["permissions"]["deny"] = list(deny_tool_patterns)
-    if not allow_network:
-        settings["sandbox"]["network"] = {"allowedDomains": []}
-    return settings
-
-
-def sandbox_args(
-    work_dir: Path | str,
-    *,
-    extra_dirs: list[Path | str] | None = None,
-    allow_network: bool = True,
-    allow_bash: bool = True,
-    deny_tools: list[str] | None = None,
-    excluded_commands: list[str] | None = None,
-    deny_paths: list[Path | str] | None = None,
-    deny_tool_patterns: list[str] | None = None,
-) -> list[str]:
-    """CLI args to append to a ``claude --print`` invocation.
-
-    The caller must **not** also pass ``--permission-mode bypassPermissions``
-    — doing so disables the prompt-driven default-deny that makes the
-    allow-list act as a whitelist.
-
-    Three mechanisms stacked:
-
-    - ``--settings <json>`` installs the per-session sandbox + file-tool
-      allow list from :func:`build_sandbox_settings`.
-    - ``--disallowedTools`` always denies ``WebFetch``/``WebSearch`` plus
-      any ``deny_tools`` supplied by the caller (de-duped, comma-joined).
-    """
-    settings = build_sandbox_settings(
-        work_dir,
-        extra_dirs=extra_dirs,
-        allow_network=allow_network,
-        allow_bash=allow_bash,
-        excluded_commands=excluded_commands,
-        deny_paths=deny_paths,
-        deny_tool_patterns=deny_tool_patterns,
-    )
-    disallow: list[str] = list(_ALWAYS_DENIED_TOOLS)
-    for t in deny_tools or ():
-        if t not in disallow:
-            disallow.append(t)
-    return [
-        "--settings", json.dumps(settings),
-        f"--disallowedTools={','.join(disallow)}",
+    args: list[str] = [
+        "bwrap",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        *_system_bind_args(),
+        *_etc_bind_args(),
+        # Claude config + on-disk session transcripts.
+        # See TODO(sandbox-leak) at the top of this file.
+        "--bind", str(home / ".claude"), str(home / ".claude"),
+        "--bind", str(home / ".claude.json"), str(home / ".claude.json"),
+        # Claude binary lives under ~/.local/share/claude; ~/.local/bin/claude
+        # is a symlink to it. Read-only is enough.
+        "--ro-bind", str(home / ".local"), str(home / ".local"),
+        "--bind", str(home / ".cache"), str(home / ".cache"),
+        # The sole writable /data path.
+        "--bind", str(work), str(work),
+        # Scrub hostname so the jail can't be fingerprinted by it.
+        "--unshare-uts", "--hostname", "sandbox",
+        "--setenv", "HOME", str(home),
+        "--chdir", str(work),
     ]
+    for p in extra_writable or ():
+        resolved = str(Path(p).resolve())
+        args.extend(["--bind", resolved, resolved])
+    return args
+
+

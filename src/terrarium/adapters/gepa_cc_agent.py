@@ -68,8 +68,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from terrarium.adapters.claude_code import _copy_session_transcript
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import sandbox_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix
 
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
@@ -497,30 +498,23 @@ see your reasoning; keep it tight.
             parent_iter_id=parent_iter_id,
         )
 
-        cmd: list[str] = [
+        session_id = str(uuid.uuid4())
+        # bwrap (when sandboxed) confines writes to run_dir; sibling algos /
+        # other proposers' run_dirs aren't bound, so their paths don't exist
+        # in the jail. Bash stays on so grep/diff/jq/python can analyze past
+        # candidates. Network is shared (claude needs api.anthropic.com);
+        # WebFetch/WebSearch denial is the only outbound brake.
+        cmd: list[str] = bwrap_prefix(self.run_dir) if self.sandbox else []
+        cmd += [
             "claude",
             "--print",
             wrapper,
             "--output-format", "json",
             "--model", self.model,
+            "--session-id", session_id,
+            "--permission-mode", "bypassPermissions",
+            DENY_WEB_TOOLS,
         ]
-        if self.sandbox:
-            # File tools + Bash + OS bwrap jail, all scoped to run_dir.
-            # Network stays off (no reason for reflection to leave the host).
-            # Bash is left on because the bwrap jail already confines shell
-            # commands to run_dir, and grep/diff/jq/python make the agent much
-            # more effective at analyzing past candidates and reflective
-            # datasets than the Claude file tools alone.
-            # Caveat: bash bypasses Claude's per-tool allow-list, so a
-            # misbehaving call can rm/mv anything in run_dir — write isolation
-            # across concurrent proposers is still convention-only.
-            cmd.extend(sandbox_args(
-                self.run_dir,
-                allow_network=False,
-                allow_bash=True,
-            ))
-        else:
-            cmd.extend(["--permission-mode", "bypassPermissions"])
         if self.max_thinking_tokens is None and self.effort is not None:
             cmd.extend(["--effort", self.effort])
         if self.max_budget_usd is not None:
@@ -537,6 +531,7 @@ see your reasoning; keep it tight.
         proc = subprocess.run(
             cmd, cwd=str(self.run_dir), env=env, capture_output=True, text=True
         )
+        _copy_session_transcript(self.run_dir, session_id, subdir)
 
         payload: dict[str, Any] = {}
         stdout = (proc.stdout or "").strip()
@@ -649,7 +644,7 @@ see your reasoning; keep it tight.
         except OSError as e:
             print(
                 f"[ClaudeCodeAgentProposer] failed to persist plan.md for "
-                f"iteration {iter_id}: {e}",
+                f"iteration {iteration}: {e}",
                 file=sys.stderr,
                 flush=True,
             )
