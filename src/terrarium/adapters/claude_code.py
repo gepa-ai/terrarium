@@ -33,6 +33,11 @@ from terrarium.task import Task
 if TYPE_CHECKING:
     from terrarium.eval_server import EvalServer
 
+
+def _abs_str(p: Path | str) -> str:
+    """Format an absolute path as Claude's ``//<path>`` permission-rule form."""
+    return f"/{Path(p).resolve()}"
+
 # Single-task eval script: one POST per call, returns one score.
 # Usage: ./eval.sh <candidate_file>
 EVAL_SCRIPT_SINGLE = """\
@@ -53,7 +58,7 @@ RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/evaluate" \\
     -d "$BODY")
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -n -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
 
 echo "$BODY"
 
@@ -108,7 +113,7 @@ RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/evaluate_examples
     -d "$BODY")
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -n -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
 
 echo "$BODY"
 
@@ -137,7 +142,7 @@ RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/validate" \\
     -d "$BODY")
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -n -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
 
 echo "$BODY"
 
@@ -220,6 +225,10 @@ def _strategy_section(task: Task) -> str:
         final_n = 6 if task.val_set else 5
         return (
             "1. Read the training examples in `train/` to understand the task.\n"
+            "   Each `train/<id>.json` includes a `seed_preview` field showing\n"
+            "   how the seed candidate behaves on that example (per-example\n"
+            "   score + domain summary in `Input` + seed's `Output` trace).\n"
+            "   Use these previews to find failure patterns to attack.\n"
             "2. Run `./eval.sh candidate.txt` for a baseline.\n"
             "3. Analyze failures — inspect examples that scored 0.\n"
             "4. Improve the candidate; spot-check with `--ids`.\n"
@@ -311,6 +320,8 @@ def materialize_sandbox(
     budget: BudgetTracker,
     *,
     perfect_score: float | None = None,
+    train_preview: bool = True,
+    preview_max_examples: int | None = None,
 ) -> None:
     """Set up the agent's sandbox workspace.
 
@@ -322,6 +333,20 @@ def materialize_sandbox(
             eval.sh             — train evaluation script
             validate.sh         — val evaluation script (generalization only)
             train/              — materialized training examples (generalization only)
+
+    Args:
+        train_preview: If True (default), evaluate the seed candidate on each
+            training example at materialize-time and inline the resulting
+            ``info`` dict (sans heavy raw fields) into ``train/<id>.json``.
+            This gives the agent the same per-example side-info that GEPA's
+            ``reflective_dataset`` provides — e.g. for cant_be_late, the
+            ``spot_availability`` summary string. Without it, the agent only
+            sees a ``trace_file`` path it can't read inside the sandbox,
+            which artificially handicaps optimization on tasks whose inputs
+            point to external data files.
+        preview_max_examples: Cap how many examples get a preview (use the
+            first N). Useful when ``train_set`` is huge and a full pass would
+            dominate startup. None = preview every example.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -345,15 +370,63 @@ def materialize_sandbox(
         validate_script.write_text(VALIDATE_SCRIPT.format(server_url=server_url))
         validate_script.chmod(0o755)
 
-    # Materialize train examples
+    # Materialize train examples (with optional seed-eval preview)
     if task.train_set:
         train_dir = work_dir / "train"
         train_dir.mkdir(exist_ok=True)
+        previews = _build_train_previews(task, preview_max_examples) if train_preview else {}
         for ex in task.train_set:
-            data = {"id": ex.id, "inputs": ex.inputs}
+            data: dict[str, Any] = {"id": ex.id, "inputs": ex.inputs}
             if ex.expected is not None:
                 data["expected"] = ex.expected
-            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            if ex.id in previews:
+                data["seed_preview"] = previews[ex.id]
+            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2, default=str))
+
+
+def _build_train_previews(task: Task, max_examples: int | None) -> dict[str, dict[str, Any]]:
+    """Run the seed candidate on each train example to capture side-info.
+
+    Mirrors what GEPA's ``reflective_dataset`` provides: per-example score,
+    selected ``Input`` fields (which include problem-domain summaries like
+    ``spot_availability``), and the seed's ``Output`` (timeline / cost
+    breakdown). Heavy debug fields are dropped to keep ``train/<id>.json``
+    small.
+
+    Failures are silent — a missing ``seed_preview`` just means that
+    example didn't get one, which is no worse than the pre-preview behavior.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    examples = list(task.train_set or ())
+    if max_examples is not None:
+        examples = examples[:max_examples]
+    if not examples:
+        return {}
+
+    seed = task.initial_candidate
+    eval_fn = task.eval_fn
+
+    def _one(ex):
+        try:
+            score, info = eval_fn(seed, ex)
+        except Exception:
+            return ex.id, None
+        # Drop heavy / non-portable fields; keep what GEPA's reflective_dataset
+        # would surface to the proposer.
+        info = info or {}
+        preview: dict[str, Any] = {"score": score}
+        for k in ("Input", "Output", "Error", "scores"):
+            if k in info:
+                preview[k] = info[k]
+        return ex.id, preview
+
+    out: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for eid, preview in pool.map(_one, examples):
+            if preview is not None:
+                out[eid] = preview
+    return out
 
 
 
@@ -403,7 +476,26 @@ class ClaudeCodeAdapter:
     def evolve(self, task: Task, server: EvalServer) -> Result:
         budget = server.budget
 
-        if self.run_dir:
+        # Pick work_dir.
+        #
+        # Subtle Seatbelt bug on macOS: when ``filesystem.allowRead`` contains
+        # any path under ``~/`` (the user's home), the matching ``denyRead:
+        # ["~/"]`` rule becomes a no-op for the *entire* home directory — so
+        # Bash and the Read tool can both reach ``~/.claude/projects/.../
+        # memory/``, ``~/.ssh/``, the project source tree, and anything else
+        # under home. Empirically verified: same sandbox config, work_dir under
+        # ``/var/folders`` denies these reads correctly; work_dir under
+        # ``/Users/...`` leaks the entire home dir.
+        #
+        # When ``sandbox=True`` we therefore force a tempdir work_dir under
+        # the system TMPDIR (which lives under ``/private/var/folders/`` on
+        # macOS, outside ``~/``). ``process_result`` later copies any
+        # artifacts back to ``self.run_dir`` so the sandbox isolation doesn't
+        # cost the user their persisted artifacts.
+        if self.sandbox:
+            self._pending_tempdir = tempfile.TemporaryDirectory(prefix="terrarium_cc_")
+            work_dir = Path(self._pending_tempdir.name)
+        elif self.run_dir:
             work_dir = Path(self.run_dir)
             work_dir.mkdir(parents=True, exist_ok=True)
         else:
@@ -453,7 +545,36 @@ class ClaudeCodeAdapter:
         # fall back to bypassPermissions so --print doesn't deadlock on
         # permission prompts.
         if self.sandbox:
-            cmd.extend(sandbox_args(work_dir))
+            # Claude Code's macOS sandbox blocks /dev/tcp and external binaries
+            # (cat, curl, jq), so eval.sh / validate.sh can't run inside it.
+            # Fix per https://code.claude.com/docs/en/sandboxing — list those
+            # scripts in ``excludedCommands`` so they run unsandboxed (with
+            # full network + system-tool access). To keep the escape hatch
+            # safe, simultaneously:
+            #   - deny the project source dir at the OS layer so other
+            #     sandboxed Bash calls can't ``cat`` it (anti-cheat),
+            #   - deny Read/Edit/Write of eval.sh + validate.sh through the
+            #     permission allow-list so claude can't rewrite the
+            #     unsandboxed scripts to do something else.
+            repo_src = Path(__file__).resolve().parents[3] / "src"
+            eval_sh = work_dir / "eval.sh"
+            validate_sh = work_dir / "validate.sh"
+            cmd.extend(sandbox_args(
+                work_dir,
+                excluded_commands=[
+                    "./eval.sh", "./eval.sh *",
+                    "bash ./eval.sh", "bash ./eval.sh *",
+                    "./validate.sh", "./validate.sh *",
+                    "bash ./validate.sh", "bash ./validate.sh *",
+                ],
+                deny_paths=[repo_src],
+                deny_tool_patterns=[
+                    f"Edit({_abs_str(eval_sh)})",
+                    f"Write({_abs_str(eval_sh)})",
+                    f"Edit({_abs_str(validate_sh)})",
+                    f"Write({_abs_str(validate_sh)})",
+                ],
+            ))
         else:
             cmd.extend(["--permission-mode", "bypassPermissions"])
         if self.max_thinking_tokens is None and self.effort is not None:

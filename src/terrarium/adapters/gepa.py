@@ -169,6 +169,22 @@ class GEPAAdapter:
                     sandbox=bool(self.sandbox),
                 )
                 reflection_kwargs["reflection_lm"] = reflection_lm
+            elif isinstance(lm_name, str) and lm_name.startswith("anthropic_sdk/"):
+                # Direct Anthropic SDK reflection LM — bypasses litellm.
+                # Use when litellm + httpx wedges on long extended-thinking
+                # responses (observed on cloudcast vanilla-GEPA).
+                from terrarium.adapters._anthropic_sdk_lm import AnthropicSdkLM
+                lm_kwargs = dict(self.reflection_lm_kwargs)
+                lm_kwargs.pop("reasoning_effort", None)
+                # Translate litellm-style ``num_retries`` to SDK's ``max_retries``.
+                if "num_retries" in lm_kwargs:
+                    lm_kwargs.setdefault("max_retries", lm_kwargs.pop("num_retries"))
+                reflection_lm = AnthropicSdkLM(
+                    model=lm_name.split("/", 1)[1],
+                    max_thinking_tokens=self.max_thinking_tokens,
+                    **lm_kwargs,
+                )
+                reflection_kwargs["reflection_lm"] = reflection_lm
             else:
                 lm_kwargs = dict(self.reflection_lm_kwargs)
                 if self.max_thinking_tokens is not None:
@@ -247,7 +263,15 @@ class GEPAAdapter:
         if task.has_dataset:
             if task.train_set:
                 oa_kwargs["dataset"] = task.train_set
-            if task.test_set:
+            # Prefer the dataclass val_set field (current convention used by
+            # aime_math, cant_be_late, cloudcast, and GEPA's own main.py
+            # examples). Fall back to test_set for legacy tasks that have no
+            # val_set, then to the older metadata["val_set"] escape hatch
+            # (arc_agi). This leaves task.test_set as a true held-out split
+            # consumed by runner.py's post-run evaluation.
+            if task.val_set:
+                oa_kwargs["valset"] = task.val_set
+            elif task.test_set:
                 oa_kwargs["valset"] = task.test_set
             if "val_set" in task.metadata:
                 oa_kwargs.setdefault("valset", task.metadata["val_set"])

@@ -52,6 +52,9 @@ def build_sandbox_settings(
     extra_dirs: list[Path | str] | None = None,
     allow_network: bool = True,
     allow_bash: bool = True,
+    excluded_commands: list[str] | None = None,
+    deny_paths: list[Path | str] | None = None,
+    deny_tool_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return a settings.json dict that confines ``claude`` to ``work_dir``.
 
@@ -63,6 +66,20 @@ def build_sandbox_settings(
         allow_bash: When False, omits the ``Bash(*)`` allow rule so every
             shell invocation is auto-denied. Use for LM-only flows that
             have no reason to run commands.
+        excluded_commands: Bash command patterns that bypass the sandbox
+            entirely (run as normal subprocess with full filesystem +
+            network access). Claude Code's documented escape hatch — useful
+            when a script needs ``cat`` / ``curl`` / ``localhost``, none of
+            which work inside the sandbox. See
+            https://code.claude.com/docs/en/sandboxing
+        deny_paths: Specific paths added to ``filesystem.denyRead`` and
+            ``filesystem.denyWrite``. Use to pin a path closed even when
+            ``excluded_commands`` would otherwise let an unsandboxed
+            command see it (e.g., the project source tree).
+        deny_tool_patterns: Tool patterns added to ``permissions.deny``
+            (e.g., ``Edit(//path/to/eval.sh)``). Use to prevent Claude's
+            built-in Read/Edit/Write tools from modifying scripts that
+            ``excluded_commands`` lets run unsandboxed.
     """
     paths = [str(Path(work_dir).resolve())]
     paths.extend(str(Path(p).resolve()) for p in extra_dirs or ())
@@ -74,6 +91,13 @@ def build_sandbox_settings(
     if allow_bash:
         allow_rules.append("Bash(*)")
 
+    deny_read = ["//", "~/"]
+    deny_write = ["//", "~/"]
+    if deny_paths:
+        explicit = [str(Path(p).resolve()) for p in deny_paths]
+        deny_read.extend(explicit)
+        deny_write.extend(explicit)
+
     settings: dict[str, Any] = {
         "sandbox": {
             "enabled": True,
@@ -81,14 +105,18 @@ def build_sandbox_settings(
             # instead of hard-failing the whole run.
             "failIfUnavailable": False,
             "filesystem": {
-                "denyRead": ["//", "~/"],
+                "denyRead": deny_read,
                 "allowRead": paths,
-                "denyWrite": ["//", "~/"],
+                "denyWrite": deny_write,
                 "allowWrite": paths,
             },
         },
         "permissions": {"allow": allow_rules},
     }
+    if excluded_commands:
+        settings["sandbox"]["excludedCommands"] = list(excluded_commands)
+    if deny_tool_patterns:
+        settings["permissions"]["deny"] = list(deny_tool_patterns)
     if not allow_network:
         settings["sandbox"]["network"] = {"allowedDomains": []}
     return settings
@@ -101,6 +129,9 @@ def sandbox_args(
     allow_network: bool = True,
     allow_bash: bool = True,
     deny_tools: list[str] | None = None,
+    excluded_commands: list[str] | None = None,
+    deny_paths: list[Path | str] | None = None,
+    deny_tool_patterns: list[str] | None = None,
 ) -> list[str]:
     """CLI args to append to a ``claude --print`` invocation.
 
@@ -120,6 +151,9 @@ def sandbox_args(
         extra_dirs=extra_dirs,
         allow_network=allow_network,
         allow_bash=allow_bash,
+        excluded_commands=excluded_commands,
+        deny_paths=deny_paths,
+        deny_tool_patterns=deny_tool_patterns,
     )
     disallow: list[str] = list(_ALWAYS_DENIED_TOOLS)
     for t in deny_tools or ():
