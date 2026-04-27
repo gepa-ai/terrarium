@@ -20,9 +20,35 @@ frontier_cs = [
     "frontier-cs @ git+https://github.com/FrontierCS/Frontier-CS ; python_version >= '3.11'",
     "datasets>=2.14",
 ]
+# Can't Be Late: vendored sky-spot simulator. Configs ship with terrarium;
+# the AWS spot-availability traces are an external download (one-time, see
+# the docstring in terrarium/tasks/cant_be_late.py).
+cant_be_late = [
+    "colorama",
+    "ConfigArgParse",
+    "filelock",
+    "numpy",
+    "pandas",
+    "PyYAML",
+    "tqdm",
+    "wandb",
+]
+# Cloudcast: vendored multi-cloud broadcast simulator. Configs and pricing /
+# throughput profiles all ship with terrarium — no external data needed.
+cloudcast = [
+    "networkx>=2.6",
+    "pandas>=1.3",
+    "numpy>=1.20",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-terrarium = ["conf/**/*.yaml"]
+terrarium = [
+    "conf/**/*.yaml",
+    # Vendored ADRS task data (configs, pricing/throughput profiles, simulator).
+    "tasks/cloudcast_lib/core/config/*.json",
+    "tasks/cloudcast_lib/core/profiles/*.csv",
+    "tasks/cant_be_late_lib/simulator/**/*.py",
+]
