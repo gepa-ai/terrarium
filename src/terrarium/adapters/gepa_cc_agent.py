@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -178,6 +179,70 @@ class ClaudeCodeAgentProposer:
         (self.run_dir / "task.md").write_text("\n\n".join(sections) + "\n")
         self._task_md_materialized = True
 
+    def _build_jail_mirror(self, subdir_real: Path, jail_root: Path) -> Path:
+        """Mirror the per-call read-only state into a TMPDIR-rooted jail.
+
+        On macOS we route ``sandbox=True`` through Claude Code's built-in
+        Seatbelt sandbox (``--settings`` JSON). That sandbox has a known
+        bug: when ``allowRead`` contains *any* path under ``~/``, the
+        ``denyRead: ["~/"]`` rule becomes a no-op and the entire home
+        directory is readable from inside the jail (documented in
+        :mod:`terrarium.adapters.claude_code`). ``self.run_dir`` is normally
+        under ``~/`` (Hydra's outputs/), so scoping the Seatbelt allow-list
+        to ``run_dir`` directly leaves the home dir wide open — including
+        ``~/.claude/projects/<terrarium-slug>/memory/*.md``, a real
+        cheating channel for proposers reading sibling proposers' notes.
+
+        Fix: build a per-call jail under ``$TMPDIR`` (typically
+        ``/var/folders/...`` on macOS, outside ``~/``) that contains the
+        files the agent actually needs:
+
+            <jail_root>/
+                task.md           # copy from run_dir
+                history.md        # copy from run_dir (if exists)
+                proposals/<subdir.name>/
+                    parent/, reflection/, new/   # mirror of subdir_real
+
+        bwrap (Linux) and ``claude_settings_args`` (macOS) get scoped to
+        ``jail_root`` only. The agent's wrapper prompt addresses files via
+        absolute jail paths. After ``claude`` returns, ``_sync_jail_outputs``
+        copies the agent's writes back to ``subdir_real``.
+
+        On Linux this is slightly redundant — bwrap could bind run_dir
+        directly — but avoiding the platform-specific branch keeps the
+        layout symmetric and the cheating channel closed on both.
+        """
+        # Read-only context the agent expects at run_dir root.
+        for fname in ("task.md", "history.md"):
+            src = self.run_dir / fname
+            if src.exists():
+                shutil.copy2(src, jail_root / fname)
+
+        # Per-call subdir tree (parent/, reflection/, empty new/).
+        jail_subdir = jail_root / "proposals" / subdir_real.name
+        jail_subdir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(subdir_real, jail_subdir)
+        return jail_subdir
+
+    def _sync_jail_outputs(self, jail_subdir: Path, subdir_real: Path) -> None:
+        """Copy the agent's writes (``new/*``, ``plan.md``) back to run_dir.
+
+        Only copies files the agent is supposed to produce per the prompt.
+        Anything else the agent may have written inside the jail is dropped
+        with the tempdir on context exit.
+        """
+        # Outputs the prompt instructs the agent to produce.
+        new_src = jail_subdir / "new"
+        new_dst = subdir_real / "new"
+        if new_src.is_dir():
+            new_dst.mkdir(parents=True, exist_ok=True)
+            for f in new_src.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, new_dst / f.name)
+        plan_src = jail_subdir / "plan.md"
+        if plan_src.exists():
+            shutil.copy2(plan_src, subdir_real / "plan.md")
+
     def _allocate_subdir(self, iteration: int | None) -> Path:
         """Pick a collision-free subdir for this call under ``<run_dir>/<prefix>/``.
 
@@ -292,24 +357,28 @@ class ClaudeCodeAgentProposer:
         *,
         first_iteration: bool,
         parent_iter_id: int | None,
+        root_dir: Path | None = None,
     ) -> str:
         """Program.md-style proposal brief, iteration-folder-oriented.
 
         Long task context (objective, background — often thousands of chars,
-        including the scoring rubric) lives in ``<run_dir>/task.md``; we
+        including the scoring rubric) lives in ``<root>/task.md``; we
         reference it by path so every proposal call doesn't re-ship it
         through the CLI prompt. The agent is pointed at ``history.md`` (the
         rolling log of all prior plans + outcomes) and ``parent/`` (a local
         copy of its parent iteration) so it can plan with full context
         without loading the whole ``iterations/`` tree.
+
+        ``root_dir`` is the directory the agent should treat as the run
+        root (i.e. where ``task.md`` and ``history.md`` live). When
+        sandboxed it's the per-call jail mirror under TMPDIR; otherwise
+        it's ``self.run_dir`` directly.
         """
         # Absolute paths everywhere so the agent's reads/writes resolve
-        # regardless of its cwd. We deliberately spawn ``claude --print``
-        # from a tempdir OUTSIDE ``terrarium/`` (see ``propose_new_texts``)
-        # to prevent Claude Code's CLAUDE.md walk-up from disclosing the
-        # auto-memory pointer; that means the agent's cwd is no longer
-        # ``run_dir``, so prompt paths can't be ``run_dir``-relative.
-        run_abs = self.run_dir.resolve()
+        # regardless of its cwd. Both ``root`` and ``subdir`` may live
+        # under TMPDIR (sandboxed) or under run_dir (unsandboxed); the
+        # agent's prompt is the same shape either way.
+        run_abs = (root_dir or self.run_dir).resolve()
         sub_abs = subdir.resolve()
         task_md_exists = (self.objective is not None) or (self.background is not None)
         files_to_produce = "\n".join(
@@ -356,12 +425,30 @@ class ClaudeCodeAgentProposer:
             f"`meta.json`, `val_scores.json`, plus component files):\n"
             f"{parent_component_lines}"
         )
-        if parent_iter_id is not None:
+        # Iterations/ and pareto/ only exist on disk in the persistent
+        # ``run_dir``. When sandboxed (``root_dir`` != ``self.run_dir``),
+        # they're not mirrored into the jail — task.md, history.md, and the
+        # per-call subdir are sufficient context. Drop those references.
+        sandboxed = root_dir is not None and root_dir != self.run_dir
+        if not sandboxed and parent_iter_id is not None:
             parent_section += (
                 f"\n   For full rollout outputs see "
                 f"`{run_abs}/iterations/{parent_iter_id:05d}/outputs/` + "
                 f"`{run_abs}/iterations/{parent_iter_id:05d}/trajectories/`."
             )
+        wider_state_section = (
+            ""
+            if sandboxed
+            else (
+                f"\n## Wider state (browse when useful)\n"
+                f"- `{run_abs}/iterations/NNNNN/` — every past iteration "
+                f"(accepted *and* rejected), with `meta.json`, "
+                f"`components/`, `plan.md`, `reflective_dataset.json`, "
+                f"`trace.json`. `00000/` is always the seed.\n"
+                f"- `{run_abs}/pareto/` — current Pareto frontier(s) "
+                f"keyed by iteration id.\n"
+            )
+        )
         return f"""\
 You are proposing improved text for one or more components of a program.
 Your goal is to raise the program's aggregate score on
@@ -380,12 +467,7 @@ an isolated tempdir, not the run directory.
 {parent_section}
 4. Per-example feedback for each component to update:
 {reflection_lines}
-
-## Wider state (browse when useful)
-- `{run_abs}/iterations/NNNNN/` — every past iteration (accepted *and*
-  rejected), with `meta.json`, `components/`, `plan.md`,
-  `reflective_dataset.json`, `trace.json`. `00000/` is always the seed.
-- `{run_abs}/pareto/` — current Pareto frontier(s) keyed by iteration id.
+{wider_state_section}
 
 ## Outputs you must produce
 One improved-text file per component:
@@ -500,38 +582,7 @@ can see your reasoning; keep it tight.
         )
         # Seed owns iteration id 0; the very first loop proposal runs at id 1.
         first_iteration = iteration == 1
-        wrapper = self._wrapper_prompt(
-            subdir,
-            components_to_update,
-            stems,
-            first_iteration=first_iteration,
-            parent_iter_id=parent_iter_id,
-        )
-
         session_id = str(uuid.uuid4())
-        # bwrap (when sandboxed) confines writes to run_dir; sibling algos /
-        # other proposers' run_dirs aren't bound, so their paths don't exist
-        # in the jail. Bash stays on so grep/diff/jq/python can analyze past
-        # candidates. Network is shared (claude needs api.anthropic.com);
-        # WebFetch/WebSearch denial is the only outbound brake.
-        cmd: list[str] = bwrap_prefix(self.run_dir) if self.sandbox else []
-        cmd += [
-            "claude",
-            "--print",
-            wrapper,
-            "--output-format", "json",
-            "--model", self.model,
-            "--session-id", session_id,
-            "--permission-mode", "bypassPermissions",
-            DENY_WEB_TOOLS,
-        ]
-        if self.sandbox:
-            cmd.extend(claude_settings_args(self.run_dir))  # macOS Seatbelt fallback
-        if self.max_thinking_tokens is None and self.effort is not None:
-            cmd.extend(["--effort", self.effort])
-        if self.max_budget_usd is not None:
-            remaining = max(0.01, self.max_budget_usd - self._total_cost)
-            cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
 
         env = {**os.environ}
         env.pop("CLAUDECODE", None)
@@ -540,19 +591,81 @@ can see your reasoning; keep it tight.
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
-        # Outer cwd = a tempdir OUTSIDE the terrarium tree. Claude Code's
-        # CLAUDE.md walk-up (which discovers the auto-memory pointer at
-        # ~/.claude/projects/<terrarium-slug>/memory/*.md) follows the
-        # spawning process's cwd; if that's anywhere under terrarium/, the
-        # parent CLAUDE.md is found and the auto-memory file becomes
-        # readable from inside the jail — a real cheating channel for
-        # GEPA proposers (sibling proposers' notes leak in). Spawning from
-        # a tempdir breaks the walk-up. The agent reaches run_dir via the
-        # absolute paths embedded in ``_wrapper_prompt``.
-        with tempfile.TemporaryDirectory(prefix="terrarium_gepa_cc_agent_") as outer_cwd:
-            proc = subprocess.run(
-                cmd, cwd=outer_cwd, env=env, capture_output=True, text=True
+        # When sandboxed, run claude inside a TMPDIR-rooted jail mirror of
+        # this call's read-only state (task.md, history.md, the per-call
+        # subdir). bwrap/Seatbelt are scoped to ``jail_root`` only — never
+        # to ``self.run_dir`` — which keeps Seatbelt's denyRead("~/") rule
+        # from no-op-ing on macOS (see ``_build_jail_mirror`` for the bug
+        # writeup). After claude returns, ``_sync_jail_outputs`` copies the
+        # agent's writes back to ``subdir`` so the GEPA outer loop's
+        # ``_read_new_texts`` finds them in the canonical location.
+        #
+        # Outer cwd is *also* the jail (and thus outside terrarium/), which
+        # also closes Claude Code's CLAUDE.md walk-up channel — the auto-
+        # memory pointer at ~/.claude/projects/<terrarium-slug>/memory/
+        # never gets disclosed because there's no terrarium/CLAUDE.md
+        # ancestor of cwd to walk up to.
+        if self.sandbox:
+            jail_ctx: Any = tempfile.TemporaryDirectory(prefix="terrarium_gepa_cc_agent_")
+        else:
+            # No-op context manager so the unsandboxed path stays one branch.
+            class _NullCtx:
+                def __enter__(self): return str(self.run_dir)
+                def __exit__(self, *a): return False
+                run_dir = self.run_dir
+            jail_ctx = _NullCtx()
+            jail_ctx.run_dir = self.run_dir
+        with jail_ctx as jail_root_str:
+            jail_root = Path(jail_root_str)
+            if self.sandbox:
+                agent_subdir = self._build_jail_mirror(subdir, jail_root)
+            else:
+                # Unsandboxed: agent operates directly on the real subdir
+                # under run_dir. No mirror, no copyback.
+                agent_subdir = subdir
+
+            wrapper = self._wrapper_prompt(
+                agent_subdir,
+                components_to_update,
+                stems,
+                first_iteration=first_iteration,
+                parent_iter_id=parent_iter_id,
+                root_dir=jail_root,
             )
+
+            # bwrap (Linux) confines writes to ``jail_root``; siblings and
+            # other proposers don't exist in the jail. claude_settings_args
+            # (macOS) builds the Seatbelt JSON scoped to ``jail_root``.
+            # Bash stays on so the agent can grep/diff/jq/python the
+            # mirrored state. Network is shared (claude needs
+            # api.anthropic.com); WebFetch/WebSearch denial is the only
+            # outbound brake.
+            cmd: list[str] = bwrap_prefix(jail_root) if self.sandbox else []
+            cmd += [
+                "claude",
+                "--print",
+                wrapper,
+                "--output-format", "json",
+                "--model", self.model,
+                "--session-id", session_id,
+                "--permission-mode", "bypassPermissions",
+                DENY_WEB_TOOLS,
+            ]
+            if self.sandbox:
+                cmd.extend(claude_settings_args(jail_root))
+            if self.max_thinking_tokens is None and self.effort is not None:
+                cmd.extend(["--effort", self.effort])
+            if self.max_budget_usd is not None:
+                remaining = max(0.01, self.max_budget_usd - self._total_cost)
+                cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
+
+            proc = subprocess.run(
+                cmd, cwd=str(jail_root), env=env, capture_output=True, text=True
+            )
+
+            if self.sandbox:
+                self._sync_jail_outputs(agent_subdir, subdir)
+
         _copy_session_transcript(self.run_dir, session_id, subdir)
 
         payload: dict[str, Any] = {}
