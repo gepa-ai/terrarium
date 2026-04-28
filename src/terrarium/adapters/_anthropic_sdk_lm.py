@@ -5,6 +5,12 @@ responses (observed on cloudcast vanilla-GEPA runs: TCP CLOSE_WAIT, 100% CPU,
 log frozen indefinitely). The Anthropic Python SDK uses its own httpx client
 with finite timeouts and is not affected.
 
+Install: ``pip install terrarium[anthropic_sdk]`` (or just
+``pip install anthropic``). Pulled in only on demand — the import lives
+inside :class:`AnthropicSdkLM.__init__` so ``terrarium`` itself stays
+importable without ``anthropic`` in any environment that doesn't use
+``reflection_lm="anthropic_sdk/<model>"``.
+
 Implements the GEPA ``LanguageModel`` protocol::
 
     __call__(prompt: str | list[dict[str, str]]) -> str
