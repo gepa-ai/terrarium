@@ -529,15 +529,9 @@ def _load_candidate(work_dir: Path, relpath: str) -> str | None:
 
 
 def _score_candidate(server: "EvalServer", task: Task, candidate: str) -> tuple[float, dict[str, Any]]:
-    """Score a candidate through the Terrarium eval server.
-
-    For dataset tasks, prefer the held-out val split when available — that's
-    the convention vanilla GEPA, cc, and cc-agent all use during the search
-    loop, so the meta-harness frontier stays comparable to theirs. Falls
-    back to train if no val split exists. Single-task problems just call
-    evaluate(). Both paths go through the same budget counter, so
-    ``BudgetExhausted`` propagates to the caller identically.
-    """
+    """Score a candidate via the eval server. Dataset tasks prefer val split
+    (matches the other adapters' search-loop convention); fall back to train
+    if no val_set; single-task → evaluate()."""
     if task.has_dataset:
         if task.val_set:
             return server.evaluate_examples(candidate, split="val")
@@ -730,14 +724,10 @@ class MetaHarnessAdapter:
     def evolve(self, task: Task, server: "EvalServer") -> Result:
         budget = server.budget
 
-        # When sandbox=True, force a tempdir work_dir even if ``run_dir`` is
-        # set. Same rationale as the ClaudeCodeAdapter and cc-agent fixes:
-        # spawning ``claude --print`` from a cwd under ``terrarium/`` lets
-        # Claude Code's CLAUDE.md walk-up disclose the auto-memory pointer
-        # (``~/.claude/projects/<terrarium-slug>/memory/*.md``), which is
-        # a real cheating channel for proposers — sibling proposers' notes
-        # leak in. ``process_result`` mirrors the tempdir back to
-        # ``output_dir/work/`` so artifacts aren't lost.
+        # When sandbox=True, force tempdir work_dir even if run_dir is set —
+        # avoids Claude Code's CLAUDE.md walk-up disclosing the auto-memory
+        # pointer, and keeps Seatbelt's allowRead outside ~/. process_result
+        # mirrors back to output_dir/work/ so artifacts aren't lost.
         if self.sandbox:
             self._pending_tempdir = tempfile.TemporaryDirectory(prefix="terrarium_mh_")
             work_dir = Path(self._pending_tempdir.name)

@@ -180,58 +180,33 @@ class ClaudeCodeAgentProposer:
         self._task_md_materialized = True
 
     def _build_jail_mirror(self, subdir_real: Path, jail_root: Path) -> Path:
-        """Mirror the per-call read-only state into a TMPDIR-rooted jail.
+        """Mirror per-call read-only state into a TMPDIR-rooted jail.
 
-        On macOS we route ``sandbox=True`` through Claude Code's built-in
-        Seatbelt sandbox (``--settings`` JSON). That sandbox has a known
-        bug: when ``allowRead`` contains *any* path under ``~/``, the
-        ``denyRead: ["~/"]`` rule becomes a no-op and the entire home
-        directory is readable from inside the jail (documented in
-        :mod:`terrarium.adapters.claude_code`). ``self.run_dir`` is normally
-        under ``~/`` (Hydra's outputs/), so scoping the Seatbelt allow-list
-        to ``run_dir`` directly leaves the home dir wide open — including
-        ``~/.claude/projects/<terrarium-slug>/memory/*.md``, a real
-        cheating channel for proposers reading sibling proposers' notes.
+        Layout: ``<jail_root>/{task.md,history.md,proposals/<sub.name>/...}``.
+        The agent reads/writes inside the jail; ``_sync_jail_outputs`` copies
+        ``new/*`` and ``plan.md`` back to ``subdir_real`` on return.
 
-        Fix: build a per-call jail under ``$TMPDIR`` (typically
-        ``/var/folders/...`` on macOS, outside ``~/``) that contains the
-        files the agent actually needs:
-
-            <jail_root>/
-                task.md           # copy from run_dir
-                history.md        # copy from run_dir (if exists)
-                proposals/<subdir.name>/
-                    parent/, reflection/, new/   # mirror of subdir_real
-
-        bwrap (Linux) and ``claude_settings_args`` (macOS) get scoped to
-        ``jail_root`` only. The agent's wrapper prompt addresses files via
-        absolute jail paths. After ``claude`` returns, ``_sync_jail_outputs``
-        copies the agent's writes back to ``subdir_real``.
-
-        On Linux this is slightly redundant — bwrap could bind run_dir
-        directly — but avoiding the platform-specific branch keeps the
-        layout symmetric and the cheating channel closed on both.
+        Why mirror instead of binding run_dir: on macOS Seatbelt's
+        ``denyRead: ["~/"]`` no-ops if ``allowRead`` contains a home-tree
+        path (run_dir is under hydra outputs/, i.e. ~/). Scoping the
+        Seatbelt allow-list to a TMPDIR-rooted jail keeps allowRead outside
+        ~/, so the deny rule actually blocks ~/.claude/projects, ~/.ssh,
+        and the source tree. On Linux this is slightly redundant (bwrap
+        could bind run_dir directly) but symmetry beats a platform branch.
         """
-        # Read-only context the agent expects at run_dir root.
         for fname in ("task.md", "history.md"):
             src = self.run_dir / fname
             if src.exists():
                 shutil.copy2(src, jail_root / fname)
-
-        # Per-call subdir tree (parent/, reflection/, empty new/).
         jail_subdir = jail_root / "proposals" / subdir_real.name
         jail_subdir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(subdir_real, jail_subdir)
         return jail_subdir
 
     def _sync_jail_outputs(self, jail_subdir: Path, subdir_real: Path) -> None:
-        """Copy the agent's writes (``new/*``, ``plan.md``) back to run_dir.
-
-        Only copies files the agent is supposed to produce per the prompt.
-        Anything else the agent may have written inside the jail is dropped
-        with the tempdir on context exit.
-        """
-        # Outputs the prompt instructs the agent to produce.
+        """Copy the agent's prompt-mandated outputs (``new/*``, ``plan.md``)
+        from the jail back to ``subdir_real``. Anything else is dropped with
+        the tempdir."""
         new_src = jail_subdir / "new"
         new_dst = subdir_real / "new"
         if new_src.is_dir():
@@ -359,25 +334,14 @@ class ClaudeCodeAgentProposer:
         parent_iter_id: int | None,
         root_dir: Path | None = None,
     ) -> str:
-        """Program.md-style proposal brief, iteration-folder-oriented.
+        """Program.md-style proposal brief.
 
-        Long task context (objective, background — often thousands of chars,
-        including the scoring rubric) lives in ``<root>/task.md``; we
-        reference it by path so every proposal call doesn't re-ship it
-        through the CLI prompt. The agent is pointed at ``history.md`` (the
-        rolling log of all prior plans + outcomes) and ``parent/`` (a local
-        copy of its parent iteration) so it can plan with full context
-        without loading the whole ``iterations/`` tree.
-
-        ``root_dir`` is the directory the agent should treat as the run
-        root (i.e. where ``task.md`` and ``history.md`` live). When
-        sandboxed it's the per-call jail mirror under TMPDIR; otherwise
-        it's ``self.run_dir`` directly.
+        Long task context (objective, background, scoring rubric) lives in
+        ``<root>/task.md`` rather than the CLI prompt. The agent is pointed
+        at ``history.md`` and ``parent/`` for context. ``root_dir`` is the
+        per-call jail mirror under TMPDIR when sandboxed, ``self.run_dir``
+        otherwise; either way the prompt uses absolute paths.
         """
-        # Absolute paths everywhere so the agent's reads/writes resolve
-        # regardless of its cwd. Both ``root`` and ``subdir`` may live
-        # under TMPDIR (sandboxed) or under run_dir (unsandboxed); the
-        # agent's prompt is the same shape either way.
         run_abs = (root_dir or self.run_dir).resolve()
         sub_abs = subdir.resolve()
         task_md_exists = (self.objective is not None) or (self.background is not None)
@@ -549,21 +513,16 @@ can see your reasoning; keep it tight.
             return {}
 
         meta = dict(metadata) if metadata else {}
+        # GEPA's ``iteration`` is already the 1-indexed on-disk iter id.
         iteration = meta.get("iteration")
         parent_iter_id = meta.get("parent_iteration_id")
-        # ``iteration`` from GEPA is already the 1-indexed on-disk iter id
-        # (matches the ``Iteration N`` log line and ``iterations/NNNNN/``
-        # subdir name); no further shifting needed.
         iteration = int(iteration) if iteration is not None else None
         parent_iter_id = int(parent_iter_id) if parent_iter_id is not None else None
 
         self._ensure_task_md()
-        # Regenerate ``history.md`` from the iterations/ tree on disk. GEPA's
-        # state.save() runs at the top of each outer-loop turn, so every
-        # iteration strictly before this one already has
-        # ``iterations/NNNNN/meta.json`` (+ optionally ``plan.md``) written.
-        # Deriving history.md every call keeps the view in sync with disk
-        # without any cross-thread bookkeeping.
+        # Regenerate history.md from the iterations/ tree every call —
+        # state.save() at the top of each GEPA turn means everything
+        # strictly before this iter is already on disk.
         if iteration is not None:
             self._rebuild_history_md()
 
@@ -591,24 +550,14 @@ can see your reasoning; keep it tight.
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
-        # When sandboxed, run claude inside a TMPDIR-rooted jail mirror of
-        # this call's read-only state (task.md, history.md, the per-call
-        # subdir). bwrap/Seatbelt are scoped to ``jail_root`` only — never
-        # to ``self.run_dir`` — which keeps Seatbelt's denyRead("~/") rule
-        # from no-op-ing on macOS (see ``_build_jail_mirror`` for the bug
-        # writeup). After claude returns, ``_sync_jail_outputs`` copies the
-        # agent's writes back to ``subdir`` so the GEPA outer loop's
-        # ``_read_new_texts`` finds them in the canonical location.
-        #
-        # Outer cwd is *also* the jail (and thus outside terrarium/), which
-        # also closes Claude Code's CLAUDE.md walk-up channel — the auto-
-        # memory pointer at ~/.claude/projects/<terrarium-slug>/memory/
-        # never gets disclosed because there's no terrarium/CLAUDE.md
-        # ancestor of cwd to walk up to.
+        # Sandbox path: run claude inside a TMPDIR-rooted jail mirror of
+        # this call's read-only state. bwrap/Seatbelt and outer cwd are
+        # scoped to the jail, never run_dir — closes both the Seatbelt
+        # ~/-no-op channel and the CLAUDE.md walk-up channel. Outputs
+        # sync back to ``subdir`` after claude returns.
         if self.sandbox:
             jail_ctx: Any = tempfile.TemporaryDirectory(prefix="terrarium_gepa_cc_agent_")
         else:
-            # No-op context manager so the unsandboxed path stays one branch.
             class _NullCtx:
                 def __enter__(self): return str(self.run_dir)
                 def __exit__(self, *a): return False
@@ -617,12 +566,7 @@ can see your reasoning; keep it tight.
             jail_ctx.run_dir = self.run_dir
         with jail_ctx as jail_root_str:
             jail_root = Path(jail_root_str)
-            if self.sandbox:
-                agent_subdir = self._build_jail_mirror(subdir, jail_root)
-            else:
-                # Unsandboxed: agent operates directly on the real subdir
-                # under run_dir. No mirror, no copyback.
-                agent_subdir = subdir
+            agent_subdir = self._build_jail_mirror(subdir, jail_root) if self.sandbox else subdir
 
             wrapper = self._wrapper_prompt(
                 agent_subdir,
@@ -632,14 +576,6 @@ can see your reasoning; keep it tight.
                 parent_iter_id=parent_iter_id,
                 root_dir=jail_root,
             )
-
-            # bwrap (Linux) confines writes to ``jail_root``; siblings and
-            # other proposers don't exist in the jail. claude_settings_args
-            # (macOS) builds the Seatbelt JSON scoped to ``jail_root``.
-            # Bash stays on so the agent can grep/diff/jq/python the
-            # mirrored state. Network is shared (claude needs
-            # api.anthropic.com); WebFetch/WebSearch denial is the only
-            # outbound brake.
             cmd: list[str] = bwrap_prefix(jail_root) if self.sandbox else []
             cmd += [
                 "claude",

@@ -99,20 +99,12 @@ class GEPAAdapter:
         self.objective = objective
         self.background = background
         self.callbacks = callbacks or []
-        # Extra kwargs passed to ``gepa.lm.LM(...)`` when wrapping a string
-        # ``reflection.reflection_lm``. ``timeout`` is forwarded to litellm
-        # (its httpx default ~600s otherwise cuts off long extended-thinking
-        # responses); ``num_retries`` controls retry on transient failures.
+        # Forwarded to ``gepa.lm.LM(...)`` (litellm path) or to the SDK LM —
+        # e.g. ``timeout``, ``num_retries``.
         self.reflection_lm_kwargs = dict(reflection_lm_kwargs) if reflection_lm_kwargs else {}
-        # When set, terminate the GEPA loop once the best valset score
-        # reaches/exceeds this threshold. Implemented via a callback that
-        # raises ``BudgetExhausted`` from ``on_iteration_end``; the
-        # terrarium runner already catches that and returns the current best.
         self.stop_at_score = stop_at_score
         self.max_thinking_tokens = max_thinking_tokens
-        # Propagates into ClaudeCodeReflectionProposer (only used when
-        # reflection_lm starts with ``claude_code/``). None = take the
-        # top-level ``sandbox:`` default from the runner.
+        # None ⇒ inherit the runner's top-level ``sandbox:`` default.
         self.sandbox = sandbox
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
@@ -170,14 +162,11 @@ class GEPAAdapter:
                 )
                 reflection_kwargs["reflection_lm"] = reflection_lm
             elif isinstance(lm_name, str) and lm_name.startswith("anthropic_sdk/"):
-                # Direct Anthropic SDK reflection LM — bypasses litellm.
-                # Use when litellm + httpx wedges on long extended-thinking
-                # responses (observed on cloudcast vanilla-GEPA).
+                # Bypass litellm via the official Anthropic SDK.
                 from terrarium.adapters._anthropic_sdk_lm import AnthropicSdkLM
                 lm_kwargs = dict(self.reflection_lm_kwargs)
                 lm_kwargs.pop("reasoning_effort", None)
-                # Translate litellm-style ``num_retries`` to SDK's ``max_retries``.
-                if "num_retries" in lm_kwargs:
+                if "num_retries" in lm_kwargs:  # litellm naming → SDK naming
                     lm_kwargs.setdefault("max_retries", lm_kwargs.pop("num_retries"))
                 reflection_lm = AnthropicSdkLM(
                     model=lm_name.split("/", 1)[1],
@@ -263,12 +252,10 @@ class GEPAAdapter:
         if task.has_dataset:
             if task.train_set:
                 oa_kwargs["dataset"] = task.train_set
-            # Prefer the dataclass val_set field (current convention used by
-            # aime_math, cant_be_late, cloudcast, and GEPA's own main.py
-            # examples). Fall back to test_set for legacy tasks that have no
-            # val_set, then to the older metadata["val_set"] escape hatch
-            # (arc_agi). This leaves task.test_set as a true held-out split
-            # consumed by runner.py's post-run evaluation.
+            # val_set first (terrarium convention); test_set as legacy
+            # fallback; metadata["val_set"] for tasks with neither dataclass
+            # field. test_set stays a true held-out split for runner.py's
+            # post-run eval whenever val_set is populated.
             if task.val_set:
                 oa_kwargs["valset"] = task.val_set
             elif task.test_set:
@@ -276,9 +263,6 @@ class GEPAAdapter:
             if "val_set" in task.metadata:
                 oa_kwargs.setdefault("valset", task.metadata["val_set"])
 
-        # Both adapters pass the same two task fields through to the
-        # evolution system. yaml-level ``adapter.objective`` /
-        # ``adapter.background`` overrides win.
         objective = self.objective or task.objective
         background = self.background or task.background
         if objective:

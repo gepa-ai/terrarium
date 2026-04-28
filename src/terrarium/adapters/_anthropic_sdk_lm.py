@@ -1,22 +1,11 @@
 """Direct Anthropic SDK reflection LM — bypasses litellm.
 
-Use when the litellm + httpx streaming path wedges on long extended-thinking
-responses (observed on cloudcast vanilla-GEPA runs: TCP CLOSE_WAIT, 100% CPU,
-log frozen indefinitely). The Anthropic Python SDK uses its own httpx client
-with finite timeouts and is not affected.
+Use when the litellm + httpx path wedges on long extended-thinking responses.
+Implements GEPA's ``LanguageModel`` protocol and exposes ``total_cost`` for
+:class:`gepa.utils.stop_condition.MaxReflectionCostStopper`.
 
-Install: ``pip install terrarium[anthropic_sdk]`` (or just
-``pip install anthropic``). Pulled in only on demand — the import lives
-inside :class:`AnthropicSdkLM.__init__` so ``terrarium`` itself stays
-importable without ``anthropic`` in any environment that doesn't use
-``reflection_lm="anthropic_sdk/<model>"``.
-
-Implements the GEPA ``LanguageModel`` protocol::
-
-    __call__(prompt: str | list[dict[str, str]]) -> str
-
-Exposes ``total_cost`` so :class:`gepa.utils.stop_condition.MaxReflectionCostStopper`
-can read cumulative USD spend off the LM.
+Install: ``pip install terrarium[anthropic_sdk]``. The import is deferred to
+``AnthropicSdkLM.__init__`` so ``terrarium`` stays importable without it.
 """
 
 from __future__ import annotations
@@ -24,8 +13,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-# Per-1M-token USD pricing, used to compute a cost estimate after each call.
-# Overrides accepted via ``input_price_per_mtok`` / ``output_price_per_mtok``.
+# (input_per_mtok, output_per_mtok) USD; overrides accepted as ctor kwargs.
 _PRICE_TABLE: dict[str, tuple[float, float]] = {
     "claude-opus-4-7":              (15.0, 75.0),
     "claude-opus-4-5":              (15.0, 75.0),
@@ -43,7 +31,7 @@ def _lookup_price(model: str) -> tuple[float, float]:
     for known, price in _PRICE_TABLE.items():
         if known in model:
             return price
-    return (3.0, 15.0)
+    return (3.0, 15.0)  # default to Sonnet pricing for unknown models
 
 
 class AnthropicSdkLM:
@@ -96,11 +84,11 @@ class AnthropicSdkLM:
     def _build_messages(self, prompt: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
         if isinstance(prompt, str):
             return [{"role": "user", "content": prompt}]
+        # role=system is stripped here and re-attached via the ``system`` kwarg
+        # in ``__call__`` — the SDK rejects it inside ``messages``.
         msgs: list[dict[str, Any]] = []
         for m in prompt:
             role = m.get("role", "user")
-            # Anthropic SDK rejects role="system" in messages — strip and
-            # surface separately via system kwarg (handled by caller below).
             if role == "system":
                 continue
             msgs.append({"role": role, "content": m.get("content", "")})
@@ -123,8 +111,7 @@ class AnthropicSdkLM:
             kwargs["system"] = sys_prompt
         if self.max_thinking_tokens is not None:
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.max_thinking_tokens}
-            # Extended thinking requires temperature=1.
-            kwargs["temperature"] = 1.0
+            kwargs["temperature"] = 1.0  # extended thinking requires temperature=1
 
         response = self._client.messages.create(**kwargs)
 

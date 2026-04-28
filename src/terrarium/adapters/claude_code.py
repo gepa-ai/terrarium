@@ -321,52 +321,35 @@ def materialize_sandbox(
 ) -> None:
     """Set up the agent's sandbox workspace.
 
-    Creates:
-        work_dir/
-            program.md          — structured task instructions
-            candidate.txt       — initial candidate
-            best_candidate.txt  — agent writes best here
-            eval.sh             — train evaluation script
-            validate.sh         — val evaluation script (generalization only)
-            train/              — materialized training examples (generalization only)
+    Layout: ``program.md``, ``candidate.txt``, ``best_candidate.txt``,
+    ``eval.sh``, ``validate.sh`` (val_set only), ``train/<id>.json`` (dataset).
 
     Args:
-        train_preview: If True (default), evaluate the seed candidate on each
-            training example at materialize-time and inline the resulting
-            ``info`` dict (sans heavy raw fields) into ``train/<id>.json``.
-            This gives the agent the same per-example side-info that GEPA's
-            ``reflective_dataset`` provides — e.g. for cant_be_late, the
-            ``spot_availability`` summary string. Without it, the agent only
-            sees a ``trace_file`` path it can't read inside the sandbox,
-            which artificially handicaps optimization on tasks whose inputs
-            point to external data files.
-        preview_max_examples: Cap how many examples get a preview (use the
-            first N). Useful when ``train_set`` is huge and a full pass would
-            dominate startup. None = preview every example.
+        train_preview: Evaluate the seed candidate on each train example at
+            materialize-time and inline per-example side-info into
+            ``train/<id>.json`` — gives the agent the same context GEPA's
+            ``reflective_dataset`` provides (e.g. cant_be_late's
+            ``spot_availability``) so it isn't blind to inputs whose data
+            lives in external trace files.
+        preview_max_examples: Cap how many examples get a preview. ``None``
+            = preview every example.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # program.md — structured instructions
     (work_dir / "program.md").write_text(build_program_md(task, budget, perfect_score=perfect_score))
-
-    # Candidate files
     (work_dir / "candidate.txt").write_text(task.initial_candidate)
     (work_dir / "best_candidate.txt").write_text(task.initial_candidate)
 
-    # eval.sh — minimal one-shot script for single-task; full split/--ids
-    # script for dataset tasks.
     eval_template = EVAL_SCRIPT_DATASET if task.has_dataset else EVAL_SCRIPT_SINGLE
     eval_script = work_dir / "eval.sh"
     eval_script.write_text(eval_template.format(server_url=server_url))
     eval_script.chmod(0o755)
 
-    # validate.sh (generalization mode only)
     if task.val_set:
         validate_script = work_dir / "validate.sh"
         validate_script.write_text(VALIDATE_SCRIPT.format(server_url=server_url))
         validate_script.chmod(0o755)
 
-    # Materialize train examples (with optional seed-eval preview)
     if task.train_set:
         train_dir = work_dir / "train"
         train_dir.mkdir(exist_ok=True)
@@ -381,17 +364,8 @@ def materialize_sandbox(
 
 
 def _build_train_previews(task: Task, max_examples: int | None) -> dict[str, dict[str, Any]]:
-    """Run the seed candidate on each train example to capture side-info.
-
-    Mirrors what GEPA's ``reflective_dataset`` provides: per-example score,
-    selected ``Input`` fields (which include problem-domain summaries like
-    ``spot_availability``), and the seed's ``Output`` (timeline / cost
-    breakdown). Heavy debug fields are dropped to keep ``train/<id>.json``
-    small.
-
-    Failures are silent — a missing ``seed_preview`` just means that
-    example didn't get one, which is no worse than the pre-preview behavior.
-    """
+    """Eval the seed on each train example; return per-id side-info dicts.
+    Heavy debug fields are stripped. Failures are silent (no preview emitted)."""
     from concurrent.futures import ThreadPoolExecutor
 
     examples = list(task.train_set or ())
@@ -472,22 +446,12 @@ class ClaudeCodeAdapter:
     def evolve(self, task: Task, server: EvalServer) -> Result:
         budget = server.budget
 
-        # Pick work_dir.
-        #
-        # Subtle Seatbelt bug on macOS: when ``filesystem.allowRead`` contains
-        # any path under ``~/`` (the user's home), the matching ``denyRead:
-        # ["~/"]`` rule becomes a no-op for the *entire* home directory — so
-        # Bash and the Read tool can both reach ``~/.claude/projects/.../
-        # memory/``, ``~/.ssh/``, the project source tree, and anything else
-        # under home. Empirically verified: same sandbox config, work_dir under
-        # ``/var/folders`` denies these reads correctly; work_dir under
-        # ``/Users/...`` leaks the entire home dir.
-        #
-        # When ``sandbox=True`` we therefore force a tempdir work_dir under
-        # the system TMPDIR (which lives under ``/private/var/folders/`` on
-        # macOS, outside ``~/``). ``process_result`` later copies any
-        # artifacts back to ``self.run_dir`` so the sandbox isolation doesn't
-        # cost the user their persisted artifacts.
+        # When sandbox=True, force work_dir under TMPDIR. macOS Seatbelt bug:
+        # ``denyRead: ["~/"]`` no-ops if ``allowRead`` contains any path under
+        # ``~/``. A TMPDIR-rooted work_dir keeps allowRead outside home, so
+        # the deny rule actually blocks ~/.claude/projects, ~/.ssh, the
+        # project source tree, etc. ``process_result`` copies artifacts back
+        # to self.run_dir so the user doesn't lose them.
         if self.sandbox:
             self._pending_tempdir = tempfile.TemporaryDirectory(prefix="terrarium_cc_")
             work_dir = Path(self._pending_tempdir.name)

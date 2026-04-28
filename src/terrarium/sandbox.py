@@ -61,16 +61,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Linux uses bwrap (below); macOS has no bwrap, so we fall back to Claude
-# Code's built-in ``sandbox.enabled: true`` + Seatbelt — the same approach
-# we used before the upstream bwrap rewrite. The internal sandbox crashes
-# on Ubuntu 24.04 (the bug that motivated the bwrap rewrite) but works
-# fine on macOS, so we keep it as the macOS-only path.
+# Linux uses bwrap; macOS falls back to Claude Code's Seatbelt sandbox
+# (see ``claude_settings_args`` below). The bug that motivated the bwrap
+# rewrite is Linux-only.
 _IS_MACOS = sys.platform == "darwin"
 
-# Content-bearing file tools we whitelist per allowed directory on the
-# macOS Seatbelt path. Glob is deliberately excluded — it auto-allows
-# regardless of rules and only returns filenames (no content).
+# Content tools whitelisted per allowed dir on the Seatbelt path. Glob is
+# excluded — it auto-allows and only returns filenames anyway.
 _FILE_TOOLS: tuple[str, ...] = ("Read", "Grep", "Edit", "Write", "NotebookEdit")
 
 # System directories we expose read-only. For each, we check at runtime:
@@ -187,14 +184,9 @@ def bwrap_prefix(
     return args
 
 
-# ---------------------------------------------------------------------------
-# macOS fallback: Claude Code's built-in sandbox via ``--settings`` JSON.
-# ---------------------------------------------------------------------------
-# Linux uses bwrap; macOS has no bwrap, so we route sandbox=True on macOS
-# through the pre-rewrite mechanism: ``sandbox.enabled: true`` (Seatbelt)
-# plus a tool allow-list. Same approach upstream replaced — but the bug
-# they replaced it for (``--tmpfs /sbin`` on Ubuntu 24.04) is Linux-only;
-# Seatbelt works fine on macOS.
+# macOS fallback: Claude Code's built-in Seatbelt sandbox via --settings JSON.
+# bwrap is Linux-only; the bug that motivated upstream's bwrap rewrite (tmpfs
+# on /sbin under merged-/usr) is Linux-only, so Seatbelt is fine here.
 
 
 def _abs_glob(path: str) -> str:
@@ -207,16 +199,11 @@ def _build_macos_sandbox_settings(
     *,
     extra_writable: list[Path | str] | None = None,
 ) -> dict[str, Any]:
-    """Build a settings.json dict that confines ``claude`` to ``work_dir``
-    via Claude Code's internal sandbox (Seatbelt on macOS).
+    """Settings JSON for Claude Code's Seatbelt sandbox.
 
-    Two layers:
-    - ``sandbox.filesystem.{allow,deny}{Read,Write}``: OS-level confinement
-      of Bash subprocesses.
-    - ``permissions.allow``: tool-level whitelist for Read/Grep/Edit/Write/
-      NotebookEdit. With ``--permission-mode bypassPermissions`` on the
-      caller side this is mostly advisory (Claude won't ask), but the OS
-      sandbox still enforces filesystem confinement.
+    Two layers: ``sandbox.filesystem.*`` confines Bash subprocesses;
+    ``permissions.allow`` whitelists file tools (advisory under
+    bypassPermissions, but OS-level confinement still applies).
     """
     paths = [str(Path(work_dir).resolve())]
     paths.extend(str(Path(p).resolve()) for p in extra_writable or ())
@@ -244,13 +231,8 @@ def claude_settings_args(
     *,
     extra_writable: list[Path | str] | None = None,
 ) -> list[str]:
-    """Return ``--settings <json>`` claude args for the macOS Seatbelt path.
-
-    No-op on Linux: returns ``[]``, since :func:`bwrap_prefix` already
-    confines the process there. Callers should prepend ``bwrap_prefix(...)``
-    for the OS jail and append ``claude_settings_args(...)`` after the
-    ``claude`` binary; both are platform-correct.
-    """
+    """``--settings <json>`` for the macOS Seatbelt path. Empty on Linux
+    (where :func:`bwrap_prefix` already confines)."""
     if not _IS_MACOS:
         return []
     settings = _build_macos_sandbox_settings(work_dir, extra_writable=extra_writable)

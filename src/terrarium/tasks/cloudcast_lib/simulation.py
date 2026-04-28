@@ -19,20 +19,17 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-SideInfo = dict  # vendored: was ``from gepa.optimize_anything import SideInfo`` (a dict alias)
+SideInfo = dict  # was ``from gepa.optimize_anything`` — vendored as plain dict
 
 logger = logging.getLogger(__name__)
 
 FAILED_SCORE = -100_000.0
 
-# Cap per-candidate evaluation at 60s. Real evals on cloudcast configs finish
-# in <1s; only pathological generated candidates (e.g. ``list(nx.shortest_simple_paths(...))``
-# on a dense graph, which yields exponentially many paths) take longer.
-# Implementation note: this runs the candidate in a daemon thread and abandons
-# it on timeout. Python can't kill threads, so the worker keeps burning CPU
-# until the process exits — but the run progresses past the bad candidate.
-# Diverges from the blog setup (no timeout there) but the blog never tripped
-# this failure mode in their reported runs.
+# Per-candidate eval timeout. Real evals are <1s; pathological generated
+# candidates (e.g. ``list(nx.shortest_simple_paths(...))`` on a dense
+# graph) can run forever. Implemented as a daemon thread + join — Python
+# can't kill threads, so the timed-out worker keeps burning CPU until the
+# process exits. Diverges from blog setup (no timeout there) intentionally.
 SEARCH_ALGORITHM_TIMEOUT_SECS = 60.0
 
 
