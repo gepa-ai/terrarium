@@ -27,11 +27,12 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetTracker
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
     from terrarium.eval_server import EvalServer
+
 
 # Single-task eval script: one POST per call, returns one score.
 # Usage: ./eval.sh <candidate_file>
@@ -53,7 +54,7 @@ RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/evaluate" \\
     -d "$BODY")
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -n -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
 
 echo "$BODY"
 
@@ -108,7 +109,7 @@ RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/evaluate_examples
     -d "$BODY")
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -n -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
 
 echo "$BODY"
 
@@ -137,7 +138,7 @@ RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST "$SERVER_URL/validate" \\
     -d "$BODY")
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | head -n -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
 
 echo "$BODY"
 
@@ -220,6 +221,10 @@ def _strategy_section(task: Task) -> str:
         final_n = 6 if task.val_set else 5
         return (
             "1. Read the training examples in `train/` to understand the task.\n"
+            "   Each `train/<id>.json` includes a `seed_preview` field showing\n"
+            "   how the seed candidate behaves on that example (per-example\n"
+            "   score + domain summary in `Input` + seed's `Output` trace).\n"
+            "   Use these previews to find failure patterns to attack.\n"
             "2. Run `./eval.sh candidate.txt` for a baseline.\n"
             "3. Analyze failures — inspect examples that scored 0.\n"
             "4. Improve the candidate; spot-check with `--ids`.\n"
@@ -311,49 +316,87 @@ def materialize_sandbox(
     budget: BudgetTracker,
     *,
     perfect_score: float | None = None,
+    train_preview: bool = True,
+    preview_max_examples: int | None = None,
 ) -> None:
     """Set up the agent's sandbox workspace.
 
-    Creates:
-        work_dir/
-            program.md          — structured task instructions
-            candidate.txt       — initial candidate
-            best_candidate.txt  — agent writes best here
-            eval.sh             — train evaluation script
-            validate.sh         — val evaluation script (generalization only)
-            train/              — materialized training examples (generalization only)
+    Layout: ``program.md``, ``candidate.txt``, ``best_candidate.txt``,
+    ``eval.sh``, ``validate.sh`` (val_set only), ``train/<id>.json`` (dataset).
+
+    Args:
+        train_preview: Evaluate the seed candidate on each train example at
+            materialize-time and inline per-example side-info into
+            ``train/<id>.json`` — gives the agent the same context GEPA's
+            ``reflective_dataset`` provides (e.g. cant_be_late's
+            ``spot_availability``) so it isn't blind to inputs whose data
+            lives in external trace files.
+        preview_max_examples: Cap how many examples get a preview. ``None``
+            = preview every example.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # program.md — structured instructions
     (work_dir / "program.md").write_text(build_program_md(task, budget, perfect_score=perfect_score))
-
-    # Candidate files
     (work_dir / "candidate.txt").write_text(task.initial_candidate)
     (work_dir / "best_candidate.txt").write_text(task.initial_candidate)
 
-    # eval.sh — minimal one-shot script for single-task; full split/--ids
-    # script for dataset tasks.
     eval_template = EVAL_SCRIPT_DATASET if task.has_dataset else EVAL_SCRIPT_SINGLE
     eval_script = work_dir / "eval.sh"
     eval_script.write_text(eval_template.format(server_url=server_url))
     eval_script.chmod(0o755)
 
-    # validate.sh (generalization mode only)
     if task.val_set:
         validate_script = work_dir / "validate.sh"
         validate_script.write_text(VALIDATE_SCRIPT.format(server_url=server_url))
         validate_script.chmod(0o755)
 
-    # Materialize train examples
     if task.train_set:
         train_dir = work_dir / "train"
         train_dir.mkdir(exist_ok=True)
+        previews = _build_train_previews(task, preview_max_examples) if train_preview else {}
         for ex in task.train_set:
-            data = {"id": ex.id, "inputs": ex.inputs}
+            data: dict[str, Any] = {"id": ex.id, "inputs": ex.inputs}
             if ex.expected is not None:
                 data["expected"] = ex.expected
-            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            if ex.id in previews:
+                data["seed_preview"] = previews[ex.id]
+            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2, default=str))
+
+
+def _build_train_previews(task: Task, max_examples: int | None) -> dict[str, dict[str, Any]]:
+    """Eval the seed on each train example; return per-id side-info dicts.
+    Heavy debug fields are stripped. Failures are silent (no preview emitted)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    examples = list(task.train_set or ())
+    if max_examples is not None:
+        examples = examples[:max_examples]
+    if not examples:
+        return {}
+
+    seed = task.initial_candidate
+    eval_fn = task.eval_fn
+
+    def _one(ex):
+        try:
+            score, info = eval_fn(seed, ex)
+        except Exception:
+            return ex.id, None
+        # Drop heavy / non-portable fields; keep what GEPA's reflective_dataset
+        # would surface to the proposer.
+        info = info or {}
+        preview: dict[str, Any] = {"score": score}
+        for k in ("Input", "Output", "Error", "scores"):
+            if k in info:
+                preview[k] = info[k]
+        return ex.id, preview
+
+    out: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for eid, preview in pool.map(_one, examples):
+            if preview is not None:
+                out[eid] = preview
+    return out
 
 
 
@@ -403,7 +446,16 @@ class ClaudeCodeAdapter:
     def evolve(self, task: Task, server: EvalServer) -> Result:
         budget = server.budget
 
-        if self.run_dir:
+        # When sandbox=True, force work_dir under TMPDIR. macOS Seatbelt bug:
+        # ``denyRead: ["~/"]`` no-ops if ``allowRead`` contains any path under
+        # ``~/``. A TMPDIR-rooted work_dir keeps allowRead outside home, so
+        # the deny rule actually blocks ~/.claude/projects, ~/.ssh, the
+        # project source tree, etc. ``process_result`` copies artifacts back
+        # to self.run_dir so the user doesn't lose them.
+        if self.sandbox:
+            self._pending_tempdir = tempfile.TemporaryDirectory(prefix="terrarium_cc_")
+            work_dir = Path(self._pending_tempdir.name)
+        elif self.run_dir:
             work_dir = Path(self.run_dir)
             work_dir.mkdir(parents=True, exist_ok=True)
         else:
@@ -454,6 +506,8 @@ class ClaudeCodeAdapter:
             "--permission-mode", "bypassPermissions",
             DENY_WEB_TOOLS,
         ]
+        if self.sandbox:
+            cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
         if self.max_thinking_tokens is None and self.effort is not None:
             cmd.extend(["--effort", self.effort])
         if budget.max_token_cost is not None:

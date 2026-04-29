@@ -59,8 +59,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -70,7 +72,7 @@ from typing import Any
 
 from terrarium.adapters.claude_code import _copy_session_transcript
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
 
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
@@ -176,6 +178,45 @@ class ClaudeCodeAgentProposer:
             sections.append("## Background\n" + self.background.strip())
         (self.run_dir / "task.md").write_text("\n\n".join(sections) + "\n")
         self._task_md_materialized = True
+
+    def _build_jail_mirror(self, subdir_real: Path, jail_root: Path) -> Path:
+        """Mirror per-call read-only state into a TMPDIR-rooted jail.
+
+        Layout: ``<jail_root>/{task.md,history.md,proposals/<sub.name>/...}``.
+        The agent reads/writes inside the jail; ``_sync_jail_outputs`` copies
+        ``new/*`` and ``plan.md`` back to ``subdir_real`` on return.
+
+        Why mirror instead of binding run_dir: on macOS Seatbelt's
+        ``denyRead: ["~/"]`` no-ops if ``allowRead`` contains a home-tree
+        path (run_dir is under hydra outputs/, i.e. ~/). Scoping the
+        Seatbelt allow-list to a TMPDIR-rooted jail keeps allowRead outside
+        ~/, so the deny rule actually blocks ~/.claude/projects, ~/.ssh,
+        and the source tree. On Linux this is slightly redundant (bwrap
+        could bind run_dir directly) but symmetry beats a platform branch.
+        """
+        for fname in ("task.md", "history.md"):
+            src = self.run_dir / fname
+            if src.exists():
+                shutil.copy2(src, jail_root / fname)
+        jail_subdir = jail_root / "proposals" / subdir_real.name
+        jail_subdir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(subdir_real, jail_subdir)
+        return jail_subdir
+
+    def _sync_jail_outputs(self, jail_subdir: Path, subdir_real: Path) -> None:
+        """Copy the agent's prompt-mandated outputs (``new/*``, ``plan.md``)
+        from the jail back to ``subdir_real``. Anything else is dropped with
+        the tempdir."""
+        new_src = jail_subdir / "new"
+        new_dst = subdir_real / "new"
+        if new_src.is_dir():
+            new_dst.mkdir(parents=True, exist_ok=True)
+            for f in new_src.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, new_dst / f.name)
+        plan_src = jail_subdir / "plan.md"
+        if plan_src.exists():
+            shutil.copy2(plan_src, subdir_real / "plan.md")
 
     def _allocate_subdir(self, iteration: int | None) -> Path:
         """Pick a collision-free subdir for this call under ``<run_dir>/<prefix>/``.
@@ -291,91 +332,106 @@ class ClaudeCodeAgentProposer:
         *,
         first_iteration: bool,
         parent_iter_id: int | None,
+        root_dir: Path | None = None,
     ) -> str:
-        """Program.md-style proposal brief, iteration-folder-oriented.
+        """Program.md-style proposal brief.
 
-        Long task context (objective, background — often thousands of chars,
-        including the scoring rubric) lives in ``<run_dir>/task.md``; we
-        reference it by path so every proposal call doesn't re-ship it
-        through the CLI prompt. The agent is pointed at ``history.md`` (the
-        rolling log of all prior plans + outcomes) and ``parent/`` (a local
-        copy of its parent iteration) so it can plan with full context
-        without loading the whole ``iterations/`` tree.
+        Long task context (objective, background, scoring rubric) lives in
+        ``<root>/task.md`` rather than the CLI prompt. The agent is pointed
+        at ``history.md`` and ``parent/`` for context. ``root_dir`` is the
+        per-call jail mirror under TMPDIR when sandboxed, ``self.run_dir``
+        otherwise; either way the prompt uses absolute paths.
         """
-        rel = subdir.relative_to(self.run_dir).as_posix()
+        run_abs = (root_dir or self.run_dir).resolve()
+        sub_abs = subdir.resolve()
         task_md_exists = (self.objective is not None) or (self.background is not None)
-        # Listed in the Outputs section below — carries both the stem (for
-        # reflection file lookup) and the write path. No sidecar
-        # ``components_to_update.json`` / ``_index.json`` needed.
         files_to_produce = "\n".join(
-            f"- `{rel}/new/{stems[name]}.md`  (component {name!r})"
+            f"- `{sub_abs}/new/{stems[name]}.md`  (component {name!r})"
             for name in components
         )
         task_section = (
-            "## Task\nThe problem statement and **scoring rubric** are in "
-            "`task.md` at the top of the working directory. Read it first — "
-            "it defines what a higher score means and, for graded problems, "
-            "what the achievable range actually is. Do not assume a score of "
-            "1.0 is perfect unless `task.md` says so.\n\n"
+            f"## Task\nThe problem statement and **scoring rubric** are in "
+            f"`{run_abs}/task.md`. Read it first — it defines what a higher "
+            "score means and, for graded problems, what the achievable range "
+            "actually is. Do not assume a score of 1.0 is perfect unless "
+            "`task.md` says so.\n\n"
             if task_md_exists
             else ""
         )
         if first_iteration:
             history_section = (
-                "## History\nThis is the first proposal in this run — there "
-                "is no `history.md` yet. Your `parent/` directory contains "
-                "the **seed program** (no `plan.md`).\n\n"
+                f"## History\nThis is the first proposal in this run — there "
+                f"is no `history.md` yet. Your `{sub_abs}/parent/` directory "
+                "contains the **seed program** (no `plan.md`).\n\n"
             )
         else:
             history_section = (
-                "## History\nRead `history.md` at the top of the working "
-                "directory **first**. It's a chronological log of every "
-                "prior iteration's short plan and score outcome (accepted "
-                "or rejected). Use it to avoid repeating strategies that "
-                "have already been tried and to build on what worked.\n\n"
+                f"## History\nRead `{run_abs}/history.md` **first**. It's a "
+                "chronological log of every prior iteration's short plan and "
+                "score outcome (accepted or rejected). Use it to avoid "
+                "repeating strategies that have already been tried and to "
+                "build on what worked.\n\n"
             )
         # Enumerate concrete input paths per component, same pattern the
         # Outputs section uses. Passing literal ``<stem>`` placeholders
         # confused the agent — it Read the placeholder filename verbatim and
         # errored out. We have the real filenames in ``stems``; use them.
         parent_component_lines = "\n".join(
-            f"   - `{rel}/parent/components/{stems[name]}.txt`  (component {name!r})"
+            f"   - `{sub_abs}/parent/components/{stems[name]}.txt`  (component {name!r})"
             for name in sorted(stems)
         )
         reflection_lines = "\n".join(
-            f"   - `{rel}/reflection/{stems[name]}.json`  (component {name!r})"
+            f"   - `{sub_abs}/reflection/{stems[name]}.json`  (component {name!r})"
             for name in components
         )
         parent_section = (
-            f"3. `{rel}/parent/` — parent iteration (`plan.md`, `meta.json`, "
-            f"`val_scores.json`, plus component files):\n{parent_component_lines}"
+            f"3. `{sub_abs}/parent/` — parent iteration (`plan.md`, "
+            f"`meta.json`, `val_scores.json`, plus component files):\n"
+            f"{parent_component_lines}"
         )
-        if parent_iter_id is not None:
+        # Iterations/ and pareto/ only exist on disk in the persistent
+        # ``run_dir``. When sandboxed (``root_dir`` != ``self.run_dir``),
+        # they're not mirrored into the jail — task.md, history.md, and the
+        # per-call subdir are sufficient context. Drop those references.
+        sandboxed = root_dir is not None and root_dir != self.run_dir
+        if not sandboxed and parent_iter_id is not None:
             parent_section += (
                 f"\n   For full rollout outputs see "
-                f"`iterations/{parent_iter_id:05d}/outputs/` + `trajectories/`."
+                f"`{run_abs}/iterations/{parent_iter_id:05d}/outputs/` + "
+                f"`{run_abs}/iterations/{parent_iter_id:05d}/trajectories/`."
             )
+        wider_state_section = (
+            ""
+            if sandboxed
+            else (
+                f"\n## Wider state (browse when useful)\n"
+                f"- `{run_abs}/iterations/NNNNN/` — every past iteration "
+                f"(accepted *and* rejected), with `meta.json`, "
+                f"`components/`, `plan.md`, `reflective_dataset.json`, "
+                f"`trace.json`. `00000/` is always the seed.\n"
+                f"- `{run_abs}/pareto/` — current Pareto frontier(s) "
+                f"keyed by iteration id.\n"
+            )
+        )
         return f"""\
 You are proposing improved text for one or more components of a program.
 Your goal is to raise the program's aggregate score on
 future evaluations, based on the reflective feedback from past runs.
 
-Your working directory is the shared run directory. All inputs and
-outputs for **this** proposal call live under:
-  `{rel}/`
+All inputs and outputs for **this** proposal call live under:
+  `{sub_abs}/`
+The shared run directory is at:
+  `{run_abs}/`
+Use these absolute paths in every Read/Write/Bash call — your cwd is
+an isolated tempdir, not the run directory.
 
 {task_section}{history_section}## Inputs (read in this order)
-1. `task.md` — problem statement + scoring rubric.
-2. `history.md` — chronological log of prior iterations' plans and scores.
+1. `{run_abs}/task.md` — problem statement + scoring rubric.
+2. `{run_abs}/history.md` — chronological log of prior iterations' plans and scores.
 {parent_section}
 4. Per-example feedback for each component to update:
 {reflection_lines}
-
-## Wider state (browse when useful)
-- `iterations/NNNNN/` — every past iteration (accepted *and* rejected),
-  with `meta.json`, `components/`, `plan.md`, `reflective_dataset.json`,
-  `trace.json`. `00000/` is always the seed program.
-- `pareto/` — current Pareto frontier(s) keyed by iteration id.
+{wider_state_section}
 
 ## Outputs you must produce
 One improved-text file per component:
@@ -384,13 +440,13 @@ One improved-text file per component:
 Wrap the new component text in a single ```…``` fenced block. Anything
 outside the block is treated as rationale and discarded by the engine.
 
-**Also** write a short plan to `{rel}/plan.md` — **≤50 words**, plain prose.
-Describe what you're changing and why. This file is concatenated with
-every prior iteration's plan into `history.md` so future proposers can
-see your reasoning; keep it tight.
+**Also** write a short plan to `{sub_abs}/plan.md` — **≤50 words**, plain
+prose. Describe what you're changing and why. This file is concatenated
+with every prior iteration's plan into `history.md` so future proposers
+can see your reasoning; keep it tight.
 
 ## Rules
-- Write only inside `{rel}/new/` and `{rel}/plan.md`.
+- Write only inside `{sub_abs}/new/` and `{sub_abs}/plan.md`.
 - Do not modify other iterations, state files, `task.md`, `history.md`,
   or another proposal's directory.
 - Do not attempt to run any evaluations or verifications.
@@ -457,21 +513,16 @@ see your reasoning; keep it tight.
             return {}
 
         meta = dict(metadata) if metadata else {}
+        # GEPA's ``iteration`` is already the 1-indexed on-disk iter id.
         iteration = meta.get("iteration")
         parent_iter_id = meta.get("parent_iteration_id")
-        # ``iteration`` from GEPA is already the 1-indexed on-disk iter id
-        # (matches the ``Iteration N`` log line and ``iterations/NNNNN/``
-        # subdir name); no further shifting needed.
         iteration = int(iteration) if iteration is not None else None
         parent_iter_id = int(parent_iter_id) if parent_iter_id is not None else None
 
         self._ensure_task_md()
-        # Regenerate ``history.md`` from the iterations/ tree on disk. GEPA's
-        # state.save() runs at the top of each outer-loop turn, so every
-        # iteration strictly before this one already has
-        # ``iterations/NNNNN/meta.json`` (+ optionally ``plan.md``) written.
-        # Deriving history.md every call keeps the view in sync with disk
-        # without any cross-thread bookkeeping.
+        # Regenerate history.md from the iterations/ tree every call —
+        # state.save() at the top of each GEPA turn means everything
+        # strictly before this iter is already on disk.
         if iteration is not None:
             self._rebuild_history_md()
 
@@ -490,36 +541,7 @@ see your reasoning; keep it tight.
         )
         # Seed owns iteration id 0; the very first loop proposal runs at id 1.
         first_iteration = iteration == 1
-        wrapper = self._wrapper_prompt(
-            subdir,
-            components_to_update,
-            stems,
-            first_iteration=first_iteration,
-            parent_iter_id=parent_iter_id,
-        )
-
         session_id = str(uuid.uuid4())
-        # bwrap (when sandboxed) confines writes to run_dir; sibling algos /
-        # other proposers' run_dirs aren't bound, so their paths don't exist
-        # in the jail. Bash stays on so grep/diff/jq/python can analyze past
-        # candidates. Network is shared (claude needs api.anthropic.com);
-        # WebFetch/WebSearch denial is the only outbound brake.
-        cmd: list[str] = bwrap_prefix(self.run_dir) if self.sandbox else []
-        cmd += [
-            "claude",
-            "--print",
-            wrapper,
-            "--output-format", "json",
-            "--model", self.model,
-            "--session-id", session_id,
-            "--permission-mode", "bypassPermissions",
-            DENY_WEB_TOOLS,
-        ]
-        if self.max_thinking_tokens is None and self.effort is not None:
-            cmd.extend(["--effort", self.effort])
-        if self.max_budget_usd is not None:
-            remaining = max(0.01, self.max_budget_usd - self._total_cost)
-            cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
 
         env = {**os.environ}
         env.pop("CLAUDECODE", None)
@@ -528,9 +550,58 @@ see your reasoning; keep it tight.
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
-        proc = subprocess.run(
-            cmd, cwd=str(self.run_dir), env=env, capture_output=True, text=True
-        )
+        # Sandbox path: run claude inside a TMPDIR-rooted jail mirror of
+        # this call's read-only state. bwrap/Seatbelt and outer cwd are
+        # scoped to the jail, never run_dir — closes both the Seatbelt
+        # ~/-no-op channel and the CLAUDE.md walk-up channel. Outputs
+        # sync back to ``subdir`` after claude returns.
+        if self.sandbox:
+            jail_ctx: Any = tempfile.TemporaryDirectory(prefix="terrarium_gepa_cc_agent_")
+        else:
+            class _NullCtx:
+                def __enter__(self): return str(self.run_dir)
+                def __exit__(self, *a): return False
+                run_dir = self.run_dir
+            jail_ctx = _NullCtx()
+            jail_ctx.run_dir = self.run_dir
+        with jail_ctx as jail_root_str:
+            jail_root = Path(jail_root_str)
+            agent_subdir = self._build_jail_mirror(subdir, jail_root) if self.sandbox else subdir
+
+            wrapper = self._wrapper_prompt(
+                agent_subdir,
+                components_to_update,
+                stems,
+                first_iteration=first_iteration,
+                parent_iter_id=parent_iter_id,
+                root_dir=jail_root,
+            )
+            cmd: list[str] = bwrap_prefix(jail_root) if self.sandbox else []
+            cmd += [
+                "claude",
+                "--print",
+                wrapper,
+                "--output-format", "json",
+                "--model", self.model,
+                "--session-id", session_id,
+                "--permission-mode", "bypassPermissions",
+                DENY_WEB_TOOLS,
+            ]
+            if self.sandbox:
+                cmd.extend(claude_settings_args(jail_root))
+            if self.max_thinking_tokens is None and self.effort is not None:
+                cmd.extend(["--effort", self.effort])
+            if self.max_budget_usd is not None:
+                remaining = max(0.01, self.max_budget_usd - self._total_cost)
+                cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
+
+            proc = subprocess.run(
+                cmd, cwd=str(jail_root), env=env, capture_output=True, text=True
+            )
+
+            if self.sandbox:
+                self._sync_jail_outputs(agent_subdir, subdir)
+
         _copy_session_transcript(self.run_dir, session_id, subdir)
 
         payload: dict[str, Any] = {}

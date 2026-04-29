@@ -12,8 +12,17 @@ build/
 # Terrarium run artifacts
 outputs/
 experiments/
+run_logs/
 
 # IDE
 .idea/
 .vscode/
 *.swp
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# OS / misc
+.DS_Store

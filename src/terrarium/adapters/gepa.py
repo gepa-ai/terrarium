@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import bwrap_prefix
+from terrarium.sandbox import bwrap_prefix, claude_settings_args
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -99,20 +99,12 @@ class GEPAAdapter:
         self.objective = objective
         self.background = background
         self.callbacks = callbacks or []
-        # Extra kwargs passed to ``gepa.lm.LM(...)`` when wrapping a string
-        # ``reflection.reflection_lm``. ``timeout`` is forwarded to litellm
-        # (its httpx default ~600s otherwise cuts off long extended-thinking
-        # responses); ``num_retries`` controls retry on transient failures.
+        # Forwarded to ``gepa.lm.LM(...)`` (litellm path) or to the SDK LM —
+        # e.g. ``timeout``, ``num_retries``.
         self.reflection_lm_kwargs = dict(reflection_lm_kwargs) if reflection_lm_kwargs else {}
-        # When set, terminate the GEPA loop once the best valset score
-        # reaches/exceeds this threshold. Implemented via a callback that
-        # raises ``BudgetExhausted`` from ``on_iteration_end``; the
-        # terrarium runner already catches that and returns the current best.
         self.stop_at_score = stop_at_score
         self.max_thinking_tokens = max_thinking_tokens
-        # Propagates into ClaudeCodeReflectionProposer (only used when
-        # reflection_lm starts with ``claude_code/``). None = take the
-        # top-level ``sandbox:`` default from the runner.
+        # None ⇒ inherit the runner's top-level ``sandbox:`` default.
         self.sandbox = sandbox
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
@@ -167,6 +159,19 @@ class GEPAAdapter:
                     max_thinking_tokens=self.max_thinking_tokens,
                     effort=effort,
                     sandbox=bool(self.sandbox),
+                )
+                reflection_kwargs["reflection_lm"] = reflection_lm
+            elif isinstance(lm_name, str) and lm_name.startswith("anthropic_sdk/"):
+                # Bypass litellm via the official Anthropic SDK.
+                from terrarium.adapters._anthropic_sdk_lm import AnthropicSdkLM
+                lm_kwargs = dict(self.reflection_lm_kwargs)
+                lm_kwargs.pop("reasoning_effort", None)
+                if "num_retries" in lm_kwargs:  # litellm naming → SDK naming
+                    lm_kwargs.setdefault("max_retries", lm_kwargs.pop("num_retries"))
+                reflection_lm = AnthropicSdkLM(
+                    model=lm_name.split("/", 1)[1],
+                    max_thinking_tokens=self.max_thinking_tokens,
+                    **lm_kwargs,
                 )
                 reflection_kwargs["reflection_lm"] = reflection_lm
             else:
@@ -247,14 +252,17 @@ class GEPAAdapter:
         if task.has_dataset:
             if task.train_set:
                 oa_kwargs["dataset"] = task.train_set
-            if task.test_set:
+            # val_set first (terrarium convention); test_set as legacy
+            # fallback; metadata["val_set"] for tasks with neither dataclass
+            # field. test_set stays a true held-out split for runner.py's
+            # post-run eval whenever val_set is populated.
+            if task.val_set:
+                oa_kwargs["valset"] = task.val_set
+            elif task.test_set:
                 oa_kwargs["valset"] = task.test_set
             if "val_set" in task.metadata:
                 oa_kwargs.setdefault("valset", task.metadata["val_set"])
 
-        # Both adapters pass the same two task fields through to the
-        # evolution system. yaml-level ``adapter.objective`` /
-        # ``adapter.background`` overrides win.
         objective = self.objective or task.objective
         background = self.background or task.background
         if objective:
@@ -487,6 +495,8 @@ class ClaudeCodeReflectionProposer:
             "--permission-mode", "bypassPermissions",
             "--disallowedTools=WebFetch,WebSearch,Bash,Read,Edit,Write,Glob,Grep,Task,NotebookEdit",
         ]
+        if self.sandbox:
+            cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
         # ``max_thinking_tokens`` takes precedence over ``--effort`` (same mutex
         # rule the runner enforces for the claude_code / meta_harness adapters).
         if self.max_thinking_tokens is None and self.effort is not None:
