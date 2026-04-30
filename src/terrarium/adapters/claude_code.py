@@ -420,6 +420,8 @@ class ClaudeCodeAdapter:
         stop_at_score: float | None = None,
         max_thinking_tokens: int | None = None,
         sandbox: bool | None = None,
+        ralph: bool = False,
+        ralph_max_iterations: int = 50,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
@@ -437,6 +439,11 @@ class ClaudeCodeAdapter:
         # bubblewrap/Seatbelt + file-tool deny rules). None = take the
         # top-level ``sandbox:`` default from the runner.
         self.sandbox = sandbox
+        # Ralph loop: when claude exits before the LLM/eval budget is out,
+        # resume the session with ``--resume <session_id>`` and keep
+        # iterating. Off by default to preserve single-shot behavior.
+        self.ralph = ralph
+        self.ralph_max_iterations = ralph_max_iterations
         # Tempdir whose lifetime spans evolve → process_result, so the
         # adapter's workspace is still readable when process_result runs.
         # Cleaned up by process_result; on an evolve error we let
@@ -491,28 +498,6 @@ class ClaudeCodeAdapter:
         # ``--disallowedTools`` is variadic; pass with ``=`` so it doesn't
         # swallow the trailing positional prompt.
         session_id = str(uuid.uuid4())
-        # bwrap (when sandboxed) scopes writes to work_dir; network is
-        # shared so eval.sh / validate.sh can curl the local eval server
-        # (and claude can reach api.anthropic.com). WebFetch/WebSearch
-        # denied at the tool layer; bypassPermissions gives full file/Bash
-        # access inside the jail.
-        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
-        cmd += [
-            "claude",
-            "--print",
-            "--output-format", "json",
-            "--model", self.model,
-            "--session-id", session_id,
-            "--permission-mode", "bypassPermissions",
-            DENY_WEB_TOOLS,
-        ]
-        if self.sandbox:
-            cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
-        if self.max_thinking_tokens is None and self.effort is not None:
-            cmd.extend(["--effort", self.effort])
-        if budget.max_token_cost is not None:
-            cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
-        cmd.append(prompt)
 
         env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
         if self.max_thinking_tokens is not None:
@@ -520,14 +505,50 @@ class ClaudeCodeAdapter:
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
         adapter_cost = 0.0
-        proc = subprocess.run(
-            cmd,
-            cwd=str(work_dir),
+        ralph_iterations = 1
+        proc = self._run_claude(
+            work_dir=work_dir,
+            session_id=session_id,
+            prompt=prompt,
+            budget=budget,
+            adapter_cost=adapter_cost,
+            resume=False,
             env=env,
-            capture_output=True,
-            text=True,
         )
-        adapter_cost = _extract_claude_cost(proc.stdout)
+        adapter_cost += _extract_claude_cost(proc.stdout)
+
+        if self.ralph:
+            # Resume the same session until the budget is out or claude
+            # signals it's done by erroring. Each iteration's
+            # --max-budget-usd is the *remaining* LLM budget so the
+            # final iteration self-caps inside the CLI.
+            continue_prompt = (
+                "Continue iterating on the candidate. Re-read program.md if needed. "
+                "Run ./eval.sh and ./validate.sh as appropriate. "
+                "Keep refining best_candidate.txt until you exhaust the budget "
+                "or genuinely cannot find another improvement."
+            )
+            for _ in range(self.ralph_max_iterations - 1):
+                if not self._has_budget_headroom(server, adapter_cost):
+                    break
+                if proc.returncode != 0:
+                    break  # claude errored — don't retry blindly
+                proc = self._run_claude(
+                    work_dir=work_dir,
+                    session_id=session_id,
+                    prompt=continue_prompt,
+                    budget=budget,
+                    adapter_cost=adapter_cost,
+                    resume=True,
+                    env=env,
+                )
+                iter_cost = _extract_claude_cost(proc.stdout)
+                adapter_cost += iter_cost
+                ralph_iterations += 1
+                # Defensive: if claude returns success but spent ~$0, it's
+                # likely declining to continue. Stop to avoid a busy loop.
+                if proc.returncode == 0 and iter_cost < 0.001:
+                    break
 
         best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
 
@@ -540,8 +561,75 @@ class ClaudeCodeAdapter:
                 "adapter_cost": adapter_cost,
                 "session_id": session_id,
                 "work_dir": str(work_dir),
+                "ralph_iterations": ralph_iterations,
             },
         )
+
+    def _run_claude(
+        self,
+        *,
+        work_dir: Path,
+        session_id: str,
+        prompt: str,
+        budget: BudgetTracker,
+        adapter_cost: float,
+        resume: bool,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        """Invoke ``claude --print`` once. ``resume=True`` continues the pinned
+        session via ``--resume <session_id>`` instead of starting a new one.
+        ``--max-budget-usd`` is set to the *remaining* LLM budget so successive
+        iterations don't stack the cap.
+        """
+        # bwrap (when sandboxed) scopes writes to work_dir; network is
+        # shared so eval.sh / validate.sh can curl the local eval server
+        # (and claude can reach api.anthropic.com). WebFetch/WebSearch
+        # denied at the tool layer; bypassPermissions gives full file/Bash
+        # access inside the jail.
+        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
+        cmd += [
+            "claude",
+            "--print",
+            "--output-format", "json",
+            "--model", self.model,
+        ]
+        if resume:
+            cmd.extend(["--resume", session_id])
+        else:
+            cmd.extend(["--session-id", session_id])
+        cmd.extend([
+            "--permission-mode", "bypassPermissions",
+            DENY_WEB_TOOLS,
+        ])
+        if self.sandbox:
+            cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
+        if self.max_thinking_tokens is None and self.effort is not None:
+            cmd.extend(["--effort", self.effort])
+        if budget.max_token_cost is not None:
+            remaining = max(0.0, budget.max_token_cost - adapter_cost)
+            cmd.extend(["--max-budget-usd", f"{remaining:.6f}"])
+        cmd.append(prompt)
+
+        return subprocess.run(
+            cmd,
+            cwd=str(work_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def _has_budget_headroom(self, server: EvalServer, adapter_cost: float) -> bool:
+        """Whether starting another Ralph iteration is worthwhile. Stops if the
+        eval-count budget is exhausted, or if the LLM budget has < $0.05 left
+        (no point spawning a CLI for pennies).
+        """
+        budget = server.budget
+        if budget.exhausted:
+            return False
+        if budget.max_token_cost is not None:
+            if adapter_cost >= budget.max_token_cost - 0.05:
+                return False
+        return True
 
     def process_result(self, result: Result, output_dir: Path) -> None:
         """Copy the session transcript and (when work dir lives outside
