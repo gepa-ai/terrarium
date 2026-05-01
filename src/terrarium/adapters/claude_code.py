@@ -216,21 +216,51 @@ def _budget_section(budget: BudgetTracker) -> str:
 
 
 def _strategy_section(task: Task) -> str:
-    if task.has_dataset and task.train_set:
-        val_step = "5. Validate periodically with `./validate.sh candidate.txt`.\n" if task.val_set else ""
-        final_n = 6 if task.val_set else 5
-        return (
-            "1. Read the training examples in `train/` to understand the task.\n"
-            "2. Run `./eval.sh candidate.txt` for a baseline.\n"
-            "3. Analyze failures — inspect examples that scored 0.\n"
-            "4. Improve the candidate; spot-check with `--ids`.\n"
-            f"{val_step}{final_n}. Write your best candidate to `best_candidate.txt`."
+    """Explicit experiment loop, in the spirit of karpathy/autoresearch.
+
+    Three modes, picked by what splits the task has:
+      - train_set + val_set → ``./validate.sh`` is the per-iteration signal;
+        ``train/`` is materialized for diagnostic inspection (``--ids``) only.
+      - train_set only      → ``./eval.sh`` on the train split is the signal.
+      - no dataset          → ``./eval.sh`` runs the single-task ``eval_fn``.
+    """
+    has_train_dir = task.has_dataset and bool(task.train_set)
+    use_val_signal = has_train_dir and bool(task.val_set)
+
+    score_cmd = "./validate.sh candidate.txt" if use_val_signal else "./eval.sh candidate.txt"
+    score_label = "val_score" if use_val_signal else "score"
+
+    note = (
+        "**Note:** training examples are materialized under `train/` for inspection. "
+        "Spot-check specific examples on demand with "
+        "`./eval.sh candidate.txt --ids id1,id2,id3` to diagnose failures.\n\n"
+        if use_val_signal else ""
+    )
+
+    if has_train_dir:
+        baseline_note = f"note the {score_label}"
+        edit_step = (
+            "2. **Hypothesize and edit.** Read failures in `train/` "
+            "(spot-check with `./eval.sh candidate.txt --ids id1,id2` if useful), "
+            "form a hypothesis, edit `candidate.txt`."
         )
+    else:
+        baseline_note = "note the score and any judge feedback"
+        edit_step = (
+            "2. **Hypothesize and edit.** Use the judge feedback from the prior eval, "
+            "form a hypothesis, edit `candidate.txt`."
+        )
+
     return (
-        "1. Read the candidate (`candidate.txt`) and the problem description above.\n"
-        "2. Run `./eval.sh candidate.txt` for a baseline score and any judge feedback.\n"
-        "3. Revise the candidate based on what you learned.\n"
-        "4. Iterate; write your best solution to `best_candidate.txt` as you improve."
+        "Run this as an explicit experiment loop forever, until you hit the max score (if there is one)."
+        f"{note}"
+        f"1. **Baseline.** Run `{score_cmd}` on the seed; {baseline_note}.\n"
+        f"{edit_step}\n"
+        f"3. **Score.** Run `{score_cmd}`.\n"
+        f"4. **Keep or discard.** If {score_label} improved over the best so far, "
+        "`cp candidate.txt best_candidate.txt`. "
+        "Otherwise `cp best_candidate.txt candidate.txt` to revert.\n"
+        "5. Repeat from step 2"
     )
 
 
