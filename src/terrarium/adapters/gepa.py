@@ -252,14 +252,11 @@ class GEPAAdapter:
         if task.has_dataset:
             if task.train_set:
                 oa_kwargs["dataset"] = task.train_set
-            # val_set first (terrarium convention); test_set as legacy
-            # fallback; metadata["val_set"] for tasks with neither dataclass
-            # field. test_set stays a true held-out split for runner.py's
-            # post-run eval whenever val_set is populated.
+            # val_set only — test_set is a held-out split reserved for
+            # runner.py's post-run eval and must never leak into the
+            # optimization loop.
             if task.val_set:
                 oa_kwargs["valset"] = task.val_set
-            elif task.test_set:
-                oa_kwargs["valset"] = task.test_set
             if "val_set" in task.metadata:
                 oa_kwargs.setdefault("valset", task.metadata["val_set"])
 
