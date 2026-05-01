@@ -484,6 +484,77 @@ class BenchmarkContractTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_claude_code_ralph_continue_prompt_omits_validate_without_val_set(self) -> None:
+        task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
+        server = EvalServer(task, BudgetTracker(max_evals=2, max_token_cost=1.0))
+        prompts: list[str] = []
+        server.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                adapter = ClaudeCodeAdapter(
+                    run_dir=tmp,
+                    sandbox=False,
+                    ralph=True,
+                    ralph_max_iterations=2,
+                )
+
+                def fake_run(cmd, **kwargs):
+                    del kwargs
+                    prompts.append(cmd[-1])
+                    server.budget.record(1.0)
+                    return subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=0,
+                        stdout='{"total_cost_usd":0.01}',
+                        stderr="",
+                    )
+
+                with patch("terrarium.adapters.claude_code.subprocess.run", side_effect=fake_run):
+                    adapter.evolve(task, server)
+        finally:
+            server.stop()
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Run ./eval.sh as appropriate.", prompts[1])
+        self.assertNotIn("validate.sh", prompts[1])
+
+    def test_claude_code_ralph_continue_prompt_mentions_validate_with_val_set(self) -> None:
+        task = _task(
+            train=[Example("train", {}, 1.0)],
+            val=[Example("val", {}, 1.0)],
+            test=[Example("test", {}, 1.0)],
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=2, max_token_cost=1.0))
+        prompts: list[str] = []
+        server.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                adapter = ClaudeCodeAdapter(
+                    run_dir=tmp,
+                    sandbox=False,
+                    ralph=True,
+                    ralph_max_iterations=2,
+                )
+
+                def fake_run(cmd, **kwargs):
+                    del kwargs
+                    prompts.append(cmd[-1])
+                    server.budget.record(1.0)
+                    return subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=0,
+                        stdout='{"total_cost_usd":0.01}',
+                        stderr="",
+                    )
+
+                with patch("terrarium.adapters.claude_code.subprocess.run", side_effect=fake_run):
+                    adapter.evolve(task, server)
+        finally:
+            server.stop()
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Run ./eval.sh and ./validate.sh as appropriate.", prompts[1])
+
     def test_meta_harness_proposer_failure_raises(self) -> None:
         task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
         server = EvalServer(task, BudgetTracker(max_evals=1))

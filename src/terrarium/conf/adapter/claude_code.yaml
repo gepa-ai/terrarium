@@ -17,3 +17,11 @@ stop_at_score: null
 # MAX_THINKING_TOKENS=<value>). null = adaptive (provider default).
 # The runner threads the top-level ``max_thinking_tokens`` here.
 max_thinking_tokens: null
+# Ralph loop: when claude exits before the LLM/eval budget is out, resume
+# the pinned session (``claude --resume <session_id>``) and keep iterating
+# until the budget is exhausted. Off by default — single-shot otherwise.
+ralph: false
+# Hard cap on total claude invocations under the Ralph loop (incl. the
+# initial run). Safety net only; the loop usually exits earlier when the
+# budget is exhausted or claude declines to continue.
+ralph_max_iterations: 50
