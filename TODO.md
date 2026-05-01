@@ -137,6 +137,21 @@
      server under the official filesystem sandbox path. MetaHarness produced a
      real evaluated candidate in the tiny smoke, but that candidate scored
      `0.0` on the one-example reduced AIME slice.
+   - Ran a larger sandboxed MetaHarness smoke with a `$1.00` token budget:
+     - `outputs/smoke/meta_harness_aime_mini_sandbox_one_dollar`
+     - `task.train_limit=2`, `task.test_limit=2`
+     - `budget.max_evals: 6`
+     - `budget.max_token_cost: 1.0`
+     - `adapter.max_iterations: 2`
+     - `adapter.max_candidates_per_iter: 2`
+     - `total_evals: 6`
+     - `best_score: 1.0`
+     - `test_score: 1.0`
+     - `total_cost: 0.4247526`
+     - `sandbox_scope.optimizer_subprocess_sandbox: true`
+   - Confirmed MetaHarness can produce a meaningful nonzero and then perfect
+     reduced AIME result under the sandboxed real-adapter path before hitting
+     the eval budget.
 
 7. Done: resolve `adapter.max_turns` for Claude Code.
    - `adapter.max_turns` exists in the config and adapter constructor, but the
