@@ -346,8 +346,8 @@ def _run_proposer(
     log_dir: Path,
     max_thinking_tokens: int | None = None,
     sandbox: bool = True,
-) -> tuple[int, float, str]:
-    """Launch one proposer session. Returns (exit_code, cost_usd, session_id).
+) -> tuple[int, float, str, Path | None]:
+    """Launch one proposer session. Returns (exit_code, cost_usd, session_id, claude_home).
 
     Uses ``--output-format json`` so the subprocess emits a single, terminal
     JSON object on stdout with the fields we care about:
@@ -450,7 +450,7 @@ def _run_proposer(
         },
     }, indent=2))
 
-    return exit_code, cost_usd, session_id
+    return exit_code, cost_usd, session_id, claude_home
 
 
 def _parse_proposer_result(stdout: str, work_dir: Path, session_id: str) -> tuple[float, dict[str, Any]]:
@@ -768,6 +768,7 @@ class MetaHarnessAdapter:
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         session_ids: list[str] = []
+        claude_homes: dict[str, str] = {}
         total_proposer_cost = 0.0
 
         # Unlimited-iteration mode: use an effective cap derived from budget
@@ -812,7 +813,7 @@ class MetaHarnessAdapter:
 
             # ── Propose ─────────────────────────────────────────
             propose_start = time.time()
-            exit_code, cost, session_id = _run_proposer(
+            exit_code, cost, session_id, claude_home = _run_proposer(
                 work_dir=work_dir,
                 iteration=iteration,
                 model=self.model,
@@ -827,6 +828,8 @@ class MetaHarnessAdapter:
             propose_time = time.time() - propose_start
             total_proposer_cost += cost
             session_ids.append(session_id)
+            if claude_home is not None:
+                claude_homes[session_id] = str(claude_home)
 
             _log(
                 f"  {_cyan('proposer')} exit={exit_code} cost=${cost:.3f} "
@@ -1063,11 +1066,13 @@ class MetaHarnessAdapter:
                     "stop_reason": stop_reason,
                     "proposer_cost": total_proposer_cost,
                     "session_ids": session_ids,
+                    "claude_homes": claude_homes,
                     "work_dir": str(work_dir),
                     "frontier": self._read_frontier(frontier_path),
                 },
                 "work_dir": str(work_dir),
                 "session_ids": session_ids,
+                "claude_homes": claude_homes,
             },
         )
 
@@ -1083,11 +1088,13 @@ class MetaHarnessAdapter:
         """
         work_dir = Path(result.metadata.get("work_dir", ""))
         session_ids: list[str] = result.metadata.get("session_ids", []) or []
+        claude_homes: dict[str, str] = result.metadata.get("claude_homes", {}) or {}
 
         transcripts_dir = output_dir / "sessions"
         transcripts_dir.mkdir(parents=True, exist_ok=True)
         for sid in session_ids:
-            _copy_session_transcript(work_dir, sid, transcripts_dir)
+            claude_home = Path(claude_homes[sid]) if sid in claude_homes else None
+            _copy_session_transcript(work_dir, sid, transcripts_dir, claude_home=claude_home)
 
         if work_dir.exists() and not _is_under(work_dir, output_dir):
             shutil.copytree(
@@ -1149,8 +1156,15 @@ def _claude_project_slug(cwd: Path) -> str:
     return _SLUG_RE.sub("-", str(cwd.resolve()))
 
 
-def _copy_session_transcript(cwd: Path, session_id: str, dst_dir: Path) -> None:
-    src = Path.home() / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
+def _copy_session_transcript(
+    cwd: Path,
+    session_id: str,
+    dst_dir: Path,
+    *,
+    claude_home: Path | None = None,
+) -> None:
+    home = claude_home or Path.home()
+    src = home / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
     if not src.exists():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)

@@ -53,6 +53,7 @@ def run(
     max_evals: int | None = 100,
     max_token_cost: float | None = None,
     max_concurrency: int = 8,
+    benchmark: DictConfig | dict[str, Any] | None = None,
     tracking: TrackingConfig | None = None,
     output_dir: str | Path | None = None,
 ) -> Result:
@@ -70,6 +71,8 @@ def run(
             unlimited. Enforcement is adapter-side (GEPA via
             ``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
         max_concurrency: Max parallel evaluations in the server.
+        benchmark: Optional benchmark contract config. If omitted, the task's
+            metadata declares the mode, falling back to ``single``.
         tracking: Optional wandb/mlflow tracking config.
         output_dir: Directory where incremental log files (``evals/<i>.json``,
             ``summary.json``, ``reflection_cost_log.jsonl``) are written during
@@ -87,6 +90,7 @@ def run(
     """
     if isinstance(task, str):
         task = get_task(task)
+    task = _prepare_task_for_benchmark(task, _benchmark_config(benchmark))
     official_task = task
     search_task = replace(task, test_set=None) if task.test_set else task
 
@@ -240,6 +244,33 @@ def _build_tracking_config(cfg: DictConfig) -> TrackingConfig | None:
 
 def _plain_config(cfg: Any) -> Any:
     return OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else cfg
+
+
+def _benchmark_config(cfg: DictConfig | dict[str, Any] | None) -> DictConfig:
+    if cfg is None:
+        return OmegaConf.create({})
+    if isinstance(cfg, DictConfig):
+        return OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    return OmegaConf.create(cfg)
+
+
+def _effective_adapter_sandbox(adapter: Any, top_level_sandbox: bool | None) -> bool | None:
+    value = getattr(adapter, "sandbox", None) if hasattr(adapter, "sandbox") else top_level_sandbox
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _validate_access_policy(access_policy: DictConfig | None, adapter: Any, sandbox: bool | None) -> None:
+    if not access_policy:
+        return
+    execution = access_policy.get("execution")
+    effective_sandbox = _effective_adapter_sandbox(adapter, sandbox)
+    if execution == "sandboxed" and effective_sandbox is not True:
+        raise ValueError(
+            "access_policy.execution=sandboxed requires an effective adapter sandbox. "
+            "Set sandbox=true or use access_policy.execution=unsandboxed."
+        )
 
 
 def _split_limit(task_cfg: DictConfig | None, split_name: str) -> int | None:
@@ -426,6 +457,7 @@ def main(cfg: DictConfig) -> None:
 
     _apply_perfect_score(adapter, cfg.get("perfect_score"))
     _apply_sandbox(adapter, cfg.get("sandbox"))
+    _validate_access_policy(cfg.get("access_policy"), adapter, cfg.get("sandbox"))
 
     tracking = _build_tracking_config(cfg.tracking) if "tracking" in cfg else None
 
@@ -448,14 +480,14 @@ def main(cfg: DictConfig) -> None:
     if benchmark_cfg.get("mode") is None:
         benchmark_cfg.mode = cfg.task.get("mode")
     raw_task = _apply_task_split_limits(get_task(cfg.task.name), cfg.task)
-    task = _prepare_task_for_benchmark(raw_task, benchmark_cfg)
 
     result = run(
-        task,
+        raw_task,
         adapter,
         max_evals=cfg.budget.get("max_evals"),
         max_token_cost=cfg.budget.get("max_token_cost"),
         max_concurrency=cfg.max_concurrency,
+        benchmark=benchmark_cfg,
         tracking=tracking,
         output_dir=hydra_out,
     )
@@ -466,6 +498,7 @@ def main(cfg: DictConfig) -> None:
         "adapter_target": cfg.adapter.get("_target_", "unknown"),
         "benchmark": _plain_config(benchmark_cfg),
         "access_policy": _plain_config(cfg.get("access_policy", {})),
+        "effective_sandbox": _effective_adapter_sandbox(adapter, cfg.get("sandbox")),
         "adapter_dir": str(adapter_dir),
         "best_score": result.best_score,
         "total_evals": result.total_evals,

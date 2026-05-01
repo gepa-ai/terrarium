@@ -456,6 +456,9 @@ class EvalServer:
         except BudgetExhausted:
             self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
 
+        except ValueError as e:
+            self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=400)
+
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
 
@@ -488,6 +491,9 @@ class EvalServer:
 
         except BudgetExhausted:
             self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+
+        except ValueError as e:
+            self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=400)
 
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)

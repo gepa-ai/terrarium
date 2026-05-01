@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from omegaconf import OmegaConf
 
 from terrarium.adapters.claude_code import materialize_sandbox as materialize_claude_sandbox
-from terrarium.adapters.meta_harness import _materialize_sandbox as materialize_meta_sandbox
+from terrarium.adapters.meta_harness import (
+    _claude_project_slug as meta_claude_project_slug,
+    _copy_session_transcript as copy_meta_session_transcript,
+    _materialize_sandbox as materialize_meta_sandbox,
+)
 from terrarium.budget import BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.adapter import Result
-from terrarium.runner import _prepare_task_for_benchmark, run
+from terrarium.runner import _prepare_task_for_benchmark, _validate_access_policy, run
 from terrarium.task import Example, Task
 from terrarium.tasks.arc_agi import _evaluate_test
 
@@ -79,6 +86,47 @@ class BenchmarkContractTests(unittest.TestCase):
 
         self.assertIsNone(prepared.val_set)
         self.assertIsNotNone(prepared.test_set)
+
+    def test_run_applies_benchmark_contract_to_programmatic_tasks(self) -> None:
+        task = _task(
+            train=[Example("same", {}, 1.0)],
+            val=[Example("same", {}, 1.0)],
+            test=[Example("test", {}, 1.0)],
+        )
+
+        class CaptureAdapter:
+            def evolve(self, task: Task, server: EvalServer) -> Result:
+                del task, server
+                return Result(best_candidate="seed", best_score=0.0)
+
+        with self.assertRaisesRegex(ValueError, "overlapping example IDs"):
+            run(task, CaptureAdapter(), max_evals=10, max_concurrency=1)
+
+    def test_run_respects_benchmark_use_val_false(self) -> None:
+        seen: dict[str, object] = {}
+
+        class CaptureAdapter:
+            def evolve(self, task: Task, server: EvalServer) -> Result:
+                seen["adapter_val_set"] = task.val_set
+                seen["server_val_set"] = server.task.val_set
+                return Result(best_candidate="seed", best_score=0.0)
+
+        task = _task(
+            train=[Example("train", {}, 1.0)],
+            val=[Example("val", {}, 2.0)],
+            test=[Example("test", {}, 3.0)],
+        )
+
+        run(
+            task,
+            CaptureAdapter(),
+            max_evals=10,
+            max_concurrency=1,
+            benchmark={"mode": "generalization", "use_val": False},
+        )
+
+        self.assertIsNone(seen["adapter_val_set"])
+        self.assertIsNone(seen["server_val_set"])
 
     def test_run_hides_test_set_from_adapter_and_server(self) -> None:
         seen: dict[str, object] = {}
@@ -161,6 +209,39 @@ class BenchmarkContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "split must be one of"):
             server.evaluate_examples("candidate", split="bogus")
 
+    def test_eval_server_http_evaluate_examples_contract_errors_are_400(self) -> None:
+        task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 3.0)])
+        server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1)
+        server.start()
+        try:
+            for body in (
+                {"candidate": "candidate", "split": "test"},
+                {"candidate": "candidate", "split": "bogus"},
+                {"candidate": "candidate", "example_ids": ["missing"]},
+            ):
+                req = urllib.request.Request(
+                    server.url + "/evaluate_examples",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(raised.exception.code, 400)
+        finally:
+            server.stop()
+
+    def test_sandboxed_access_policy_requires_effective_sandbox(self) -> None:
+        class AdapterWithSandbox:
+            sandbox = False
+
+        with self.assertRaisesRegex(ValueError, "requires an effective adapter sandbox"):
+            _validate_access_policy(
+                OmegaConf.create({"execution": "sandboxed"}),
+                AdapterWithSandbox(),
+                sandbox=False,
+            )
+
     def test_claude_materialization_writes_visible_splits_not_test(self) -> None:
         task = _task(
             train=[Example("train", {"x": 1}, 1.0)],
@@ -195,6 +276,26 @@ class BenchmarkContractTests(unittest.TestCase):
             self.assertTrue((work_dir / "train" / "train.json").exists())
             self.assertTrue((work_dir / "val" / "val.json").exists())
             self.assertFalse((work_dir / "test").exists())
+
+    def test_meta_harness_transcript_copy_uses_isolated_claude_home(self) -> None:
+        session_id = "session-123"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work_dir = root / "work"
+            claude_home = root / "home"
+            output_dir = root / "out"
+            src_dir = claude_home / ".claude" / "projects" / meta_claude_project_slug(work_dir)
+            src_dir.mkdir(parents=True)
+            (src_dir / f"{session_id}.jsonl").write_text('{"ok": true}\n')
+
+            copy_meta_session_transcript(
+                work_dir,
+                session_id,
+                output_dir,
+                claude_home=claude_home,
+            )
+
+            self.assertEqual((output_dir / f"{session_id}.jsonl").read_text(), '{"ok": true}\n')
 
     def test_arc_test_scoring_accepts_grid_predictions_and_attempt_lists(self) -> None:
         gold = [[[1, 2], [3, 4]]]
