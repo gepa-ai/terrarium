@@ -120,6 +120,23 @@
      CLI path, eval-server budget accounting moves during search, hidden test
      remains runner-owned and post-search, and summary artifacts include
      `sandbox_scope` and access policy.
+   - Re-ran the reduced real-adapter smokes with `sandbox=true`:
+     - `outputs/smoke/claude_code_aime_mini_sandbox_eval_required`
+       - `total_evals: 2`
+       - `best_score: 1.0`
+       - `test_score: 1.0`
+       - `total_cost: 0.18476745`
+       - `sandbox_scope.optimizer_subprocess_sandbox: true`
+     - `outputs/smoke/meta_harness_aime_mini_sandbox_eval_required`
+       - `total_evals: 1`
+       - `best_score: 0.0`
+       - `test_score: 0.0`
+       - `total_cost: 0.09402405`
+       - `sandbox_scope.optimizer_subprocess_sandbox: true`
+   - Confirmed both real adapters can authenticate, propose, and call the eval
+     server under the official filesystem sandbox path. MetaHarness produced a
+     real evaluated candidate in the tiny smoke, but that candidate scored
+     `0.0` on the one-example reduced AIME slice.
 
 7. Done: resolve `adapter.max_turns` for Claude Code.
    - `adapter.max_turns` exists in the config and adapter constructor, but the
