@@ -16,6 +16,28 @@ defaults:
   - tracking: none
   - _self_
 
+# Benchmark contract knobs.
+# mode: null uses task.mode. Supported modes:
+#   - single: one fixed objective, no dataset splits
+#   - multi_task: visible dataset search, optional visible validation, no hidden test
+#   - generalization: train/optional val during search, hidden test after search
+# use_val: expose the validation split during search when the task has one.
+benchmark:
+  mode: null
+  use_val: true
+
+# Access policy for this benchmark condition. The sandbox/harness should
+# enforce these fields where possible; the runner logs them in summary.json so
+# results with incompatible access policies are not pooled accidentally.
+access_policy:
+  readable_paths: []
+  writable_paths: []
+  execution: sandboxed
+  network: model_api_and_eval_server
+  shared_cache: false
+  prior_artifacts: false
+  external_tools: []
+
 # Budget limits. At least one must be set.
 # max_evals: total number of eval calls allowed.
 # max_token_cost: max USD spend on adapter LLM tokens

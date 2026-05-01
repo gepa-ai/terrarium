@@ -3,7 +3,8 @@
 The candidate is a Python program defining ``search_algorithm(src, dsts, G,
 num_partitions)``; the evaluator simulates the resulting broadcast topology
 over a NetworkX graph of AWS/GCP/Azure regions and scores ``1 / (1 + cost)``
-(higher is better, ``-100_000`` on failure).
+(higher is better, ``-100_000`` on failure). This is a visible multi-task
+search benchmark: the dataset is intentionally reused as the validation set.
 
 All code, configs, and pricing/throughput profiles are vendored under
 ``cloudcast_lib/`` (originally from ``gepa/examples/adrs/cloudcast``). The
@@ -178,10 +179,20 @@ def _make_task() -> Task:
         train_set=examples,
         val_set=examples,
         metadata={
-            "type": "generalization",
+            "type": "multi_task",
             "candidate_type": "code",
             "language": "python",
             "source": "vendored from gepa/examples/adrs/cloudcast",
+            "split_provenance": {
+                "source_dataset": str(_CONFIG_DIR),
+                "split_method": "visible_dataset_reused_as_validation",
+                "split_seed": None,
+                "split_sizes": {
+                    "train": len(examples),
+                    "val": len(examples),
+                    "test": 0,
+                },
+            },
         },
     )
 

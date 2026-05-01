@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetTracker
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args, prepare_claude_home
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -67,7 +67,7 @@ fi
 # Dataset eval script: full-split eval or specific example IDs.
 # Usage:
 #   ./eval.sh <candidate_file>                     → eval on train split (default)
-#   ./eval.sh <candidate_file> test                → eval on test split
+#   ./eval.sh <candidate_file> val                 → eval on visible val split
 #   ./eval.sh <candidate_file> --ids id1,id2,id3   → eval on specific examples
 EVAL_SCRIPT_DATASET = """\
 #!/usr/bin/env bash
@@ -122,8 +122,8 @@ fi
 VALIDATE_SCRIPT = """\
 #!/usr/bin/env bash
 # Usage: ./validate.sh <candidate_file>
-# Evaluates the candidate on the held-out validation set.
-# Returns aggregate val_score only (individual scores hidden).
+# Evaluates the candidate on the validation set.
+# Returns aggregate val_score.
 # Exit code 1 if budget exhausted.
 set -euo pipefail
 
@@ -184,6 +184,19 @@ Training examples are in `train/` as individual JSON files.
 ./eval.sh candidate.txt --ids example_0,example_1,example_2
 ```{cost_line}{val_section}"""
 
+_EVAL_MULTI_TASK = """\
+## Evaluation
+This is a **multi-task search** benchmark with {train_size} visible examples.
+Examples are in `train/` as individual JSON files.
+
+```bash
+# Evaluate on all visible examples
+./eval.sh candidate.txt
+
+# Evaluate on specific examples
+./eval.sh candidate.txt --ids example_0,example_1,example_2
+```{cost_line}{val_section}"""
+
 _EVAL_SINGLE = """\
 ## Evaluation
 This is a **single-task** optimization.
@@ -193,12 +206,19 @@ This is a **single-task** optimization.
 
 _VAL_SECTION = """
 ### Validation
-There is a hidden validation set ({val_size} examples).
-You cannot see individual val examples or their scores.
+There is a validation set ({val_size} examples) available during search.
 ```bash
 ./validate.sh candidate.txt
 ```
-Returns only the aggregate val_score.{val_cost}"""
+Returns the aggregate val_score.{val_cost} Validation examples are in `val/`."""
+
+_VISIBLE_VAL_SECTION = """
+### Validation
+This task also exposes a visible validation command over {val_size} examples.
+```bash
+./validate.sh candidate.txt
+```
+Returns the aggregate val_score.{val_cost}"""
 
 
 def _budget_section(budget: BudgetTracker) -> str:
@@ -246,13 +266,12 @@ def _perfect_score_section(perfect_score: float | None) -> str:
 
 def _rules_section(task: Task, budget: BudgetTracker) -> str:
     scripts = "eval.sh, validate.sh" if task.val_set else "eval.sh"
-    val_rule = "\n- You cannot see the validation examples." if task.val_set else ""
     exhaust_rule = (
         "\n- When the budget is exhausted, scripts return BUDGET_EXHAUSTED."
         if budget.max_evals is not None else ""
     )
     return (
-        f"- You cannot modify {scripts} or the server.{val_rule}\n"
+        f"- You cannot modify {scripts} or the server.\n"
         f"- Focus on meaningful improvements each iteration.{exhaust_rule}"
     )
 
@@ -282,10 +301,18 @@ def build_program_md(task: Task, budget: BudgetTracker, *, perfect_score: float 
             val_cost = f" Costs {val_size} budget units." if has_eval_budget else ""
             # Prepend a newline so the validation block is separated from whatever
             # came before (cost line in eval-budget mode, closing fence otherwise).
-            val_section = "\n" + _VAL_SECTION.format(val_size=val_size, val_cost=val_cost)
+            val_template = (
+                _VISIBLE_VAL_SECTION
+                if task.metadata.get("type") == "multi_task" else _VAL_SECTION
+            )
+            val_section = "\n" + val_template.format(val_size=val_size, val_cost=val_cost)
         else:
             val_section = ""
-        eval_section = _EVAL_GENERALIZATION.format(
+        eval_template = (
+            _EVAL_MULTI_TASK
+            if task.metadata.get("type") == "multi_task" else _EVAL_GENERALIZATION
+        )
+        eval_section = eval_template.format(
             train_size=train_size, cost_line=cost_line, val_section=val_section,
         )
     else:
@@ -316,7 +343,8 @@ def materialize_sandbox(
     """Set up the agent's sandbox workspace.
 
     Layout: ``program.md``, ``candidate.txt``, ``best_candidate.txt``,
-    ``eval.sh``, ``validate.sh`` (val_set only), ``train/<id>.json`` (dataset).
+    ``eval.sh``, ``validate.sh`` (val_set only), ``train/<id>.json`` and
+    ``val/<id>.json`` for visible dataset splits.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -342,6 +370,15 @@ def materialize_sandbox(
             if ex.expected is not None:
                 data["expected"] = ex.expected
             (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+
+    if task.val_set:
+        val_dir = work_dir / "val"
+        val_dir.mkdir(exist_ok=True)
+        for ex in task.val_set:
+            data = {"id": ex.id, "inputs": ex.inputs}
+            if ex.expected is not None:
+                data["expected"] = ex.expected
+            (val_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
 
 
 
@@ -441,7 +478,8 @@ class ClaudeCodeAdapter:
         # (and claude can reach api.anthropic.com). WebFetch/WebSearch
         # denied at the tool layer; bypassPermissions gives full file/Bash
         # access inside the jail.
-        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
+        claude_home = prepare_claude_home(work_dir) if self.sandbox else None
+        cmd: list[str] = bwrap_prefix(work_dir, claude_home=claude_home) if self.sandbox else []
         cmd += [
             "claude",
             "--print",
@@ -460,6 +498,8 @@ class ClaudeCodeAdapter:
         cmd.append(prompt)
 
         env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+        if claude_home is not None:
+            env["HOME"] = str(claude_home)
         if self.max_thinking_tokens is not None:
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
@@ -485,6 +525,7 @@ class ClaudeCodeAdapter:
                 "adapter_cost": adapter_cost,
                 "session_id": session_id,
                 "work_dir": str(work_dir),
+                "claude_home": str(claude_home) if claude_home is not None else None,
             },
         )
 
@@ -495,9 +536,15 @@ class ClaudeCodeAdapter:
         """
         work_dir = Path(result.metadata["work_dir"])
         session_id = result.metadata["session_id"]
-        _copy_session_transcript(work_dir, session_id, output_dir / "sessions")
+        claude_home = Path(result.metadata["claude_home"]) if result.metadata.get("claude_home") else None
+        _copy_session_transcript(work_dir, session_id, output_dir / "sessions", claude_home=claude_home)
         if not _is_under(work_dir, output_dir):
-            shutil.copytree(work_dir, output_dir / "work", dirs_exist_ok=True)
+            shutil.copytree(
+                work_dir,
+                output_dir / "work",
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(".terrarium_claude_home"),
+            )
         if self._pending_tempdir is not None:
             self._pending_tempdir.cleanup()
             self._pending_tempdir = None
@@ -519,13 +566,20 @@ def _claude_project_slug(cwd: Path) -> str:
     return _SLUG_RE.sub("-", str(cwd.resolve()))
 
 
-def _copy_session_transcript(cwd: Path, session_id: str, dst_dir: Path) -> None:
+def _copy_session_transcript(
+    cwd: Path,
+    session_id: str,
+    dst_dir: Path,
+    *,
+    claude_home: Path | None = None,
+) -> None:
     """Copy the transcript for ``session_id`` (passed to ``claude --session-id``)
     into ``dst_dir``. Because we pinned the UUID at launch, there is no
     ambiguity about which file belongs to this run — concurrent processes get
     distinct UUIDs.
     """
-    src = Path.home() / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
+    home = claude_home or Path.home()
+    src = home / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
     if not src.exists():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)

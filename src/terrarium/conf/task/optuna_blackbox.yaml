@@ -1,2 +1,3 @@
 # @package task
 name: optuna_blackbox
+mode: single

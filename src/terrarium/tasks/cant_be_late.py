@@ -182,6 +182,16 @@ def _make_task() -> Task:
             "candidate_type": "code",
             "language": "python",
             "source": "vendored from gepa/examples/adrs/can_be_late",
+            "split_provenance": {
+                "source_dataset": str(trace_root),
+                "split_method": "vendored_loader_train_val_test",
+                "split_seed": None,
+                "split_sizes": {
+                    "train": len(train_set),
+                    "val": len(val_set),
+                    "test": len(test_set),
+                },
+            },
         },
     )
 

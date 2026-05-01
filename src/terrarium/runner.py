@@ -25,6 +25,8 @@ import json
 import os
 import sys
 import time
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +39,11 @@ from terrarium.adapter import Adapter, Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.registry import get_task
-from terrarium.task import Task
+from terrarium.task import Example, Task
 from terrarium.tracking import TerrariumTracker, TrackingConfig
 
 CONFIG_PATH = str(Path(__file__).parent / "conf")
+BENCHMARK_MODES = {"single", "multi_task", "generalization"}
 
 
 def run(
@@ -84,17 +87,19 @@ def run(
     """
     if isinstance(task, str):
         task = get_task(task)
+    official_task = task
+    search_task = replace(task, test_set=None) if task.test_set else task
 
     if isinstance(adapter, str):
         adapter = load_adapter(adapter)
 
     tracker = TerrariumTracker(tracking) if tracking else None
     budget = BudgetTracker(max_evals=max_evals, max_token_cost=max_token_cost)
-    server = EvalServer(task, budget, tracker=tracker, max_concurrency=max_concurrency, output_dir=output_dir)
+    server = EvalServer(search_task, budget, tracker=tracker, max_concurrency=max_concurrency, output_dir=output_dir)
     server.start()
 
     if tracker:
-        tracker.start({"task": task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
+        tracker.start({"task": official_task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
         # Inject GEPA-level callback for iteration/valset metrics
         from terrarium.adapters.gepa import GEPAAdapter
 
@@ -104,7 +109,7 @@ def run(
     start = time.time()
 
     try:
-        result = adapter.evolve(task, server)
+        result = adapter.evolve(search_task, server)
     except BudgetExhausted:
         result = Result(
             best_candidate=server.best_candidate,
@@ -129,11 +134,11 @@ def run(
         adapter.process_result(result, Path(output_dir))
 
     # Evaluate best candidate on held-out test set (outside budget).
-    if isinstance(task, Task) and task.test_set and result.best_candidate:
+    if official_task.test_set and result.best_candidate:
         test_scores: dict[str, float] = {}
-        for ex in task.test_set:
+        for ex in official_task.test_set:
             try:
-                score, _ = task.eval_fn(result.best_candidate, ex)
+                score, _ = official_task.eval_fn(result.best_candidate, ex)
                 test_scores[ex.id] = score
             except Exception:
                 test_scores[ex.id] = 0.0
@@ -233,6 +238,139 @@ def _build_tracking_config(cfg: DictConfig) -> TrackingConfig | None:
     return TrackingConfig(**raw)  # type: ignore[arg-type]
 
 
+def _plain_config(cfg: Any) -> Any:
+    return OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else cfg
+
+
+def _split_limit(task_cfg: DictConfig | None, split_name: str) -> int | None:
+    if task_cfg is None:
+        return None
+    value = task_cfg.get(f"{split_name}_limit")
+    if value is None:
+        return None
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"task.{split_name}_limit must be >= 0")
+    return value
+
+
+def _limit_examples(examples: list[Example] | None, limit: int | None) -> list[Example] | None:
+    if examples is None or limit is None:
+        return examples
+    return examples[:limit]
+
+
+def _apply_task_split_limits(task: Task, task_cfg: DictConfig | None) -> Task:
+    """Apply optional task.<split>_limit knobs for smoke/debug runs."""
+    limits = {
+        "train": _split_limit(task_cfg, "train"),
+        "val": _split_limit(task_cfg, "val"),
+        "test": _split_limit(task_cfg, "test"),
+    }
+    if all(limit is None for limit in limits.values()):
+        return task
+
+    metadata = dict(task.metadata)
+    provenance = metadata.get("split_provenance")
+    if isinstance(provenance, dict):
+        provenance = dict(provenance)
+        provenance["limited_for_run"] = {k: v for k, v in limits.items() if v is not None}
+        provenance["run_split_sizes"] = {
+            "train": len(_limit_examples(task.train_set, limits["train"]) or []),
+            "val": len(_limit_examples(task.val_set, limits["val"]) or []),
+            "test": len(_limit_examples(task.test_set, limits["test"]) or []),
+        }
+        metadata["split_provenance"] = provenance
+
+    return replace(
+        task,
+        train_set=_limit_examples(task.train_set, limits["train"]),
+        val_set=_limit_examples(task.val_set, limits["val"]),
+        test_set=_limit_examples(task.test_set, limits["test"]),
+        metadata=metadata,
+    )
+
+
+def _example_id_set(task: Task, split_name: str, split: list[Example] | None) -> set[str]:
+    ids: list[str] = [ex.id for ex in split or []]
+    duplicates = sorted(ex_id for ex_id, count in Counter(ids).items() if count > 1)
+    if duplicates:
+        preview = ", ".join(duplicates[:5])
+        raise ValueError(f"Task '{task.name}' has duplicate IDs in {split_name}_set: {preview}")
+    return set(ids)
+
+
+def _validate_generalization_splits(task: Task) -> None:
+    if not task.train_set:
+        raise ValueError(f"benchmark.mode=generalization requires task '{task.name}' to define train_set")
+    if not task.test_set:
+        raise ValueError(f"benchmark.mode=generalization requires task '{task.name}' to define test_set")
+
+    split_ids = {
+        "train": _example_id_set(task, "train", task.train_set),
+        "val": _example_id_set(task, "val", task.val_set),
+        "test": _example_id_set(task, "test", task.test_set),
+    }
+    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+        overlap = sorted(split_ids[left] & split_ids[right])
+        if overlap:
+            preview = ", ".join(overlap[:5])
+            raise ValueError(
+                f"Task '{task.name}' has overlapping example IDs between "
+                f"{left}_set and {right}_set: {preview}"
+            )
+
+
+def _normalize_benchmark_mode(mode: Any) -> str:
+    if mode == "single_task":
+        return "single"
+    if mode in BENCHMARK_MODES:
+        return str(mode)
+    raise ValueError("benchmark.mode must be one of: single, multi_task, generalization")
+
+
+def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) -> Task:
+    """Apply the minimal benchmark contract before adapters see the task."""
+    benchmark_cfg = benchmark_cfg or OmegaConf.create({})
+    mode = _normalize_benchmark_mode(benchmark_cfg.get("mode") or task.metadata.get("type") or "single")
+    use_val = bool(benchmark_cfg.get("use_val", True))
+
+    metadata = dict(task.metadata)
+    metadata_mode = metadata.get("type")
+
+    if metadata_mode in BENCHMARK_MODES | {"single_task"} and _normalize_benchmark_mode(metadata_mode) != mode:
+        raise ValueError(
+            f"Task '{task.name}' declares metadata.type={metadata_mode!r}, "
+            f"but benchmark.mode={mode!r}"
+        )
+    if "val_set" in metadata:
+        raise ValueError(
+            f"Task '{task.name}' stores validation examples in metadata['val_set']; "
+            "use Task.val_set so all adapters get the same split contract."
+        )
+
+    if mode == "generalization":
+        _validate_generalization_splits(task)
+    elif mode == "multi_task" and not task.train_set:
+        raise ValueError(f"benchmark.mode=multi_task requires task '{task.name}' to define train_set")
+
+    val_set = task.val_set
+    if not use_val:
+        val_set = None
+
+    test_set = task.test_set if mode == "generalization" else None
+
+    metadata["type"] = mode
+    prepared = replace(task, val_set=val_set, test_set=test_set, metadata=metadata)
+
+    if mode == "single" and prepared.has_dataset:
+        raise ValueError(
+            f"benchmark.mode=single is inconsistent with dataset task '{task.name}'. "
+            "Use benchmark.mode=multi_task or benchmark.mode=generalization."
+        )
+
+    return prepared
+
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
 def main(cfg: DictConfig) -> None:
@@ -306,8 +444,14 @@ def main(cfg: DictConfig) -> None:
             lm_kwargs['max_tokens'] = cfg.task.solver_max_tokens
         dspy.configure(lm=dspy.LM(solver_lm, **lm_kwargs))
 
+    benchmark_cfg = OmegaConf.create(OmegaConf.to_container(cfg.get("benchmark", {}), resolve=True))
+    if benchmark_cfg.get("mode") is None:
+        benchmark_cfg.mode = cfg.task.get("mode")
+    raw_task = _apply_task_split_limits(get_task(cfg.task.name), cfg.task)
+    task = _prepare_task_for_benchmark(raw_task, benchmark_cfg)
+
     result = run(
-        cfg.task.name,
+        task,
         adapter,
         max_evals=cfg.budget.get("max_evals"),
         max_token_cost=cfg.budget.get("max_token_cost"),
@@ -320,6 +464,8 @@ def main(cfg: DictConfig) -> None:
         "task": cfg.task.name,
         "adapter": adapter_name,
         "adapter_target": cfg.adapter.get("_target_", "unknown"),
+        "benchmark": _plain_config(benchmark_cfg),
+        "access_policy": _plain_config(cfg.get("access_policy", {})),
         "adapter_dir": str(adapter_dir),
         "best_score": result.best_score,
         "total_evals": result.total_evals,

@@ -50,8 +50,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import requests
-
 _FRONTIER_CS_REPO_URL = "https://github.com/FrontierCS/Frontier-CS"
 _JUDGE_PORT = 8081
 _JUDGE_URL = f"http://localhost:{_JUDGE_PORT}"
@@ -150,6 +148,11 @@ def _algorithmic_rows() -> dict[str, dict[str, Any]]:
 
 def _judge_is_alive() -> bool:
     """Check if the judge server is responding on the default port."""
+    try:
+        import requests
+    except ImportError:
+        return False
+
     try:
         r = requests.get(f"{_JUDGE_URL}/problems", timeout=5)
         return r.status_code == 200
@@ -329,7 +332,6 @@ def _make_smoke_task() -> Task:
         )
         for pid in available
     ]
-
     def eval_fn(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         return _evaluate(candidate, problem_id=example.inputs["problem_id"])
 
@@ -344,10 +346,12 @@ def _make_smoke_task() -> Task:
         eval_fn=eval_fn,
         train_set=examples,
         metadata={
-            "type": "generalization",
+            "type": "multi_task",
             "candidate_type": "code",
             "language": "cpp",
             "frontier_cs_track": "algorithmic",
+            "official": False,
+            "purpose": "adapter pipeline smoke test",
         },
     )
 

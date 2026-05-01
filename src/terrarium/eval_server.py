@@ -17,11 +17,12 @@ POST /evaluate
 
 POST /evaluate_examples
     Body: {"candidate": "<text>", "example_ids": ["a","b","c"]}
-    Or:   {"candidate": "<text>", "split": "train"|"test"|"all"}
+    Or:   {"candidate": "<text>", "split": "train"|"val"|"all"}
     Evaluates the candidate on the specified examples (or all in a split)
     in parallel, respecting the concurrency limit. Each example = 1 budget tick.
     Response: {"average_score": 1.23, "scores": {"a": 0.9, ...}, "budget": {...}}
     For single-task problems (no dataset), behaves like /evaluate.
+    The test split is hidden during search and is never exposed by this API.
     Status 429 when budget is insufficient to evaluate all requested examples.
 
 GET /status
@@ -99,9 +100,10 @@ class EvalServer:
             self._evals_dir.mkdir(exist_ok=True)
         self._eval_semaphore = threading.Semaphore(max_concurrency)
 
-        # Build example lookup for dataset tasks
+        # Build public example lookup for dataset tasks. Hidden test examples
+        # are evaluated only by the runner after search.
         self._examples: dict[str, Example] = {}
-        for dataset in [task.train_set, task.val_set, task.test_set]:
+        for dataset in [task.train_set, task.val_set]:
             if dataset:
                 for ex in dataset:
                     self._examples[ex.id] = ex
@@ -148,7 +150,7 @@ class EvalServer:
 
         For single-task problems (no dataset), delegates to evaluate().
 
-        Provide either ``example_ids`` (explicit list) or ``split`` ("train"/"test"/"all").
+        Provide either ``example_ids`` (explicit list) or ``split`` ("train"/"val"/"all").
         If both are given, ``example_ids`` takes precedence.
 
         Returns:
@@ -168,16 +170,24 @@ class EvalServer:
         # Resolve examples
         examples: list[Example] = []
         if example_ids is not None:
+            unknown_ids: list[str] = []
             for eid in example_ids:
                 if eid in self._examples:
                     examples.append(self._examples[eid])
+                else:
+                    unknown_ids.append(eid)
+            if unknown_ids:
+                preview = ", ".join(unknown_ids[:5])
+                raise ValueError(f"Unknown or hidden example IDs: {preview}")
         elif split is not None:
+            if split == "test":
+                raise ValueError("test split is hidden during search")
+            if split not in ("train", "val", "all"):
+                raise ValueError("split must be one of: train, val, all")
             if split in ("train", "all") and self.task.train_set:
                 examples.extend(self.task.train_set)
             if split in ("val", "all") and self.task.val_set:
                 examples.extend(self.task.val_set)
-            if split in ("test", "all") and self.task.test_set:
-                examples.extend(self.task.test_set)
         else:
             if self.task.train_set:
                 examples.extend(self.task.train_set)
@@ -235,7 +245,7 @@ class EvalServer:
 
 
     def validate(self, candidate: str) -> dict[str, Any]:
-        """Evaluate candidate on the full hidden val_set, return aggregate score only."""
+        """Evaluate candidate on the full visible val_set, return aggregate score only."""
         if not self.task.val_set:
             raise ValueError("validate() requires a task with val_set")
 
@@ -336,7 +346,11 @@ class EvalServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
+            if self._thread:
+                self._thread.join(timeout=1)
             self._server = None
+            self._thread = None
         self._pool.shutdown(wait=False)
 
     # ── Internal ────────────────────────────────────────────────────────
@@ -428,6 +442,13 @@ class EvalServer:
             return
 
         try:
+            if example_id and example_id not in self._examples:
+                self._send_json(
+                    handler,
+                    {"error": f"Unknown or hidden example ID: {example_id}", "budget": self.budget.status()},
+                    status=400,
+                )
+                return
             example = self._examples.get(example_id) if example_id else None
             score, info = self.evaluate(candidate, example)
             self._send_json(handler, {"score": score, "info": info, "budget": self.budget.status()})

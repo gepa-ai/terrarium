@@ -1,2 +1,6 @@
 # @package task
 name: arc_agi
+mode: generalization
+train_limit: null
+val_limit: null
+test_limit: null

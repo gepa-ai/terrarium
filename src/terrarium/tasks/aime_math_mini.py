@@ -50,6 +50,16 @@ def _make_task() -> Task:
         metadata={
             "type": "generalization",
             "candidate_type": "prompt",
+            "split_provenance": {
+                "source_dataset": "AI-MO/aimo-validation-aime",
+                "split_method": "shuffle_seed_42_fixed_10_15_15",
+                "split_seed": 42,
+                "split_sizes": {
+                    "train": len(train_set),
+                    "val": len(val_set),
+                    "test": len(test_set),
+                },
+            },
         },
     )
 

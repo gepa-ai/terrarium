@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import bwrap_prefix, claude_settings_args
+from terrarium.sandbox import bwrap_prefix, claude_settings_args, prepare_claude_home
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -252,16 +252,10 @@ class GEPAAdapter:
         if task.has_dataset:
             if task.train_set:
                 oa_kwargs["dataset"] = task.train_set
-            # val_set first (terrarium convention); test_set as legacy
-            # fallback; metadata["val_set"] for tasks with neither dataclass
-            # field. test_set stays a true held-out split for runner.py's
-            # post-run eval whenever val_set is populated.
+            # test_set stays hidden; only val_set is available for selection
+            # during search.
             if task.val_set:
                 oa_kwargs["valset"] = task.val_set
-            elif task.test_set:
-                oa_kwargs["valset"] = task.test_set
-            if "val_set" in task.metadata:
-                oa_kwargs.setdefault("valset", task.metadata["val_set"])
 
         objective = self.objective or task.objective
         background = self.background or task.background
@@ -485,7 +479,8 @@ class ClaudeCodeReflectionProposer:
         # sandboxed) is belt; the deny list is braces. Network stays
         # shared (claude needs api.anthropic.com); with no Bash there's
         # nothing to curl from inside the jail anyway.
-        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
+        claude_home = prepare_claude_home(work_dir) if self.sandbox else None
+        cmd: list[str] = bwrap_prefix(work_dir, claude_home=claude_home) if self.sandbox else []
         cmd += [
             "claude",
             "--print",
@@ -506,6 +501,8 @@ class ClaudeCodeReflectionProposer:
             cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
 
         env = {**os.environ}
+        if claude_home is not None:
+            env["HOME"] = str(claude_home)
         # Strip CLAUDECODE so nested claude-in-claude doesn't confuse the CLI
         # (same workaround meta-harness uses).
         env.pop("CLAUDECODE", None)

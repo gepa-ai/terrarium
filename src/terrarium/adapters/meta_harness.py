@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args, prepare_claude_home
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -223,6 +223,13 @@ fully-scored candidate costs {train_size} units. Your candidate must
 generalize across *every* train example, not just one.
 """
 
+_EVAL_MULTI_TASK = """\
+This is a **multi-task search** benchmark with {train_size} visible examples{val_note}.
+The outer loop scores each candidate on the full visible training set; each
+example costs 1 unit of the evaluation budget, so one fully-scored candidate
+costs {train_size} units.
+"""
+
 
 def _build_task_md(task: Task) -> str:
     optional = ""
@@ -232,11 +239,12 @@ def _build_task_md(task: Task) -> str:
         optional += f"## Background\n{task.background}\n\n"
 
     if task.has_dataset and task.train_set:
-        val_note = (
-            f" (plus a hidden val set of {len(task.val_set)} examples; not visible to the proposer)"
-            if task.val_set else ""
-        )
-        eval_section = _EVAL_DATASET.format(train_size=len(task.train_set), val_note=val_note)
+        if task.metadata.get("type") == "multi_task":
+            val_note = f" (validation command covers {len(task.val_set)} visible examples)" if task.val_set else ""
+            eval_section = _EVAL_MULTI_TASK.format(train_size=len(task.train_set), val_note=val_note)
+        else:
+            val_note = f" and {len(task.val_set)} visible validation examples" if task.val_set else ""
+            eval_section = _EVAL_DATASET.format(train_size=len(task.train_set), val_note=val_note)
     else:
         eval_section = _EVAL_SINGLE
 
@@ -264,6 +272,7 @@ def _materialize_sandbox(work_dir: Path, task: Task, budget: BudgetTracker) -> N
                 eval_traces/                    (per-candidate JSONs from eval server,
                                                  populated after each candidate scores)
             train/<id>.json                     (dataset tasks only)
+            val/<id>.json                       (visible validation examples only)
     """
     del budget  # task.md is task-only; budget is dynamic and goes in the per-iteration prompt
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -312,6 +321,15 @@ def _materialize_sandbox(work_dir: Path, task: Task, budget: BudgetTracker) -> N
                 data["expected"] = ex.expected
             (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
 
+    if task.val_set:
+        val_dir = work_dir / "val"
+        val_dir.mkdir(exist_ok=True)
+        for ex in task.val_set:
+            data = {"id": ex.id, "inputs": ex.inputs}
+            if ex.expected is not None:
+                data["expected"] = ex.expected
+            (val_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+
 
 # ── Proposer subprocess (claude --print stream-json) ────────────────
 
@@ -358,7 +376,8 @@ def _run_proposer(
     # shared so claude can reach api.anthropic.com; the proposer doesn't
     # need to call the eval server itself. WebFetch/WebSearch denied at
     # the tool layer; bypassPermissions gives full file/Bash access.
-    cmd: list[str] = bwrap_prefix(work_dir) if sandbox else []
+    claude_home = prepare_claude_home(work_dir) if sandbox else None
+    cmd: list[str] = bwrap_prefix(work_dir, claude_home=claude_home) if sandbox else []
     cmd += [
         "claude",
         "--print",
@@ -377,6 +396,8 @@ def _run_proposer(
         cmd.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
 
     env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+    if claude_home is not None:
+        env["HOME"] = str(claude_home)
     # Strip CLAUDECODE so a claude-running-claude situation doesn't confuse
     # the CLI (same workaround the reference proposer uses).
     env.pop("CLAUDECODE", None)
@@ -996,9 +1017,12 @@ class MetaHarnessAdapter:
 
             bench_time = time.time() - bench_start
 
+            timing = (
+                f"iter {iteration} wall={_elapsed(time.time() - run_start)} "
+                f"propose={_elapsed(propose_time)} bench={_elapsed(bench_time)}"
+            )
             _log(
-                f"  {_dim(f'iter {iteration} wall={_elapsed(time.time() - run_start)} '
-                       f'propose={_elapsed(propose_time)} bench={_elapsed(bench_time)}')}"
+                f"  {_dim(timing)}"
                 + (f" {_green('IMPROVED')}" if iter_improved else "")
             )
 
@@ -1066,7 +1090,12 @@ class MetaHarnessAdapter:
             _copy_session_transcript(work_dir, sid, transcripts_dir)
 
         if work_dir.exists() and not _is_under(work_dir, output_dir):
-            shutil.copytree(work_dir, output_dir / "work", dirs_exist_ok=True)
+            shutil.copytree(
+                work_dir,
+                output_dir / "work",
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(".terrarium_claude_home"),
+            )
 
         if self._pending_tempdir is not None:
             self._pending_tempdir.cleanup()

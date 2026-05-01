@@ -1,2 +1,3 @@
 # @package task
 name: cant_be_late
+mode: generalization
