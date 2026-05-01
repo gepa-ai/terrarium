@@ -17,12 +17,17 @@ POST /evaluate
 
 POST /evaluate_examples
     Body: {"candidate": "<text>", "example_ids": ["a","b","c"]}
-    Or:   {"candidate": "<text>", "split": "train"|"test"|"all"}
-    Evaluates the candidate on the specified examples (or all in a split)
-    in parallel, respecting the concurrency limit. Each example = 1 budget tick.
+    Or:   {"candidate": "<text>", "split": "train"}    # only "train" allowed via HTTP
+    Evaluates the candidate on the specified examples (or all in train) in
+    parallel, respecting the concurrency limit. Each example = 1 budget tick.
     Response: {"average_score": 1.23, "scores": {"a": 0.9, ...}, "budget": {...}}
     For single-task problems (no dataset), behaves like /evaluate.
+    Status 400 when split is not "train" or example_ids include val/test ids.
     Status 429 when budget is insufficient to evaluate all requested examples.
+
+    Val is reachable only via /validate (aggregate-only). Test is not
+    reachable from HTTP — only the in-process Python API can score on it,
+    which the runner uses for held-out reporting.
 
 GET /status
     Response: {"budget": {...}, "task": "<name>", "best_score": 1.23, "total_evals": 5, "total_cost": 0.42}
@@ -416,6 +421,13 @@ class EvalServer:
             # Never let logging failure break an eval.
             pass
 
+    def _train_ids(self) -> set[str]:
+        """Ids the HTTP layer is allowed to score. val is reachable only via
+        /validate (aggregate); test is unreachable from HTTP entirely."""
+        if not self.task.train_set:
+            return set()
+        return {ex.id for ex in self.task.train_set}
+
     def _handle_evaluate(self, handler: BaseHTTPRequestHandler) -> None:
         content_length = int(handler.headers.get("Content-Length", 0))
         body = json.loads(handler.rfile.read(content_length)) if content_length else {}
@@ -426,6 +438,18 @@ class EvalServer:
         if self.budget.exhausted:
             self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
             return
+
+        # Refuse example_ids outside train_set so val/test ids cannot be
+        # probed via /evaluate. Single-task tasks have no examples, so
+        # example_id is ignored there.
+        if example_id is not None and self.task.has_dataset:
+            if example_id not in self._train_ids():
+                self._send_json(
+                    handler,
+                    {"error": f"Unknown or sealed example_id: {example_id!r}"},
+                    status=400,
+                )
+                return
 
         try:
             example = self._examples.get(example_id) if example_id else None
@@ -450,11 +474,33 @@ class EvalServer:
             self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
             return
 
+        # Lock the HTTP surface to train only. val is exposed via /validate
+        # (aggregate-only); test is not exposed at all. The Python API
+        # (evaluate_examples) is unchanged so the runner can still score on
+        # val/test directly for held-out reporting.
+        if split not in ("train", None):
+            self._send_json(
+                handler,
+                {"error": f"split={split!r} is not exposed via HTTP; only 'train' is allowed"},
+                status=400,
+            )
+            return
+        if example_ids is not None:
+            train_ids = self._train_ids()
+            invalid = [eid for eid in example_ids if eid not in train_ids]
+            if invalid:
+                self._send_json(
+                    handler,
+                    {"error": f"Unknown or sealed example_ids: {invalid[:5]}"},
+                    status=400,
+                )
+                return
+
         try:
             avg_score, info = self.evaluate_examples(
                 candidate,
                 example_ids=example_ids,
-                split=split if example_ids is None else None,
+                split="train" if example_ids is None else None,
             )
             self._send_json(handler, {
                 "average_score": avg_score,
