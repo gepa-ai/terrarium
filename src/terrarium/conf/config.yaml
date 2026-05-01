@@ -33,7 +33,7 @@ access_policy:
   readable_paths: []
   writable_paths: []
   execution: unsandboxed
-  network: model_api_and_eval_server
+  network: model_api_and_eval_server_host_shared
   shared_cache: false
   prior_artifacts: false
   external_tools: []

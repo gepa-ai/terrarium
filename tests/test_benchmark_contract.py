@@ -9,16 +9,24 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from terrarium.adapters.claude_code import materialize_sandbox as materialize_claude_sandbox
+from terrarium.adapters.claude_code import ClaudeCodeAdapter, materialize_sandbox as materialize_claude_sandbox
 from terrarium.adapters.meta_harness import (
+    MetaHarnessAdapter,
     _claude_project_slug as meta_claude_project_slug,
     _copy_session_transcript as copy_meta_session_transcript,
     _materialize_sandbox as materialize_meta_sandbox,
 )
+from terrarium.adapters.gepa import GEPAAdapter
 from terrarium.budget import BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.adapter import Result
-from terrarium.runner import _prepare_task_for_benchmark, _validate_access_policy, run
+from terrarium.runner import (
+    _effective_adapter_sandbox,
+    _prepare_task_for_benchmark,
+    _sandbox_scope,
+    _validate_access_policy,
+    run,
+)
 from terrarium.task import Example, Task
 from terrarium.tasks.arc_agi import _evaluate_test
 
@@ -209,6 +217,28 @@ class BenchmarkContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "split must be one of"):
             server.evaluate_examples("candidate", split="bogus")
 
+    def test_eval_server_rejects_unavailable_dataset_splits_without_single_fallback(self) -> None:
+        def eval_with_single_fallback(candidate: str, example: Example | None = None) -> tuple[float, dict]:
+            del candidate
+            if example is None:
+                return 99.0, {"path": "single_fallback"}
+            return float(example.expected or 0.0), {"example_id": example.id}
+
+        task = Task(
+            name="task",
+            initial_candidate="seed",
+            eval_fn=eval_with_single_fallback,
+            train_set=[Example("train", {}, 1.0)],
+            val_set=None,
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1)
+
+        with self.assertRaisesRegex(ValueError, "val split is not available"):
+            server.evaluate_examples("candidate", split="val")
+        with self.assertRaisesRegex(ValueError, "example_ids must not be empty"):
+            server.evaluate_examples("candidate", example_ids=[])
+        self.assertEqual(server.budget.used, 0)
+
     def test_eval_server_http_evaluate_examples_contract_errors_are_400(self) -> None:
         task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 3.0)])
         server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1)
@@ -231,16 +261,127 @@ class BenchmarkContractTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_eval_server_http_rejects_hidden_val_after_use_val_false(self) -> None:
+        task = _task(
+            train=[Example("train", {}, 1.0)],
+            val=[Example("val", {}, 2.0)],
+            test=[Example("test", {}, 3.0)],
+        )
+        prepared = _prepare_task_for_benchmark(
+            task,
+            OmegaConf.create({"mode": "generalization", "use_val": False}),
+        )
+        server = EvalServer(prepared, BudgetTracker(max_evals=10), max_concurrency=1)
+        server.start()
+        try:
+            req = urllib.request.Request(
+                server.url + "/evaluate_examples",
+                data=json.dumps({"candidate": "candidate", "split": "val"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(raised.exception.code, 400)
+            self.assertEqual(server.budget.used, 0)
+        finally:
+            server.stop()
+
     def test_sandboxed_access_policy_requires_effective_sandbox(self) -> None:
         class AdapterWithSandbox:
             sandbox = False
 
-        with self.assertRaisesRegex(ValueError, "requires an effective adapter sandbox"):
+        with self.assertRaisesRegex(ValueError, "requires candidate/evaluator execution sandboxing"):
             _validate_access_policy(
-                OmegaConf.create({"execution": "sandboxed"}),
+                OmegaConf.create({"execution": "sandboxed", "network": "host_shared"}),
                 AdapterWithSandbox(),
                 sandbox=False,
             )
+
+    def test_sandboxed_access_policy_rejects_adapters_without_sandbox_capability(self) -> None:
+        class CustomNoSandbox:
+            pass
+
+        with self.assertRaisesRegex(ValueError, "requires candidate/evaluator execution sandboxing"):
+            _validate_access_policy(
+                OmegaConf.create({"execution": "sandboxed", "network": "host_shared"}),
+                CustomNoSandbox(),
+                sandbox=True,
+            )
+
+    def test_sandboxed_access_policy_rejects_default_gepa_litellm_path(self) -> None:
+        adapter = GEPAAdapter(reflection={"reflection_lm": "openai/gpt-5"}, sandbox=True)
+
+        self.assertFalse(_effective_adapter_sandbox(adapter, True))
+        with self.assertRaisesRegex(ValueError, "requires candidate/evaluator execution sandboxing"):
+            _validate_access_policy(
+                OmegaConf.create({"execution": "sandboxed", "network": "host_shared"}),
+                adapter,
+                sandbox=True,
+            )
+
+    def test_gepa_claude_code_path_reports_scoped_subprocess_sandbox(self) -> None:
+        adapter = GEPAAdapter(reflection={"reflection_lm": "claude_code/sonnet"}, sandbox=True)
+
+        self.assertTrue(_effective_adapter_sandbox(adapter, True))
+        self.assertEqual(
+            _sandbox_scope(adapter, True),
+            {
+                "optimizer_subprocess_sandbox": True,
+                "candidate_execution_sandbox": False,
+                "network_namespace_isolated": False,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "requires candidate/evaluator execution sandboxing"):
+            _validate_access_policy(
+                OmegaConf.create({"execution": "sandboxed", "network": "host_shared"}),
+                adapter,
+                sandbox=True,
+            )
+
+    def test_strict_network_policy_requires_network_namespace_isolation(self) -> None:
+        adapters = [
+            ClaudeCodeAdapter(sandbox=True),
+            MetaHarnessAdapter(sandbox=True),
+            GEPAAdapter(reflection={"reflection_lm": "claude_code/sonnet"}, sandbox=True),
+        ]
+
+        for adapter in adapters:
+            with self.subTest(adapter=type(adapter).__name__):
+                self.assertFalse(_sandbox_scope(adapter, True)["network_namespace_isolated"])
+                for network in ("network_isolated", "network_namespace_isolated", "none"):
+                    with self.assertRaisesRegex(ValueError, "requires network namespace isolation"):
+                        _validate_access_policy(
+                            OmegaConf.create({"execution": "unsandboxed", "network": network}),
+                            adapter,
+                            sandbox=True,
+                        )
+                _validate_access_policy(
+                    OmegaConf.create({
+                        "execution": "unsandboxed",
+                        "network": "model_api_and_eval_server_host_shared",
+                    }),
+                    adapter,
+                    sandbox=True,
+                )
+
+    def test_unknown_network_policy_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "access_policy.network must be one of"):
+            _validate_access_policy(
+                OmegaConf.create({"execution": "unsandboxed", "network": "model_api_and_eval_server"}),
+                ClaudeCodeAdapter(sandbox=True),
+                sandbox=True,
+            )
+
+    def test_unknown_execution_policy_is_rejected(self) -> None:
+        for execution in ("no_execution", "candidate_sandboxed", "filesystem_sandboxed"):
+            with self.subTest(execution=execution):
+                with self.assertRaisesRegex(ValueError, "access_policy.execution must be one of"):
+                    _validate_access_policy(
+                        OmegaConf.create({"execution": execution, "network": "host_shared"}),
+                        ClaudeCodeAdapter(sandbox=False),
+                        sandbox=False,
+                    )
 
     def test_claude_materialization_writes_visible_splits_not_test(self) -> None:
         task = _task(

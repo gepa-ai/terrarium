@@ -44,6 +44,23 @@
    - Done: add tests confirming Claude Code and MetaHarness materialize visible train/val splits but never hidden test splits.
    - Done: document the Linux network policy. Current official policy keeps the host network namespace shared so local eval-server and provider API access work; arbitrary outbound Bash network is part of this access policy and results should not be pooled with stricter network-isolated runs.
 
+4. Done: add and run a reduced benchmark smoke matrix.
+   - Added `scripts/smoke_benchmark_matrix.py`.
+   - The matrix covers:
+     - `aime_math_mini` as `generalization`
+     - `arc_agi` as `generalization`
+     - `cloudcast` as `multi_task`
+     - one `frontier_cs_algo_smoke` problem as `multi_task`
+   - Dropped Circle Packing from this smoke matrix.
+   - Verified fresh run artifacts under `outputs/smoke/benchmark_matrix_current`.
+   - Confirmed meaningful evaluator output:
+     - AIME hidden reduced `test_score: 1.0`
+     - ARC visible reduced `best_score: 1.0`
+     - Cloudcast positive cost score
+     - Frontier-CS actual judge success on one problem; the empty seed scores `0.0`, as expected.
+   - Confirmed Frontier-CS requires Python 3.11+ because the `frontier-cs`
+     package is gated to that version range.
+
 ## Sandbox Probe Tests
 
 Done: `scripts/sandbox_probe.py` now proves that sandboxed Bash inside the

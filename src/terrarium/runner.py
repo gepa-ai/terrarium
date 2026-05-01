@@ -44,6 +44,9 @@ from terrarium.tracking import TerrariumTracker, TrackingConfig
 
 CONFIG_PATH = str(Path(__file__).parent / "conf")
 BENCHMARK_MODES = {"single", "multi_task", "generalization"}
+EXECUTION_POLICIES = {"unsandboxed", "sandboxed"}
+HOST_SHARED_NETWORK_POLICIES = {"host_shared", "model_api_and_eval_server_host_shared"}
+NETWORK_ISOLATED_POLICIES = {"network_namespace_isolated", "network_isolated", "none"}
 
 
 def run(
@@ -255,21 +258,56 @@ def _benchmark_config(cfg: DictConfig | dict[str, Any] | None) -> DictConfig:
 
 
 def _effective_adapter_sandbox(adapter: Any, top_level_sandbox: bool | None) -> bool | None:
-    value = getattr(adapter, "sandbox", None) if hasattr(adapter, "sandbox") else top_level_sandbox
+    effective = getattr(adapter, "effective_sandbox", None)
+    if callable(effective):
+        return effective(top_level_sandbox)
+    if not hasattr(adapter, "sandbox"):
+        return False
+    value = getattr(adapter, "sandbox", None)
     if value is None:
         return None
     return bool(value)
+
+
+def _sandbox_scope(adapter: Any, top_level_sandbox: bool | None) -> dict[str, bool]:
+    scope = getattr(adapter, "sandbox_scope", None)
+    if callable(scope):
+        value = scope(top_level_sandbox)
+        return {
+            "optimizer_subprocess_sandbox": bool(value.get("optimizer_subprocess_sandbox", False)),
+            "candidate_execution_sandbox": bool(value.get("candidate_execution_sandbox", False)),
+            "network_namespace_isolated": bool(value.get("network_namespace_isolated", False)),
+        }
+    return {
+        "optimizer_subprocess_sandbox": bool(_effective_adapter_sandbox(adapter, top_level_sandbox)),
+        "candidate_execution_sandbox": False,
+        "network_namespace_isolated": False,
+    }
 
 
 def _validate_access_policy(access_policy: DictConfig | None, adapter: Any, sandbox: bool | None) -> None:
     if not access_policy:
         return
     execution = access_policy.get("execution")
-    effective_sandbox = _effective_adapter_sandbox(adapter, sandbox)
-    if execution == "sandboxed" and effective_sandbox is not True:
+    network = access_policy.get("network")
+    scope = _sandbox_scope(adapter, sandbox)
+    if execution is not None and execution not in EXECUTION_POLICIES:
+        raise ValueError("access_policy.execution must be one of: unsandboxed, sandboxed")
+    if execution == "sandboxed" and not scope["candidate_execution_sandbox"]:
         raise ValueError(
-            "access_policy.execution=sandboxed requires an effective adapter sandbox. "
-            "Set sandbox=true or use access_policy.execution=unsandboxed."
+            "access_policy.execution=sandboxed requires candidate/evaluator execution sandboxing. "
+            "Use access_policy.execution=unsandboxed when only optimizer subprocesses are sandboxed."
+        )
+    if network in NETWORK_ISOLATED_POLICIES and not scope["network_namespace_isolated"]:
+        raise ValueError(
+            f"access_policy.network={network} requires network namespace isolation. "
+            "Use network=model_api_and_eval_server_host_shared or network=host_shared for current sandboxes."
+        )
+    if network is not None and network not in HOST_SHARED_NETWORK_POLICIES | NETWORK_ISOLATED_POLICIES:
+        raise ValueError(
+            "access_policy.network must be one of: "
+            "host_shared, model_api_and_eval_server_host_shared, "
+            "network_namespace_isolated, network_isolated, none"
         )
 
 
@@ -498,7 +536,7 @@ def main(cfg: DictConfig) -> None:
         "adapter_target": cfg.adapter.get("_target_", "unknown"),
         "benchmark": _plain_config(benchmark_cfg),
         "access_policy": _plain_config(cfg.get("access_policy", {})),
-        "effective_sandbox": _effective_adapter_sandbox(adapter, cfg.get("sandbox")),
+        "sandbox_scope": _sandbox_scope(adapter, cfg.get("sandbox")),
         "adapter_dir": str(adapter_dir),
         "best_score": result.best_score,
         "total_evals": result.total_evals,

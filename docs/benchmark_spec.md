@@ -126,6 +126,32 @@ For Claude Code adapters on Linux, the current official sandbox policy is:
   network is therefore part of this access policy and must not be mixed with
   stricter network-isolated results
 
+The run summary records sandboxing as scoped enforcement, not as a single
+boolean:
+
+- `sandbox_scope.optimizer_subprocess_sandbox`: the optimizer/proposer
+  subprocesses are filesystem-sandboxed
+- `sandbox_scope.candidate_execution_sandbox`: candidate/evaluator execution is
+  sandboxed
+- `sandbox_scope.network_namespace_isolated`: subprocess network namespace is
+  isolated from the host
+
+`access_policy.execution` accepts only `unsandboxed` or `sandboxed`.
+`access_policy.execution: sandboxed` is reserved for runs where
+`sandbox_scope.candidate_execution_sandbox` is true. Runs where only Claude Code
+proposer/reflection subprocesses are sandboxed must use
+`access_policy.execution: unsandboxed` and rely on `sandbox_scope` for the
+narrower enforcement detail.
+
+Network policy values are explicit about host sharing:
+
+- `host_shared`: host network is available
+- `model_api_and_eval_server_host_shared`: model APIs and eval server are needed,
+  but the network namespace is still host-shared and arbitrary outbound network
+  is not blocked at OS level
+- `network_namespace_isolated`, `network_isolated`, `none`: strict policies that
+  require `sandbox_scope.network_namespace_isolated: true`
+
 ## Current Config Surface
 
 The minimal current Hydra surface is:
@@ -138,11 +164,13 @@ benchmark:
 access_policy:
   readable_paths: []
   writable_paths: []
-  execution: sandboxed
-  network: model_api_and_eval_server
+  execution: unsandboxed
+  network: model_api_and_eval_server_host_shared
   shared_cache: false
   prior_artifacts: false
   external_tools: []
+
+sandbox: false
 ```
 
 `benchmark.mode: null` means the runner uses `task.mode` from the selected task

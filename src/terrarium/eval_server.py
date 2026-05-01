@@ -170,6 +170,8 @@ class EvalServer:
         # Resolve examples
         examples: list[Example] = []
         if example_ids is not None:
+            if not example_ids:
+                raise ValueError("example_ids must not be empty")
             unknown_ids: list[str] = []
             for eid in example_ids:
                 if eid in self._examples:
@@ -193,15 +195,9 @@ class EvalServer:
                 examples.extend(self.task.train_set)
 
         if not examples:
-            score, info = self.evaluate(candidate)
-            return score, {
-                "scores": {"_single": score},
-                "infos": {"_single": info},
-                "num_evaluated": 1,
-                "num_total": 1,
-                "partial": False,
-                "_budget": self.budget.status(),
-            }
+            if split in ("train", "val"):
+                raise ValueError(f"{split} split is not available during search")
+            raise ValueError("No visible examples are available during search")
 
         if self.budget.remaining is not None and self.budget.remaining < len(examples):
             raise BudgetExhausted(

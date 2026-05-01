@@ -107,6 +107,23 @@ class GEPAAdapter:
         # None ⇒ inherit the runner's top-level ``sandbox:`` default.
         self.sandbox = sandbox
 
+    def effective_sandbox(self, top_level_sandbox: bool | None = None) -> bool:
+        """Whether this GEPA configuration actually creates a sandbox boundary."""
+        sandbox = self.sandbox if self.sandbox is not None else top_level_sandbox
+        if not sandbox:
+            return False
+        lm_name = self.reflection.get("reflection_lm")
+        return isinstance(lm_name, str) and (
+            lm_name.startswith("claude_code/") or lm_name.startswith("claude_code_agent/")
+        )
+
+    def sandbox_scope(self, top_level_sandbox: bool | None = None) -> dict[str, bool]:
+        return {
+            "optimizer_subprocess_sandbox": self.effective_sandbox(top_level_sandbox),
+            "candidate_execution_sandbox": False,
+            "network_namespace_isolated": False,
+        }
+
     def evolve(self, task: Task, server: EvalServer) -> Result:
         from gepa.lm import LM
         from gepa.optimize_anything import GEPAConfig, optimize_anything
