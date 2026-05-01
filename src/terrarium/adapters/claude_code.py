@@ -148,6 +148,11 @@ if [ "$HTTP_CODE" = "429" ]; then
 fi
 """
 
+# Nudge sent each iteration of the Ralph loop to resume the same claude
+# session. Kept short as the agent already has full context from the
+# initial program.md prompt and prior turns. 
+RALPH_CONTINUE_PROMPT = "Continue improving the candidate."
+
 # ── program.md templates ────────────────────────────────────────────────
 
 _PROGRAM_MD = """\
@@ -522,21 +527,25 @@ class ClaudeCodeAdapter:
             # signals it's done by erroring. Each iteration's
             # --max-budget-usd is the *remaining* LLM budget so the
             # final iteration self-caps inside the CLI.
-            continue_prompt = (
-                "Continue iterating on the candidate. Re-read program.md if needed. "
-                "Run ./eval.sh and ./validate.sh as appropriate. "
-                "Keep refining best_candidate.txt until you exhaust the budget "
-                "or genuinely cannot find another improvement."
-            )
             for _ in range(self.ralph_max_iterations - 1):
                 if not self._has_budget_headroom(server, adapter_cost):
                     break
                 if proc.returncode != 0:
                     break  # claude errored — don't retry blindly
+                # Threshold reached: trust server.best_score over agent
+                # compliance with program.md's perfect_score directive.
+                # Matches GEPA's ScoreThresholdStopper / meta-harness's
+                # explicit per-iteration check.
+                if (
+                    self.stop_at_score is not None
+                    and server.best_score is not None
+                    and server.best_score >= self.stop_at_score
+                ):
+                    break
                 proc = self._run_claude(
                     work_dir=work_dir,
                     session_id=session_id,
-                    prompt=continue_prompt,
+                    prompt=RALPH_CONTINUE_PROMPT,
                     budget=budget,
                     adapter_cost=adapter_cost,
                     resume=True,
