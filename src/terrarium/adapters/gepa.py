@@ -161,19 +161,6 @@ class GEPAAdapter:
                     sandbox=bool(self.sandbox),
                 )
                 reflection_kwargs["reflection_lm"] = reflection_lm
-            elif isinstance(lm_name, str) and lm_name.startswith("anthropic_sdk/"):
-                # Bypass litellm via the official Anthropic SDK.
-                from terrarium.adapters._anthropic_sdk_lm import AnthropicSdkLM
-                lm_kwargs = dict(self.reflection_lm_kwargs)
-                lm_kwargs.pop("reasoning_effort", None)
-                if "num_retries" in lm_kwargs:  # litellm naming → SDK naming
-                    lm_kwargs.setdefault("max_retries", lm_kwargs.pop("num_retries"))
-                reflection_lm = AnthropicSdkLM(
-                    model=lm_name.split("/", 1)[1],
-                    max_thinking_tokens=self.max_thinking_tokens,
-                    **lm_kwargs,
-                )
-                reflection_kwargs["reflection_lm"] = reflection_lm
             else:
                 lm_kwargs = dict(self.reflection_lm_kwargs)
                 if self.max_thinking_tokens is not None:

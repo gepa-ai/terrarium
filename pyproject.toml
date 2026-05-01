@@ -14,11 +14,6 @@ dependencies = [
 
 [project.optional-dependencies]
 gepa = ["gepa"]
-# Direct Anthropic SDK reflection LM — used when ``reflection_lm`` is set to
-# ``"anthropic_sdk/<model>"`` to bypass litellm. See
-# ``terrarium.adapters._anthropic_sdk_lm`` for why (litellm + httpx wedges on
-# long extended-thinking responses on cloudcast).
-anthropic_sdk = ["anthropic>=0.40"]
 frontier_cs = [
     # frontier-cs itself requires Python >= 3.11; gate on that marker so
     # terrarium's broader 3.10 support isn't blocked at lock time.
