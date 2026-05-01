@@ -504,11 +504,6 @@ class ClaudeCodeAdapter:
         # swallow the trailing positional prompt.
         session_id = str(uuid.uuid4())
 
-        env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
-        if self.max_thinking_tokens is not None:
-            env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
-            env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
-
         adapter_cost = 0.0
         ralph_iterations = 1
         proc = self._run_claude(
@@ -518,7 +513,6 @@ class ClaudeCodeAdapter:
             budget=budget,
             adapter_cost=adapter_cost,
             resume=False,
-            env=env,
         )
         adapter_cost += _extract_claude_cost(proc.stdout)
 
@@ -549,7 +543,6 @@ class ClaudeCodeAdapter:
                     budget=budget,
                     adapter_cost=adapter_cost,
                     resume=True,
-                    env=env,
                 )
                 iter_cost = _extract_claude_cost(proc.stdout)
                 adapter_cost += iter_cost
@@ -583,13 +576,16 @@ class ClaudeCodeAdapter:
         budget: BudgetTracker,
         adapter_cost: float,
         resume: bool,
-        env: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
         """Invoke ``claude --print`` once. ``resume=True`` continues the pinned
         session via ``--resume <session_id>`` instead of starting a new one.
         ``--max-budget-usd`` is set to the *remaining* LLM budget so successive
         iterations don't stack the cap.
         """
+        env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+        if self.max_thinking_tokens is not None:
+            env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
+            env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
         # bwrap (when sandboxed) scopes writes to work_dir; network is
         # shared so eval.sh / validate.sh can curl the local eval server
         # (and claude can reach api.anthropic.com). WebFetch/WebSearch
