@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from omegaconf import OmegaConf
 
@@ -20,6 +22,7 @@ from terrarium.adapters.gepa import GEPAAdapter
 from terrarium.budget import BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.adapter import Result
+from terrarium.registry import get_task, list_tasks
 from terrarium.runner import (
     _effective_adapter_sandbox,
     _prepare_task_for_benchmark,
@@ -29,6 +32,7 @@ from terrarium.runner import (
 )
 from terrarium.task import Example, Task
 from terrarium.tasks.arc_agi import _evaluate_test
+from terrarium.tasks import frontier_cs
 
 
 def _eval(candidate: str, example: Example | None = None) -> tuple[float, dict]:
@@ -438,6 +442,84 @@ class BenchmarkContractTests(unittest.TestCase):
 
             self.assertEqual((output_dir / f"{session_id}.jsonl").read_text(), '{"ok": true}\n')
 
+    def test_claude_code_subprocess_failure_raises(self) -> None:
+        task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
+        server = EvalServer(task, BudgetTracker(max_evals=1))
+        server.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                adapter = ClaudeCodeAdapter(run_dir=tmp, sandbox=False)
+                failed = subprocess.CompletedProcess(
+                    args=["claude"],
+                    returncode=1,
+                    stdout='{"error":"Not logged in"}',
+                    stderr="",
+                )
+                with patch("terrarium.adapters.claude_code.subprocess.run", return_value=failed):
+                    with self.assertRaisesRegex(RuntimeError, "Claude Code subprocess failed"):
+                        adapter.evolve(task, server)
+        finally:
+            server.stop()
+
+    def test_claude_code_rejects_unsupported_max_turns(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_turns is not supported"):
+            ClaudeCodeAdapter(max_turns=1)
+
+    def test_claude_code_zero_eval_success_raises(self) -> None:
+        task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
+        server = EvalServer(task, BudgetTracker(max_evals=1))
+        server.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                adapter = ClaudeCodeAdapter(run_dir=tmp, sandbox=False)
+                completed = subprocess.CompletedProcess(
+                    args=["claude"],
+                    returncode=0,
+                    stdout='{"total_cost_usd":0.01}',
+                    stderr="",
+                )
+                with patch("terrarium.adapters.claude_code.subprocess.run", return_value=completed):
+                    with self.assertRaisesRegex(RuntimeError, "without calling"):
+                        adapter.evolve(task, server)
+        finally:
+            server.stop()
+
+    def test_meta_harness_proposer_failure_raises(self) -> None:
+        task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
+        server = EvalServer(task, BudgetTracker(max_evals=1))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = MetaHarnessAdapter(
+                run_dir=tmp,
+                max_iterations=1,
+                max_candidates_per_iter=1,
+                sandbox=False,
+            )
+            with patch(
+                "terrarium.adapters.meta_harness._run_proposer",
+                return_value=(1, 0.0, "session-123", None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "MetaHarness proposer failed"):
+                    adapter.evolve(task, server)
+
+    def test_meta_harness_no_candidates_raises(self) -> None:
+        task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
+        server = EvalServer(task, BudgetTracker(max_evals=1))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = MetaHarnessAdapter(
+                run_dir=tmp,
+                max_iterations=1,
+                max_candidates_per_iter=1,
+                sandbox=False,
+            )
+            with patch(
+                "terrarium.adapters.meta_harness._run_proposer",
+                return_value=(0, 0.0, "session-123", None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "produced no candidates"):
+                    adapter.evolve(task, server)
+
     def test_arc_test_scoring_accepts_grid_predictions_and_attempt_lists(self) -> None:
         gold = [[[1, 2], [3, 4]]]
 
@@ -448,6 +530,27 @@ class BenchmarkContractTests(unittest.TestCase):
         score, results = _evaluate_test([[[[9]], [[1, 2], [3, 4]]]], gold)
         self.assertEqual(score, 1.0)
         self.assertTrue(results[0]["correct"])
+
+    def test_listing_tasks_does_not_load_frontier_cs_dataset(self) -> None:
+        with patch.object(
+            frontier_cs,
+            "_algorithmic_rows",
+            side_effect=AssertionError("Frontier-CS rows should be loaded lazily"),
+        ):
+            names = list_tasks()
+
+        self.assertIn("frontier_cs_algo_smoke", names)
+
+    def test_frontier_cs_problem_task_resolves_lazily_by_name(self) -> None:
+        frontier_cs._algorithmic_rows.cache_clear()
+        rows = {"lazy_test": {"statement": "Return 0."}}
+
+        with patch.object(frontier_cs, "_algorithmic_rows", return_value=rows) as load_rows:
+            task = get_task("frontier_cs_algo_lazy_test")
+
+        self.assertEqual(task.name, "frontier_cs_algo_lazy_test")
+        self.assertEqual(task.background, "Return 0.")
+        load_rows.assert_called_once_with()
 
 
 if __name__ == "__main__":

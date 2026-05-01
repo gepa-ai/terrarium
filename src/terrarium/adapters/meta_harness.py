@@ -851,7 +851,13 @@ class MetaHarnessAdapter:
                     budget_used=budget.used,
                     propose_time=propose_time,
                 )
-                stop_reason = "proposer_failed"
+                stdout_path = sessions_dir / f"iter{iteration}_stdout.json"
+                stderr_path = sessions_dir / f"iter{iteration}_stderr.txt"
+                raise RuntimeError(
+                    "MetaHarness proposer failed "
+                    f"(iteration {iteration}, exit {exit_code}). "
+                    f"See {stdout_path} and {stderr_path}."
+                )
 
             candidates = _read_pending(pending_path)
             if not candidates:
@@ -870,8 +876,10 @@ class MetaHarnessAdapter:
                     budget_used=budget.used,
                     propose_time=propose_time,
                 )
-                stop_reason = "no_candidates"
-                break
+                raise RuntimeError(
+                    "MetaHarness proposer produced no candidates "
+                    f"(iteration {iteration}). The run is not a valid optimizer smoke."
+                )
 
             _log(f"  {_cyan('benchmarking')} {len(candidates)} candidate(s)...")
 

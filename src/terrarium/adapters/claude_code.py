@@ -241,14 +241,16 @@ def _strategy_section(task: Task) -> str:
         final_n = 6 if task.val_set else 5
         return (
             "1. Read the training examples in `train/` to understand the task.\n"
-            "2. Run `./eval.sh candidate.txt` for a baseline.\n"
+            "2. Run `./eval.sh candidate.txt` for a baseline. Do not skip this "
+            "evaluation, even when the evaluation cap is small.\n"
             "3. Analyze failures — inspect examples that scored 0.\n"
-            "4. Improve the candidate; spot-check with `--ids`.\n"
+            "4. Improve the candidate; spot-check with `--ids` when budget remains.\n"
             f"{val_step}{final_n}. Write your best candidate to `best_candidate.txt`."
         )
     return (
         "1. Read the candidate (`candidate.txt`) and the problem description above.\n"
-        "2. Run `./eval.sh candidate.txt` for a baseline score and any judge feedback.\n"
+        "2. Run `./eval.sh candidate.txt` for a baseline score and any judge feedback. "
+        "Do not skip this evaluation, even when the evaluation cap is small.\n"
         "3. Revise the candidate based on what you learned.\n"
         "4. Iterate; write your best solution to `best_candidate.txt` as you improve."
     )
@@ -403,8 +405,13 @@ class ClaudeCodeAdapter:
         max_thinking_tokens: int | None = None,
         sandbox: bool | None = None,
     ) -> None:
+        if max_turns is not None:
+            raise ValueError(
+                "ClaudeCodeAdapter.max_turns is not supported by the installed "
+                "Claude Code CLI; no --max-turns flag is available. Use eval "
+                "and token budgets to bound runs."
+            )
         self.model = model
-        self.max_turns = max_turns
         self.stop_at_score = stop_at_score
         # When set, artifacts (candidate.txt, eval.sh, best_candidate.txt,
         # plus anything Claude writes) persist under this dir. Otherwise a
@@ -512,6 +519,18 @@ class ClaudeCodeAdapter:
             capture_output=True,
             text=True,
         )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "Claude Code subprocess failed "
+                f"(exit {proc.returncode}). "
+                f"stdout_tail={_tail_text(proc.stdout)!r} "
+                f"stderr_tail={_tail_text(proc.stderr)!r}"
+            )
+        if server.budget.used == 0:
+            raise RuntimeError(
+                "Claude Code subprocess completed without calling the Terrarium "
+                "eval server. The run is not a valid optimizer smoke."
+            )
         adapter_cost = _extract_claude_cost(proc.stdout)
 
         best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
@@ -609,6 +628,13 @@ def _extract_claude_cost(stdout: str) -> float:
         return float(payload.get("total_cost_usd", 0.0) or 0.0)
     except (json.JSONDecodeError, ValueError, TypeError):
         return 0.0
+
+
+def _tail_text(text: str | None, limit: int = 2000) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
 
 
 def create_adapter(**kwargs: Any) -> ClaudeCodeAdapter:

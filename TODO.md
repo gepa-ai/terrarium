@@ -61,6 +61,75 @@
    - Confirmed Frontier-CS requires Python 3.11+ because the `frontier-cs`
      package is gated to that version range.
 
+5. Done: remove Frontier-CS import-time side effects.
+   - Problem observed during the reduced smoke matrix: unrelated tasks can still
+     trigger Frontier-CS registration work at import time, including Hugging
+     Face metadata/network probes.
+   - Target behavior: importing/registering `terrarium.tasks` should be cheap
+     and should not touch remote datasets for benchmarks that are not selected.
+   - Added registry support for dynamic task-name resolvers.
+   - Changed Frontier-CS registration to register only the smoke factory and a
+     lazy `frontier_cs_algo_<id>` resolver; the Hugging Face problem list is
+     loaded only when a selected Frontier-CS task is requested.
+   - Added regression tests proving task listing does not load Frontier-CS rows
+     and dynamic per-problem lookup still resolves lazily.
+   - Re-ran the reduced smoke matrix under
+     `outputs/smoke/benchmark_matrix_lazy_frontier`.
+   - Confirmed non-Frontier smoke logs no longer contain Frontier-CS startup
+     noise. AIME/ARC-AGI still perform their own expected Hugging Face dataset
+     access.
+   - Confirmed the one-problem Frontier-CS smoke still resolves and returns
+     `EvaluationStatus.SUCCESS`.
+
+6. Done: run reduced real-adapter smokes for Claude Code and MetaHarness.
+   - Current status: contract tests cover Claude Code and MetaHarness sandbox
+     materialization, and `scripts/sandbox_probe.py` verifies the live Claude
+     Code-style filesystem sandbox.
+   - Reduced run:
+     - `aime_math_mini`
+     - `task.train_limit=1`, `task.val_limit=0`, `task.test_limit=1`
+     - `budget.max_evals=2`
+     - Claude Code with low effort
+     - MetaHarness with `adapter.max_iterations=1`,
+       `adapter.max_candidates_per_iter=1`, low effort, and a cheap model
+       override instead of the default Opus
+   - Initial blocker resolved: after sourcing `~/.zshrc`, `ANTHROPIC_API_KEY`
+     was available and both adapters could reach the Claude Code CLI.
+   - Hardened failure behavior:
+     - Claude Code adapter now raises on nonzero Claude subprocess exit instead
+       of returning the seed candidate with zero evals.
+     - MetaHarness now raises on proposer subprocess failure instead of writing
+       a misleading benchmark summary with hidden seed scoring.
+     - Claude Code adapter now raises if the subprocess completes without
+       calling the eval server.
+     - MetaHarness now raises if the proposer exits successfully but emits no
+       candidates.
+     - Added regression tests for these failure paths.
+   - Successful smoke artifacts:
+     - `outputs/smoke/claude_code_aime_mini_eval_required`
+       - `total_evals: 1`
+       - `best_score: 0.0`
+       - `test_score: 1.0`
+       - `total_cost: 0.142107`
+     - `outputs/smoke/meta_harness_aime_mini_eval_required`
+       - `total_evals: 1`
+       - `best_score: 1.0`
+       - `test_score: 1.0`
+       - `total_cost: 0.1195923`
+   - Confirmed each adapter launches successfully through the real Claude Code
+     CLI path, eval-server budget accounting moves during search, hidden test
+     remains runner-owned and post-search, and summary artifacts include
+     `sandbox_scope` and access policy.
+
+7. Done: resolve `adapter.max_turns` for Claude Code.
+   - `adapter.max_turns` exists in the config and adapter constructor, but the
+     installed Claude Code CLI (`2.1.126`) does not expose a `--max-turns`
+     option in `claude --help`.
+   - Removed `max_turns` from the Claude Code Hydra config.
+   - Added a constructor guard so programmatic callers get a clear
+     `ValueError` if they pass `max_turns`.
+   - Continue bounding Claude Code runs with eval and token budgets.
+
 ## Sandbox Probe Tests
 
 Done: `scripts/sandbox_probe.py` now proves that sandboxed Bash inside the

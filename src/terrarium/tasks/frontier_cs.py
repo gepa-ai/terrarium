@@ -45,7 +45,6 @@ import os
 import shutil
 import subprocess
 import time
-import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -56,7 +55,7 @@ _JUDGE_URL = f"http://localhost:{_JUDGE_PORT}"
 
 logger = logging.getLogger(__name__)
 
-from terrarium.registry import register_task_factory
+from terrarium.registry import register_task_factory, register_task_resolver
 from terrarium.task import Example, Task
 
 # Minimal compilable C++ seed. Starts from "the beginning" — the LM must
@@ -356,40 +355,24 @@ def _make_smoke_task() -> Task:
     )
 
 
+def _resolve_task(name: str):
+    if not name.startswith("frontier_cs_algo_"):
+        return None
+    problem_id = name.removeprefix("frontier_cs_algo_")
+    if not problem_id:
+        return None
+    return lambda p=problem_id: _make_problem_task(p)
+
+
 def _register_all() -> None:
-    """Register the smoke task + one factory per algorithmic problem.
+    """Register Frontier-CS entry points without touching the remote dataset.
 
-    Registration is cheap: each factory captures just the problem_id. The HF
-    dataset isn't loaded until a factory is actually invoked (via get_task()),
-    and then it's loaded exactly once (cached).
-
-    If the ``datasets`` package isn't installed, we skip silently — the
-    Frontier-CS extra wasn't installed, and other terrarium tasks should still
-    work.
+    The smoke task and dynamic ``frontier_cs_algo_<id>`` resolver defer
+    HuggingFace access until the selected Frontier-CS task is actually loaded.
+    This keeps unrelated tasks from doing Frontier-CS discovery at startup.
     """
-    try:
-        from datasets import load_dataset  # noqa: F401
-    except ImportError:
-        return
-
-    try:
-        rows = _algorithmic_rows()
-    except Exception as e:  # pragma: no cover - network/HF hub issues
-        warnings.warn(
-            f"Could not load Frontier-CS problem list from HuggingFace: {e}. "
-            "Per-problem tasks (frontier_cs_algo_<id>) will not be registered. "
-            "Other terrarium tasks are unaffected.",
-            stacklevel=2,
-        )
-        return
-
     register_task_factory("frontier_cs_algo_smoke", _make_smoke_task)
-    for pid in rows:
-        # Default-arg binding pins pid into each lambda's closure.
-        register_task_factory(
-            f"frontier_cs_algo_{pid}",
-            lambda p=pid: _make_problem_task(p),
-        )
+    register_task_resolver(_resolve_task)
 
 
 _register_all()
