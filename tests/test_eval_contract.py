@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import sys
 
 from terrarium.adapter import Adapter, Result
 from terrarium.adapters.omni import OmniAdapter
@@ -8,6 +9,7 @@ from terrarium.budget import BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.runner import run
 from terrarium.task import Example, Task
+from terrarium.tasks import aime_math
 
 
 def _dataset_task() -> Task:
@@ -158,6 +160,65 @@ class EvalContractTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             server.evaluate_examples("anything", split="test")
+
+    def _with_fake_dspy(self, predictor_cls, fn):
+        original_dspy = sys.modules.get("dspy")
+        fake_dspy = type(
+            "FakeDspy",
+            (),
+            {
+                "Signature": object,
+                "InputField": staticmethod(lambda **_kwargs: None),
+                "OutputField": staticmethod(lambda **_kwargs: None),
+                "ChainOfThought": predictor_cls,
+            },
+        )
+        sys.modules["dspy"] = fake_dspy
+        try:
+            return fn()
+        finally:
+            if original_dspy is None:
+                sys.modules.pop("dspy", None)
+            else:
+                sys.modules["dspy"] = original_dspy
+
+    def test_aime_solver_parse_errors_score_zero(self) -> None:
+        class FailingPredictor:
+            def __init__(self, _signature):
+                self.predict = type("Predict", (), {"signature": type("Sig", (), {"instructions": ""})()})()
+
+            def __call__(self, **_kwargs):
+                raise ValueError("bad solver output")
+
+        score, info = self._with_fake_dspy(
+            FailingPredictor,
+            lambda: aime_math.evaluate(
+                "prompt",
+                Example("aime", {"input": "problem", "solution": "solution"}, 7),
+            ),
+        )
+
+        self.assertEqual(score, 0.0)
+        self.assertIn("bad solver output", info["error"])
+
+    def test_aime_missing_answer_scores_zero(self) -> None:
+        class MissingAnswerPredictor:
+            def __init__(self, _signature):
+                self.predict = type("Predict", (), {"signature": type("Sig", (), {"instructions": ""})()})()
+
+            def __call__(self, **_kwargs):
+                return object()
+
+        score, info = self._with_fake_dspy(
+            MissingAnswerPredictor,
+            lambda: aime_math.evaluate(
+                "prompt",
+                Example("aime", {"input": "problem", "solution": "solution"}, 7),
+            ),
+        )
+
+        self.assertEqual(score, 0.0)
+        self.assertIn("AttributeError", info["error"])
 
 
 if __name__ == "__main__":
