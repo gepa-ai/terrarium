@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from terrarium.budget import BudgetExhausted, BudgetTracker
+from terrarium.solver_lm import SolverBudgetExhausted
 from terrarium.task import Example, Task
 from terrarium.tracking import TerrariumTracker
 
@@ -220,6 +221,8 @@ class EvalServer:
             try:
                 score, info = self.evaluate(candidate, ex)
                 return (ex.id, score, info, None)
+            except BudgetExhausted:
+                raise
             except Exception as e:
                 return (ex.id, 0.0, None, str(e))
 
@@ -466,8 +469,19 @@ class EvalServer:
             score, info = self.evaluate(candidate, example)
             self._send_json(handler, {"score": score, "info": info, "budget": self.budget.status()})
 
+        except SolverBudgetExhausted as e:
+            self._send_json(
+                handler,
+                {"error": str(e), "error_type": "solver_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
+
         except BudgetExhausted:
-            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            self._send_json(
+                handler,
+                {"error": "Budget exhausted", "error_type": "eval_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
 
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
@@ -522,8 +536,19 @@ class EvalServer:
                 "budget": self.budget.status(),
             })
 
+        except SolverBudgetExhausted as e:
+            self._send_json(
+                handler,
+                {"error": str(e), "error_type": "solver_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
+
         except BudgetExhausted:
-            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            self._send_json(
+                handler,
+                {"error": "Budget exhausted", "error_type": "eval_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
 
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
@@ -546,8 +571,19 @@ class EvalServer:
             result = self.validate(candidate)
             self._send_json(handler, {**result, "budget": self.budget.status()})
 
+        except SolverBudgetExhausted as e:
+            self._send_json(
+                handler,
+                {"error": str(e), "error_type": "solver_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
+
         except BudgetExhausted:
-            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            self._send_json(
+                handler,
+                {"error": "Budget exhausted", "error_type": "eval_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
 
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)

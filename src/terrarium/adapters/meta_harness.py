@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
 from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
+from terrarium.solver_lm import SolverBudgetExhausted
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -878,6 +879,8 @@ class MetaHarnessAdapter:
                 eval_idx_before = len(server.eval_log)
                 try:
                     score, info = _score_candidate(server, task, cand_text)
+                except SolverBudgetExhausted:
+                    raise
                 except BudgetExhausted:
                     # Capture any traces produced before budget tripped
                     _capture_eval_traces(

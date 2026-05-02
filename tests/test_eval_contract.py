@@ -5,9 +5,10 @@ import sys
 
 from terrarium.adapter import Adapter, Result
 from terrarium.adapters.omni import OmniAdapter
-from terrarium.budget import BudgetTracker
+from terrarium.budget import BudgetExhausted, BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.runner import run
+from terrarium.solver_lm import CostTrackedDSPyLM, SolverBudgetExhausted
 from terrarium.task import Example, Task
 from terrarium.tasks import aime_math
 
@@ -84,8 +85,68 @@ class EvalContractTests(unittest.TestCase):
         result = run(_dataset_task(), _SearchOnlyAdapter(), max_evals=2)
 
         self.assertEqual(result.total_evals, 2)
+        self.assertEqual(result.best_score, 0.0)
+        self.assertEqual(result.metadata["final_val_scores"], {"val-1": 0.0})
+        self.assertEqual(result.metadata["final_val_score"], 0.0)
         self.assertEqual(result.metadata["test_scores"], {"test-1": 1.0})
         self.assertEqual(result.metadata["test_score"], 1.0)
+
+    def test_runner_reports_final_validation_score_not_server_example_best(self) -> None:
+        class AdapterWithMisleadingServerBest(Adapter):
+            def evolve(self, task: Task, server: EvalServer) -> Result:
+                server.evaluate_examples("train-answer", split="train")
+                return Result(
+                    best_candidate="val-answer",
+                    best_score=server.best_score,
+                    total_evals=server.budget.used,
+                    eval_log=server.eval_log,
+                )
+
+        result = run(_dataset_task(), AdapterWithMisleadingServerBest(), max_evals=1)
+
+        self.assertEqual(result.best_score, 1.0)
+        self.assertEqual(result.metadata["final_val_score"], 1.0)
+        self.assertEqual(result.metadata["test_score"], 0.0)
+
+    def test_incomplete_final_validation_does_not_overwrite_best_score(self) -> None:
+        class SolverBudgetedTask:
+            calls = 0
+
+            @staticmethod
+            def eval_fn(candidate: str, example: Example) -> tuple[float, dict]:
+                if example.id == "val-1" and candidate == "candidate":
+                    raise SolverBudgetExhausted("solver cap")
+                SolverBudgetedTask.calls += 1
+                return (1.0 if candidate == example.expected else 0.0), {}
+
+        task = Task(
+            name="solver_budgeted_final",
+            initial_candidate="seed",
+            eval_fn=SolverBudgetedTask.eval_fn,
+            train_set=[Example("train-1", {}, "candidate")],
+            val_set=[Example("val-1", {}, "candidate")],
+        )
+
+        class CandidateAdapter(Adapter):
+            def evolve(self, task: Task, server: EvalServer) -> Result:
+                return Result("candidate", 0.75, server.budget.used, server.eval_log)
+
+        result = run(task, CandidateAdapter(), max_evals=1)
+
+        self.assertEqual(result.best_score, 0.75)
+        self.assertTrue(result.metadata["val_scoring_incomplete"])
+        self.assertNotIn("final_val_score", result.metadata)
+
+    def test_runner_includes_solver_cost_in_total_cost(self) -> None:
+        class SolverCostTracker:
+            total_cost = 0.25
+            cost_log = [{"call": 1, "cost": 0.25, "cumulative_cost": 0.25}]
+
+        result = run(_dataset_task(), _SearchOnlyAdapter(), max_evals=2, solver_cost_tracker=SolverCostTracker())
+
+        self.assertEqual(result.metadata["solver_cost"], 0.25)
+        self.assertEqual(result.metadata["total_cost"], 0.25)
+        self.assertEqual(result.metadata["solver_cost_log"], [{"call": 1, "cost": 0.25, "cumulative_cost": 0.25}])
 
     def test_direct_evaluate_rejects_examples_outside_visible_task(self) -> None:
         task = _dataset_task()
@@ -161,6 +222,55 @@ class EvalContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.evaluate_examples("anything", split="test")
 
+    def test_batch_eval_propagates_budget_exhaustion(self) -> None:
+        def eval_fn(_candidate: str, _example: Example) -> tuple[float, dict]:
+            raise SolverBudgetExhausted("solver cap")
+
+        task = Task(
+            name="budgeted_dataset",
+            initial_candidate="seed",
+            eval_fn=eval_fn,
+            train_set=[Example("train-1", {}, "x")],
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=10))
+
+        with self.assertRaises(SolverBudgetExhausted):
+            server.evaluate_examples("anything", split="train")
+
+        self.assertEqual(server.budget.used, 0)
+
+    def test_http_reports_solver_budget_exhaustion_type(self) -> None:
+        def eval_fn(_candidate: str, _example: Example | None = None) -> tuple[float, dict]:
+            raise SolverBudgetExhausted("solver cap")
+
+        task = Task(name="http_solver_budget", initial_candidate="seed", eval_fn=eval_fn)
+        server = EvalServer(task, BudgetTracker(max_evals=10))
+        server.start()
+        try:
+            import json
+            import urllib.error
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"{server.url}/evaluate",
+                data=json.dumps({"candidate": "anything"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(ctx.exception.code, 429)
+            body = json.loads(ctx.exception.read().decode())
+            self.assertEqual(body["error_type"], "solver_budget_exhausted")
+        finally:
+            server.stop()
+
+    def test_solver_cost_tracker_ignores_cache_hits(self) -> None:
+        lm = CostTrackedDSPyLM("openai/gpt-4.1-nano")
+        response = type("Response", (), {"cache_hit": True, "usage": {"total_tokens": 10}})()
+
+        self.assertEqual(lm._completion_cost(response), 0.0)
+
     def _with_fake_dspy(self, predictor_cls, fn):
         original_dspy = sys.modules.get("dspy")
         fake_dspy = type(
@@ -219,6 +329,23 @@ class EvalContractTests(unittest.TestCase):
 
         self.assertEqual(score, 0.0)
         self.assertIn("AttributeError", info["error"])
+
+    def test_aime_solver_budget_exhaustion_propagates(self) -> None:
+        class BudgetedOutPredictor:
+            def __init__(self, _signature):
+                self.predict = type("Predict", (), {"signature": type("Sig", (), {"instructions": ""})()})()
+
+            def __call__(self, **_kwargs):
+                raise BudgetExhausted("solver budget exhausted")
+
+        with self.assertRaises(BudgetExhausted):
+            self._with_fake_dspy(
+                BudgetedOutPredictor,
+                lambda: aime_math.evaluate(
+                    "prompt",
+                    Example("aime", {"input": "problem", "solution": "solution"}, 7),
+                ),
+            )
 
 
 if __name__ == "__main__":

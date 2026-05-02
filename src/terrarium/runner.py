@@ -38,6 +38,7 @@ from terrarium.adapter import Adapter, Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.registry import get_task
+from terrarium.solver_lm import SolverBudgetExhausted
 from terrarium.task import Task
 from terrarium.tracking import TerrariumTracker, TrackingConfig
 
@@ -53,6 +54,7 @@ def run(
     max_concurrency: int = 8,
     tracking: TrackingConfig | None = None,
     output_dir: str | Path | None = None,
+    solver_cost_tracker: Any | None = None,
 ) -> Result:
     """Run an evolution system on a task.
 
@@ -111,9 +113,20 @@ def run(
 
     start = time.time()
 
+    stop_reason: str | None = None
     try:
         result = adapter.evolve(search_task, server)
+    except SolverBudgetExhausted as e:
+        stop_reason = "solver_budget_exhausted"
+        result = Result(
+            best_candidate=server.best_candidate,
+            best_score=server.best_score,
+            total_evals=budget.used,
+            eval_log=server.eval_log,
+            metadata={"stop_error": str(e)},
+        )
     except BudgetExhausted:
+        stop_reason = "budget_exhausted"
         result = Result(
             best_candidate=server.best_candidate,
             best_score=server.best_score,
@@ -128,7 +141,14 @@ def run(
     result.metadata["wall_time"] = time.time() - start
     result.metadata["budget"] = budget.status()
     adapter_cost = float(result.metadata.get("adapter_cost", 0.0))
-    result.metadata["total_cost"] = server.total_cost + adapter_cost
+    if stop_reason is not None:
+        result.metadata.setdefault("stop_reason", stop_reason)
+    solver_cost = _solver_cost(solver_cost_tracker)
+    result.metadata["eval_cost"] = server.total_cost
+    result.metadata["adapter_cost"] = adapter_cost
+    result.metadata["solver_cost"] = solver_cost
+    result.metadata["solver_cost_log"] = _solver_cost_log(solver_cost_tracker)
+    result.metadata["total_cost"] = server.total_cost + adapter_cost + solver_cost
     result.metadata["progress_log"] = server.progress_log
 
     # Hand the result back to the adapter for any artifact persistence
@@ -136,17 +156,26 @@ def run(
     if output_dir is not None:
         adapter.process_result(result, Path(output_dir))
 
-    # Evaluate best candidate on held-out test set (outside budget).
+    # Score the final submitted candidate on validation/test outside the search
+    # eval budget. This makes dataset-task summaries report aggregate candidate
+    # quality instead of the server's max individual-example score.
+    if official_task.val_set and result.best_candidate:
+        val_scores = _score_examples_unbudgeted(result, official_task, result.best_candidate, official_task.val_set, "val")
+        result.metadata["final_val_scores"] = val_scores
+        if not result.metadata.get("val_scoring_incomplete"):
+            result.metadata["final_val_score"] = sum(val_scores.values()) / len(val_scores) if val_scores else 0.0
+            result.best_score = result.metadata["final_val_score"]
+
+    # Evaluate final submitted candidate on held-out test set (outside budget).
     if official_task.test_set and result.best_candidate:
-        test_scores: dict[str, float] = {}
-        for ex in official_task.test_set:
-            try:
-                score, _ = official_task.eval_fn(result.best_candidate, ex)
-                test_scores[ex.id] = score
-            except Exception:
-                test_scores[ex.id] = 0.0
+        test_scores = _score_examples_unbudgeted(result, official_task, result.best_candidate, official_task.test_set, "test")
         result.metadata["test_scores"] = test_scores
         result.metadata["test_score"] = sum(test_scores.values()) / len(test_scores) if test_scores else 0.0
+
+    solver_cost = _solver_cost(solver_cost_tracker)
+    result.metadata["solver_cost"] = solver_cost
+    result.metadata["solver_cost_log"] = _solver_cost_log(solver_cost_tracker)
+    result.metadata["total_cost"] = server.total_cost + adapter_cost + solver_cost
 
     if tracker:
         tracker.log_summary({
@@ -158,6 +187,36 @@ def run(
         tracker.end()
 
     return result
+
+
+def _score_examples_unbudgeted(
+    result: Result,
+    task: Task,
+    candidate: str,
+    examples: list[Any],
+    split: str,
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for ex in examples:
+        try:
+            score, _ = task.eval_fn(candidate, ex)
+            scores[ex.id] = score
+        except BudgetExhausted as e:
+            result.metadata[f"{split}_scoring_incomplete"] = True
+            result.metadata[f"{split}_scoring_error"] = str(e)
+            break
+        except Exception:
+            scores[ex.id] = 0.0
+    return scores
+
+
+def _solver_cost(solver_cost_tracker: Any | None) -> float:
+    return float(getattr(solver_cost_tracker, "total_cost", 0.0) or 0.0)
+
+
+def _solver_cost_log(solver_cost_tracker: Any | None) -> list[dict[str, Any]] | None:
+    cost_log = getattr(solver_cost_tracker, "cost_log", None)
+    return list(cost_log) if cost_log is not None else None
 
 
 def _task_for_search(task: Task) -> Task:
@@ -338,15 +397,23 @@ def main(cfg: DictConfig) -> None:
         tracking.wandb_tags = [cfg.task.name]
 
     # Configure task-level solver LM (e.g. for aime_math's dspy evaluator).
+    solver_cost_tracker = None
     solver_lm = cfg.task.get('solver_lm')
     if solver_lm:
         import dspy
+        from terrarium.solver_lm import CostTrackedDSPyLM
+
         lm_kwargs = {}
         if cfg.task.get('solver_temperature') is not None:
             lm_kwargs['temperature'] = cfg.task.solver_temperature
         if cfg.task.get('solver_max_tokens') is not None:
             lm_kwargs['max_tokens'] = cfg.task.solver_max_tokens
-        dspy.configure(lm=dspy.LM(solver_lm, **lm_kwargs))
+        solver_cost_tracker = CostTrackedDSPyLM(
+            solver_lm,
+            max_cost=cfg.budget.get("max_solver_cost"),
+            **lm_kwargs,
+        )
+        dspy.configure(lm=solver_cost_tracker)
 
     result = run(
         cfg.task.name,
@@ -356,6 +423,7 @@ def main(cfg: DictConfig) -> None:
         max_concurrency=cfg.max_concurrency,
         tracking=tracking,
         output_dir=hydra_out,
+        solver_cost_tracker=solver_cost_tracker,
     )
 
     summary: dict[str, Any] = {
@@ -366,9 +434,15 @@ def main(cfg: DictConfig) -> None:
         "best_score": result.best_score,
         "total_evals": result.total_evals,
         "total_cost": result.metadata.get("total_cost", 0.0),
+        "eval_cost": result.metadata.get("eval_cost", 0.0),
+        "adapter_cost": result.metadata.get("adapter_cost", 0.0),
+        "solver_cost": result.metadata.get("solver_cost", 0.0),
+        "solver_cost_log": result.metadata.get("solver_cost_log"),
         "reflection_cost_log": result.metadata.get("reflection_cost_log"),
         "wall_time": result.metadata.get("wall_time"),
         "budget": result.metadata.get("budget"),
+        "final_val_score": result.metadata.get("final_val_score"),
+        "final_val_scores": result.metadata.get("final_val_scores"),
         "test_score": result.metadata.get("test_score"),
         "test_scores": result.metadata.get("test_scores"),
         "progress_log": result.metadata.get("progress_log"),

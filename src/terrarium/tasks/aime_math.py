@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from terrarium.budget import BudgetExhausted
 from terrarium.registry import register_task_factory
 from terrarium.task import Example, Task
 
@@ -79,6 +80,8 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
 
     try:
         prediction = predictor(input=example.inputs["input"])
+    except BudgetExhausted:
+        raise
     except Exception as e:
         return 0.0, {
             "score": 0.0,
