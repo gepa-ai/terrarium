@@ -388,7 +388,7 @@ class ClaudeCodeAdapter:
 
     def __init__(
         self,
-        model: str = "sonnet",
+        model: str = "claude-sonnet-4-6",
         max_turns: int | None = None,
         run_dir: str | None = None,
         effort: str | None = None,

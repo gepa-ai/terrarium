@@ -672,8 +672,12 @@ class MetaHarnessAdapter:
     """Meta-Harness evolution against a Terrarium task.
 
     Args:
-        model: Proposer model (``claude --model``). Defaults to ``opus`` to
-            match the paper runs. Override per experiment.
+        model: Proposer model (``claude --model``). Defaults to
+            ``"claude-sonnet-4-6"`` (versioned — pin for reproducibility).
+            Reference paper used Opus for the proposer; pass
+            ``model="claude-opus-4-7"`` (or the pinned Opus version) to
+            replicate. Aliases (``"sonnet"``/``"opus"``) track Anthropic's
+            current default.
         effort: ``claude --effort`` flag (``low|medium|high|max``). The
             Terrarium runner injects the top-level ``effort`` here when the
             user hasn't set it explicitly.
@@ -698,7 +702,7 @@ class MetaHarnessAdapter:
 
     def __init__(
         self,
-        model: str = "opus",
+        model: str = "claude-sonnet-4-6",
         effort: str | None = None,
         run_dir: str | None = None,
         max_iterations: int | None = None,

@@ -16,9 +16,11 @@
 
 _target_: terrarium.adapters.meta_harness.MetaHarnessAdapter
 
-# Proposer model. Reference paper uses Opus for the proposer; override per
-# experiment (e.g. ``adapter.model=sonnet`` for cheaper ablations).
-model: opus
+# Proposer model. Versioned for reproducibility — pass ``adapter.model=opus``
+# (or another alias) to track Anthropic's current default. Reference paper
+# used Opus for the proposer; pass ``adapter.model=claude-opus-4-7`` (or the
+# current pinned Opus version) to replicate.
+model: claude-sonnet-4-6
 
 # ``claude --effort low|medium|high|max``. Left null so the top-level
 # ``effort`` config can populate it. Set here to pin per-adapter.

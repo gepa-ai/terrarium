@@ -1,6 +1,6 @@
 # @package adapter
 _target_: terrarium.adapters.claude_code.ClaudeCodeAdapter
-model: sonnet
+model: claude-sonnet-4-6
 max_turns: null
 # Work dir for candidate/eval-script files. Runner injects
 # <hydra_run_dir>/claude_code/ when null. Set to keep artifacts elsewhere.
