@@ -1,0 +1,91 @@
+# @package adapter
+#
+# Omni adapter — dispatches to any registered ``gepa.omni`` backend
+# (``gepa`` / ``claude_code`` / ``meta_harness``) via a single ``backend`` knob,
+# or composes several into an ensemble via ``strategy`` + ``configs``.
+#
+# Single-backend usage (default):
+#
+#   python -m terrarium adapter=omni adapter.backend=gepa task=circle_packing
+#   python -m terrarium adapter=omni adapter.backend=meta_harness budget.max_evals=200
+#   python -m terrarium adapter=omni adapter.backend=claude_code adapter.config='{model: sonnet}'
+#
+# Backend-specific options go in the free-form ``config`` mapping. Each omni
+# backend's factory pops the keys it understands and warns about the rest, so
+# typos surface immediately:
+#
+#   adapter.config.reflection.reflection_lm=openai/gpt-5      # gepa backend
+#   adapter.config.engine.max_workers=32                      # gepa backend
+#   adapter.config.model=sonnet                               # claude_code backend
+#   adapter.config.max_iterations=10                          # meta_harness backend
+#
+# Ensemble usage — set ``strategy`` to one of ``sequential`` / ``parallel`` /
+# ``best_of`` / ``vote`` and provide ``configs`` (list of per-backend
+# overrides). Budget is pre-partitioned ``total // N`` per inner backend
+# (sequential shares one pool instead). Examples:
+#
+#   python -m terrarium adapter=omni adapter.strategy=best_of \\
+#     'adapter.configs=[{backend: gepa}, {backend: claude_code, config: {model: sonnet}}]' \\
+#     budget.max_evals=200
+#   python -m terrarium adapter=omni adapter.strategy=sequential \\
+#     'adapter.configs=[{backend: gepa}, {backend: meta_harness}]' budget.max_evals=400
+
+_target_: terrarium.adapters.omni.OmniAdapter
+
+# Backend selector for the single-backend path. String maps via the omni
+# registry; pass a constructed ``gepa.omni.Backend`` instance from Python
+# instead of yaml if needed. Ignored when ``strategy != single``.
+backend: gepa
+
+# Free-form, backend-specific options for the single-backend path.
+# Forwarded verbatim into ``OmniConfig.config``; each backend's factory
+# consumes its own keys. Ignored when ``strategy != single`` — use per-entry
+# ``config`` inside ``configs``.
+config: {}
+
+# Composition strategy. ``single`` (default) runs one backend (``backend`` /
+# ``config`` above). The rest compose multiple backends from ``configs``:
+#   - ``sequential`` — chain stages; each best seeds the next. One shared
+#     budget pool (per-config budgets ignored).
+#   - ``parallel``   — run N concurrently; budget partitioned ``total // N``.
+#   - ``best_of``    — parallel + select highest in-search ``best_score``.
+#   - ``vote``       — parallel + one re-score pass via terrarium's outer
+#     server, select highest re-score.
+strategy: single
+
+# List of per-backend overrides for ensemble strategies. Each entry may carry
+# ``backend``, ``config``, ``effort``, ``max_thinking_tokens``,
+# ``stop_at_score``, ``sandbox``, ``run_dir``. Required when ``strategy != single``.
+# Example: [{backend: gepa, config: {reflection: {reflection_lm: openai/gpt-5}}},
+#           {backend: claude_code, config: {model: sonnet}}]
+configs: []
+
+# Thread-pool size for parallel-family ensembles. Defaults to ``len(configs)``.
+max_workers: null
+
+# Workspace for omni's per-run artifacts (evals/, progress_log.jsonl,
+# summary.json, sessions/, …). Left null — runner injects
+# ``<hydra_run_dir>/omni/`` at run time.
+run_dir: null
+
+# Per-adapter token-cost cap. Usually null (use top-level
+# ``budget.max_token_cost`` instead). Set here only if you need a cap that
+# differs from the eval-server budget.
+max_token_cost: null
+
+# Whole-loop early-stop threshold. Runner threads top-level ``perfect_score``
+# here when null.
+stop_at_score: null
+
+# ``claude --effort low|medium|high|max`` for backends that spawn Claude Code.
+# Mutex with ``max_thinking_tokens``. Runner threads top-level ``effort``
+# here when null.
+effort: null
+
+# Fixed thinking-token budget. Mutex with ``effort``. Runner threads
+# top-level ``max_thinking_tokens`` here when null.
+max_thinking_tokens: null
+
+# Sandbox subprocess backends in bwrap (Linux) / Seatbelt (macOS). Runner
+# threads top-level ``sandbox`` here when null.
+sandbox: null
