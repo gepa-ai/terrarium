@@ -273,20 +273,16 @@ def main(cfg: DictConfig) -> None:
         adapter.run_dir = str(adapter_dir)
 
     # Thinking budget: ``max_thinking_tokens`` (fixed) and ``effort``
-    # (adaptive) are mutually exclusive. When both are provided,
-    # max_thinking_tokens wins and effort is ignored.
+    # (adaptive) are independent knobs — set neither, either, or both.
+    # When both are set, the adapter forwards both to the underlying tool;
+    # actual behavior is whatever the runtime (claude CLI / litellm) does
+    # when both are present.
     max_thinking_tokens = cfg.get("max_thinking_tokens")
     effort = cfg.get("effort")
     if max_thinking_tokens is not None:
-        if effort is not None:
-            print(
-                f"[terrarium] max_thinking_tokens={max_thinking_tokens} overrides "
-                f"effort={effort} — using fixed thinking budget."
-            )
-        else:
-            print(f"[terrarium] Fixed thinking budget: max_thinking_tokens={max_thinking_tokens}")
+        print(f"[terrarium] Fixed thinking budget: max_thinking_tokens={max_thinking_tokens}")
         _apply_max_thinking_tokens(adapter, max_thinking_tokens)
-    elif effort is not None:
+    if effort is not None:
         _apply_effort(adapter, effort)
 
     _apply_perfect_score(adapter, cfg.get("perfect_score"))

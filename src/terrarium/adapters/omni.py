@@ -85,10 +85,11 @@ class OmniAdapter:
         stop_at_score: Score threshold for early stop. Forwarded as
             ``OmniConfig.stop_at_score``.
         effort: ``claude --effort`` for backends that spawn Claude Code.
-            Mutex with ``max_thinking_tokens``. Runner threads top-level
-            ``effort`` here when null.
-        max_thinking_tokens: Fixed thinking-token budget. Mutex with ``effort``.
-            Runner threads top-level ``max_thinking_tokens`` here when null.
+            Independent of ``max_thinking_tokens`` — both can be set together.
+            Runner threads top-level ``effort`` here when null.
+        max_thinking_tokens: Fixed thinking-token budget. Independent of
+            ``effort`` (both can be set together). Runner threads top-level
+            ``max_thinking_tokens`` here when null.
         sandbox: Whether to wrap subprocess backends in bwrap/Seatbelt.
             Runner threads top-level ``sandbox`` here when null.
         callbacks: Optional GEPA callback list. Only consumed by ``gepa``
