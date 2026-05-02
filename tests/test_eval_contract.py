@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import unittest
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from terrarium.adapter import Adapter, Result
 from terrarium.adapters.omni import OmniAdapter
@@ -270,6 +274,64 @@ class EvalContractTests(unittest.TestCase):
         response = type("Response", (), {"cache_hit": True, "usage": {"total_tokens": 10}})()
 
         self.assertEqual(lm._completion_cost(response), 0.0)
+
+    def test_solver_cost_tracker_does_not_serialize_forward_calls(self) -> None:
+        lm = CostTrackedDSPyLM("openai/gpt-4.1-nano")
+        response = type("Response", (), {"cache_hit": False, "usage": {"total_tokens": 10}})()
+        entered = 0
+        entered_lock = threading.Lock()
+        all_entered = threading.Event()
+        release = threading.Event()
+
+        def slow_forward(*_args, **_kwargs):
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+                if entered == 3:
+                    all_entered.set()
+            release.wait(timeout=2)
+            return response
+
+        with (
+            patch("dspy.LM.forward", side_effect=slow_forward),
+            patch.object(lm, "_completion_cost", return_value=0.01),
+        ):
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(lm.forward, prompt="x") for _ in range(3)]
+                self.assertTrue(all_entered.wait(timeout=1.0))
+                release.set()
+                [future.result(timeout=1.0) for future in futures]
+
+        self.assertEqual(lm.total_calls, 3)
+        self.assertAlmostEqual(lm.total_cost, 0.03)
+
+    def test_solver_cost_tracker_serializes_forward_calls_with_hard_budget(self) -> None:
+        lm = CostTrackedDSPyLM("openai/gpt-4.1-nano", max_cost=1.0)
+        response = type("Response", (), {"cache_hit": False, "usage": {"total_tokens": 10}})()
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def slow_forward(*_args, **_kwargs):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with active_lock:
+                active -= 1
+            return response
+
+        with (
+            patch("dspy.LM.forward", side_effect=slow_forward),
+            patch.object(lm, "_completion_cost", return_value=0.01),
+        ):
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                list(executor.map(lambda _: lm.forward(prompt="x"), range(3)))
+
+        self.assertEqual(max_active, 1)
+        self.assertEqual(lm.total_calls, 3)
+        self.assertAlmostEqual(lm.total_cost, 0.03)
 
     def _with_fake_dspy(self, predictor_cls, fn):
         original_dspy = sys.modules.get("dspy")

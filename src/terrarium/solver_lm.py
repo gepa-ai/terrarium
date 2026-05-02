@@ -27,22 +27,36 @@ class CostTrackedDSPyLM(dspy.LM):
         self._lock = threading.Lock()
 
     def forward(self, prompt=None, messages=None, **kwargs):  # type: ignore[no-untyped-def]
+        if self.max_cost is not None:
+            with self._lock:
+                self._check_budget_locked()
+                response = super().forward(prompt=prompt, messages=messages, **kwargs)
+                cost = self._completion_cost(response)
+                self._record_cost_locked(response, cost)
+            return response
+
         with self._lock:
             self._check_budget_locked()
-            response = super().forward(prompt=prompt, messages=messages, **kwargs)
-            cost = self._completion_cost(response)
-            self.total_cost += cost
-            self.total_calls += 1
-            self.cost_log.append({
-                "call": self.total_calls,
-                "model": self.model,
-                "cost": cost,
-                "cumulative_cost": self.total_cost,
-                "cache_hit": bool(getattr(response, "cache_hit", False)),
-                "usage": dict(getattr(response, "usage", {}) or {}),
-            })
+
+        response = super().forward(prompt=prompt, messages=messages, **kwargs)
+        cost = self._completion_cost(response)
+
+        with self._lock:
+            self._record_cost_locked(response, cost)
             self._check_budget_locked()
         return response
+
+    def _record_cost_locked(self, response: Any, cost: float) -> None:
+        self.total_cost += cost
+        self.total_calls += 1
+        self.cost_log.append({
+            "call": self.total_calls,
+            "model": self.model,
+            "cost": cost,
+            "cumulative_cost": self.total_cost,
+            "cache_hit": bool(getattr(response, "cache_hit", False)),
+            "usage": dict(getattr(response, "usage", {}) or {}),
+        })
 
     def _check_budget(self) -> None:
         with self._lock:
