@@ -996,9 +996,12 @@ class MetaHarnessAdapter:
 
             bench_time = time.time() - bench_start
 
+            iter_status = (
+                f"iter {iteration} wall={_elapsed(time.time() - run_start)} "
+                f"propose={_elapsed(propose_time)} bench={_elapsed(bench_time)}"
+            )
             _log(
-                f"  {_dim(f'iter {iteration} wall={_elapsed(time.time() - run_start)} '
-                       f'propose={_elapsed(propose_time)} bench={_elapsed(bench_time)}')}"
+                f"  {_dim(iter_status)}"
                 + (f" {_green('IMPROVED')}" if iter_improved else "")
             )
 

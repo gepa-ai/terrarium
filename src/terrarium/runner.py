@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -85,16 +86,20 @@ def run(
     if isinstance(task, str):
         task = get_task(task)
 
+    official_task = task
+    _validate_task_contract(official_task)
+    search_task = _task_for_search(official_task)
+
     if isinstance(adapter, str):
         adapter = load_adapter(adapter)
 
     tracker = TerrariumTracker(tracking) if tracking else None
     budget = BudgetTracker(max_evals=max_evals, max_token_cost=max_token_cost)
-    server = EvalServer(task, budget, tracker=tracker, max_concurrency=max_concurrency, output_dir=output_dir)
+    server = EvalServer(search_task, budget, tracker=tracker, max_concurrency=max_concurrency, output_dir=output_dir)
     server.start()
 
     if tracker:
-        tracker.start({"task": task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
+        tracker.start({"task": official_task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
         # Inject GEPA-level callback for iteration/valset metrics. Both the
         # native GEPAAdapter and the OmniAdapter (when ``backend=gepa``)
         # surface a ``.callbacks`` list that flows into the GEPA engine.
@@ -107,7 +112,7 @@ def run(
     start = time.time()
 
     try:
-        result = adapter.evolve(task, server)
+        result = adapter.evolve(search_task, server)
     except BudgetExhausted:
         result = Result(
             best_candidate=server.best_candidate,
@@ -132,11 +137,11 @@ def run(
         adapter.process_result(result, Path(output_dir))
 
     # Evaluate best candidate on held-out test set (outside budget).
-    if isinstance(task, Task) and task.test_set and result.best_candidate:
+    if official_task.test_set and result.best_candidate:
         test_scores: dict[str, float] = {}
-        for ex in task.test_set:
+        for ex in official_task.test_set:
             try:
-                score, _ = task.eval_fn(result.best_candidate, ex)
+                score, _ = official_task.eval_fn(result.best_candidate, ex)
                 test_scores[ex.id] = score
             except Exception:
                 test_scores[ex.id] = 0.0
@@ -153,6 +158,40 @@ def run(
         tracker.end()
 
     return result
+
+
+def _task_for_search(task: Task) -> Task:
+    """Return the adapter-visible task with held-out test examples removed."""
+    if not task.test_set:
+        return task
+
+    metadata = dict(task.metadata)
+    metadata["heldout_test_size"] = len(task.test_set)
+    return replace(task, test_set=None, metadata=metadata)
+
+
+def _validate_task_contract(task: Task) -> None:
+    """Validate split ids before exposing a task to any adapter."""
+    seen: dict[str, str] = {}
+    for split_name, dataset in (
+        ("train", task.train_set),
+        ("val", task.val_set),
+        ("test", task.test_set),
+    ):
+        if not dataset:
+            continue
+        split_ids: set[str] = set()
+        for ex in dataset:
+            if not ex.id:
+                raise ValueError(f"{task.name}: {split_name} example has empty id")
+            if ex.id in split_ids:
+                raise ValueError(f"{task.name}: duplicate example id {ex.id!r} within {split_name}")
+            if ex.id in seen:
+                raise ValueError(
+                    f"{task.name}: example id {ex.id!r} appears in both {seen[ex.id]} and {split_name}"
+                )
+            split_ids.add(ex.id)
+            seen[ex.id] = split_name
 
 
 def load_adapter(path: str, **_: Any) -> Adapter:

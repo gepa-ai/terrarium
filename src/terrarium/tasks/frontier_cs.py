@@ -45,12 +45,9 @@ import os
 import shutil
 import subprocess
 import time
-import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-
-import requests
 
 _FRONTIER_CS_REPO_URL = "https://github.com/FrontierCS/Frontier-CS"
 _JUDGE_PORT = 8081
@@ -150,6 +147,8 @@ def _algorithmic_rows() -> dict[str, dict[str, Any]]:
 
 def _judge_is_alive() -> bool:
     """Check if the judge server is responding on the default port."""
+    import requests
+
     try:
         r = requests.get(f"{_JUDGE_URL}/problems", timeout=5)
         return r.status_code == 200
@@ -353,39 +352,8 @@ def _make_smoke_task() -> Task:
 
 
 def _register_all() -> None:
-    """Register the smoke task + one factory per algorithmic problem.
-
-    Registration is cheap: each factory captures just the problem_id. The HF
-    dataset isn't loaded until a factory is actually invoked (via get_task()),
-    and then it's loaded exactly once (cached).
-
-    If the ``datasets`` package isn't installed, we skip silently — the
-    Frontier-CS extra wasn't installed, and other terrarium tasks should still
-    work.
-    """
-    try:
-        from datasets import load_dataset  # noqa: F401
-    except ImportError:
-        return
-
-    try:
-        rows = _algorithmic_rows()
-    except Exception as e:  # pragma: no cover - network/HF hub issues
-        warnings.warn(
-            f"Could not load Frontier-CS problem list from HuggingFace: {e}. "
-            "Per-problem tasks (frontier_cs_algo_<id>) will not be registered. "
-            "Other terrarium tasks are unaffected.",
-            stacklevel=2,
-        )
-        return
-
+    """Register cheap Frontier-CS entry points without loading HuggingFace data."""
     register_task_factory("frontier_cs_algo_smoke", _make_smoke_task)
-    for pid in rows:
-        # Default-arg binding pins pid into each lambda's closure.
-        register_task_factory(
-            f"frontier_cs_algo_{pid}",
-            lambda p=pid: _make_problem_task(p),
-        )
 
 
 _register_all()

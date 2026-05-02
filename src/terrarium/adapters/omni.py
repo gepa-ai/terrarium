@@ -132,13 +132,10 @@ class OmniAdapter:
     def evolve(self, task: Task, server: EvalServer) -> Result:
         from gepa.omni import Task as OmniTask
 
-        # Translate terrarium Task → omni Task. Drop terrarium.test_set; the
-        # terrarium runner already runs a held-out test eval after evolve()
-        # via task.eval_fn directly. Map terrarium.val_set onto omni.test_set
-        # because omni's gepa backend currently reads task.test_set as gepa's
-        # ``valset`` (the in-search candidate-selection split — what terrarium
-        # calls val_set). When omni's gepa backend is updated to read val_set
-        # directly, drop the test_set= line.
+        # Translate terrarium Task → omni Task. The runner already stripped
+        # terrarium.test_set before calling this adapter; keep omni.test_set
+        # empty so the inner omni server cannot run a second held-out eval or
+        # expose validation examples as a fake test split.
         omni_task = OmniTask(
             name=task.name,
             initial_candidate=task.initial_candidate,
@@ -146,7 +143,7 @@ class OmniAdapter:
             background=task.background,
             train_set=task.train_set,
             val_set=task.val_set,
-            test_set=task.val_set,
+            test_set=None,
             metadata=dict(task.metadata),
         )
 

@@ -26,8 +26,7 @@ POST /evaluate_examples
     Status 429 when budget is insufficient to evaluate all requested examples.
 
     Val is reachable only via /validate (aggregate-only). Test is not
-    reachable from HTTP — only the in-process Python API can score on it,
-    which the runner uses for held-out reporting.
+    reachable from HTTP or the search-time Python API.
 
 GET /status
     Response: {"budget": {...}, "task": "<name>", "best_score": 1.23, "total_evals": 5, "total_cost": 0.42}
@@ -104,9 +103,10 @@ class EvalServer:
             self._evals_dir.mkdir(exist_ok=True)
         self._eval_semaphore = threading.Semaphore(max_concurrency)
 
-        # Build example lookup for dataset tasks
+        # Build example lookup for adapter-visible dataset tasks. The runner
+        # strips held-out test examples before constructing this server.
         self._examples: dict[str, Example] = {}
-        for dataset in [task.train_set, task.val_set, task.test_set]:
+        for dataset in [task.train_set, task.val_set]:
             if dataset:
                 for ex in dataset:
                     self._examples[ex.id] = ex
@@ -131,6 +131,7 @@ class EvalServer:
             self.budget.check()
 
             if example is not None:
+                self._validate_visible_example(example)
                 score, info = self.task.eval_fn(candidate, example)
             else:
                 score, info = self.task.eval_fn(candidate)
@@ -143,6 +144,13 @@ class EvalServer:
         finally:
             self._eval_semaphore.release()
 
+    def _validate_visible_example(self, example: Example) -> None:
+        """Reject direct evaluation of examples outside the server-visible task."""
+        if not self.task.has_dataset:
+            return
+        if example.id not in self._examples:
+            raise ValueError(f"Unknown or sealed example_id: {example.id!r}")
+
     def evaluate_examples(
         self,
         candidate: str,
@@ -153,7 +161,7 @@ class EvalServer:
 
         For single-task problems (no dataset), delegates to evaluate().
 
-        Provide either ``example_ids`` (explicit list) or ``split`` ("train"/"test"/"all").
+        Provide either ``example_ids`` (explicit list) or ``split`` ("train"/"val"/"all").
         If both are given, ``example_ids`` takes precedence.
 
         Returns:
@@ -170,33 +178,34 @@ class EvalServer:
                 "_budget": self.budget.status(),
             }
 
-        # Resolve examples
+        # Resolve examples. The search API can only see train/val examples.
+        # Empty or unknown explicit id lists are errors for dataset tasks; they
+        # should not silently fall back to single-task scoring.
         examples: list[Example] = []
         if example_ids is not None:
+            if not example_ids:
+                raise ValueError("example_ids must not be empty")
+            unknown_ids: list[str] = []
             for eid in example_ids:
                 if eid in self._examples:
                     examples.append(self._examples[eid])
+                else:
+                    unknown_ids.append(eid)
+            if unknown_ids:
+                raise ValueError(f"Unknown or sealed example_ids: {unknown_ids[:5]}")
         elif split is not None:
+            if split not in ("train", "val", "all"):
+                raise ValueError(f"split={split!r} is not available during search")
             if split in ("train", "all") and self.task.train_set:
                 examples.extend(self.task.train_set)
             if split in ("val", "all") and self.task.val_set:
                 examples.extend(self.task.val_set)
-            if split in ("test", "all") and self.task.test_set:
-                examples.extend(self.task.test_set)
         else:
             if self.task.train_set:
                 examples.extend(self.task.train_set)
 
         if not examples:
-            score, info = self.evaluate(candidate)
-            return score, {
-                "scores": {"_single": score},
-                "infos": {"_single": info},
-                "num_evaluated": 1,
-                "num_total": 1,
-                "partial": False,
-                "_budget": self.budget.status(),
-            }
+            raise ValueError("No examples matched the requested dataset split")
 
         if self.budget.remaining is not None and self.budget.remaining < len(examples):
             raise BudgetExhausted(
@@ -341,6 +350,7 @@ class EvalServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         self._pool.shutdown(wait=False)
 
@@ -475,9 +485,7 @@ class EvalServer:
             return
 
         # Lock the HTTP surface to train only. val is exposed via /validate
-        # (aggregate-only); test is not exposed at all. The Python API
-        # (evaluate_examples) is unchanged so the runner can still score on
-        # val/test directly for held-out reporting.
+        # (aggregate-only); test is not exposed at all.
         if split not in ("train", None):
             self._send_json(
                 handler,
@@ -486,6 +494,9 @@ class EvalServer:
             )
             return
         if example_ids is not None:
+            if not example_ids:
+                self._send_json(handler, {"error": "example_ids must not be empty"}, status=400)
+                return
             train_ids = self._train_ids()
             invalid = [eid for eid in example_ids if eid not in train_ids]
             if invalid:
@@ -559,7 +570,7 @@ class EvalServer:
             "has_dataset": self.task.has_dataset,
             "train_size": len(self.task.train_set) if self.task.train_set else 0,
             "val_size": len(self.task.val_set) if self.task.val_set else 0,
-            "test_size": len(self.task.test_set) if self.task.test_set else 0,
+            "test_size": 0,
             "metadata": {k: v for k, v in self.task.metadata.items() if isinstance(v, (str, int, float, bool))},
         })
 
