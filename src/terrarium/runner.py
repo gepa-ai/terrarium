@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -160,7 +161,14 @@ def run(
     # eval budget. This makes dataset-task summaries report aggregate candidate
     # quality instead of the server's max individual-example score.
     if official_task.val_set and result.best_candidate:
-        val_scores = _score_examples_unbudgeted(result, official_task, result.best_candidate, official_task.val_set, "val")
+        val_scores = _score_examples_unbudgeted(
+            result,
+            official_task,
+            result.best_candidate,
+            official_task.val_set,
+            "val",
+            max_concurrency,
+        )
         result.metadata["final_val_scores"] = val_scores
         if not result.metadata.get("val_scoring_incomplete"):
             result.metadata["final_val_score"] = sum(val_scores.values()) / len(val_scores) if val_scores else 0.0
@@ -168,9 +176,17 @@ def run(
 
     # Evaluate final submitted candidate on held-out test set (outside budget).
     if official_task.test_set and result.best_candidate:
-        test_scores = _score_examples_unbudgeted(result, official_task, result.best_candidate, official_task.test_set, "test")
+        test_scores = _score_examples_unbudgeted(
+            result,
+            official_task,
+            result.best_candidate,
+            official_task.test_set,
+            "test",
+            max_concurrency,
+        )
         result.metadata["test_scores"] = test_scores
-        result.metadata["test_score"] = sum(test_scores.values()) / len(test_scores) if test_scores else 0.0
+        if not result.metadata.get("test_scoring_incomplete"):
+            result.metadata["test_score"] = sum(test_scores.values()) / len(test_scores) if test_scores else 0.0
 
     solver_cost = _solver_cost(solver_cost_tracker)
     result.metadata["solver_cost"] = solver_cost
@@ -195,19 +211,57 @@ def _score_examples_unbudgeted(
     candidate: str,
     examples: list[Any],
     split: str,
+    max_concurrency: int = 8,
 ) -> dict[str, float]:
     scores: dict[str, float] = {}
-    for ex in examples:
+    if not examples:
+        return scores
+
+    max_workers = max(1, min(max_concurrency, len(examples)))
+
+    def score_example(ex: Any) -> tuple[str, float]:
         try:
             score, _ = task.eval_fn(candidate, ex)
-            scores[ex.id] = score
-        except BudgetExhausted as e:
-            result.metadata[f"{split}_scoring_incomplete"] = True
-            result.metadata[f"{split}_scoring_error"] = str(e)
-            break
+            return ex.id, score
+        except BudgetExhausted:
+            raise
         except Exception:
-            scores[ex.id] = 0.0
+            return ex.id, 0.0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        pending = iter(examples)
+        futures = {executor.submit(score_example, ex): ex for ex in _take(pending, max_workers)}
+
+        while futures:
+            for future in as_completed(futures):
+                break
+            futures.pop(future)
+            try:
+                example_id, score = future.result()
+            except BudgetExhausted as e:
+                result.metadata[f"{split}_scoring_incomplete"] = True
+                result.metadata[f"{split}_scoring_error"] = str(e)
+                for pending_future in futures:
+                    pending_future.cancel()
+                break
+            scores[example_id] = score
+
+            try:
+                ex = next(pending)
+            except StopIteration:
+                continue
+            futures[executor.submit(score_example, ex)] = ex
     return scores
+
+
+def _take(items: Any, limit: int) -> list[Any]:
+    taken = []
+    for _ in range(limit):
+        try:
+            taken.append(next(items))
+        except StopIteration:
+            break
+    return taken
 
 
 def _solver_cost(solver_cost_tracker: Any | None) -> float:

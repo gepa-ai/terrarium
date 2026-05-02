@@ -141,6 +141,39 @@ class EvalContractTests(unittest.TestCase):
         self.assertTrue(result.metadata["val_scoring_incomplete"])
         self.assertNotIn("final_val_score", result.metadata)
 
+    def test_final_scoring_uses_run_concurrency_limit(self) -> None:
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def eval_fn(candidate: str, example: Example) -> tuple[float, dict]:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return (1.0 if candidate == example.expected else 0.0), {}
+
+        task = Task(
+            name="final_concurrency",
+            initial_candidate="seed",
+            eval_fn=eval_fn,
+            train_set=[Example("train-1", {}, "candidate")],
+            val_set=[Example(f"val-{i}", {}, "candidate") for i in range(4)],
+        )
+
+        class CandidateAdapter(Adapter):
+            def evolve(self, task: Task, server: EvalServer) -> Result:
+                return Result("candidate", 0.0, server.budget.used, server.eval_log)
+
+        result = run(task, CandidateAdapter(), max_evals=1, max_concurrency=2)
+
+        self.assertEqual(result.metadata["final_val_score"], 1.0)
+        self.assertLessEqual(max_active, 2)
+        self.assertGreaterEqual(max_active, 2)
+
     def test_runner_includes_solver_cost_in_total_cost(self) -> None:
         class SolverCostTracker:
             total_cost = 0.25
