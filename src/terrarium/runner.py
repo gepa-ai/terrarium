@@ -95,10 +95,13 @@ def run(
 
     if tracker:
         tracker.start({"task": task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
-        # Inject GEPA-level callback for iteration/valset metrics
+        # Inject GEPA-level callback for iteration/valset metrics. Both the
+        # native GEPAAdapter and the OmniAdapter (when ``backend=gepa``)
+        # surface a ``.callbacks`` list that flows into the GEPA engine.
         from terrarium.adapters.gepa import GEPAAdapter
+        from terrarium.adapters.omni import OmniAdapter
 
-        if isinstance(adapter, GEPAAdapter):
+        if isinstance(adapter, GEPAAdapter | OmniAdapter):
             adapter.callbacks.append(tracker.create_callback())
 
     start = time.time()
