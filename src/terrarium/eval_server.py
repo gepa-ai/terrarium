@@ -86,6 +86,11 @@ class EvalServer:
         self.max_concurrency = max_concurrency
         self.best_score: float = float("-inf")
         self.best_candidate: str = task.initial_candidate
+        self.best_visible_score: float = float("-inf")
+        self.best_visible_candidate: str = task.initial_candidate
+        self.best_visible_source: str | None = None
+        self.best_validated_score: float = float("-inf")
+        self.best_validated_candidate: str | None = None
         self.total_cost: float = 0.0
         self.eval_log: list[dict[str, Any]] = []
         self._start_time: float = time.time()
@@ -104,9 +109,10 @@ class EvalServer:
             self._evals_dir.mkdir(exist_ok=True)
         self._eval_semaphore = threading.Semaphore(max_concurrency)
 
-        # Build example lookup for dataset tasks
+        # Build public example lookup for dataset tasks. Hidden test examples
+        # are evaluated only by the runner after search.
         self._examples: dict[str, Example] = {}
-        for dataset in [task.train_set, task.val_set, task.test_set]:
+        for dataset in [task.train_set, task.val_set]:
             if dataset:
                 for ex in dataset:
                     self._examples[ex.id] = ex
@@ -153,7 +159,7 @@ class EvalServer:
 
         For single-task problems (no dataset), delegates to evaluate().
 
-        Provide either ``example_ids`` (explicit list) or ``split`` ("train"/"test"/"all").
+        Provide either ``example_ids`` (explicit list) or ``split`` ("train"/"val"/"all").
         If both are given, ``example_ids`` takes precedence.
 
         Returns:
@@ -173,30 +179,34 @@ class EvalServer:
         # Resolve examples
         examples: list[Example] = []
         if example_ids is not None:
+            if not example_ids:
+                raise ValueError("example_ids must not be empty")
+            unknown_ids: list[str] = []
             for eid in example_ids:
                 if eid in self._examples:
                     examples.append(self._examples[eid])
+                else:
+                    unknown_ids.append(eid)
+            if unknown_ids:
+                preview = ", ".join(unknown_ids[:5])
+                raise ValueError(f"Unknown or hidden example IDs: {preview}")
         elif split is not None:
+            if split == "test":
+                raise ValueError("test split is hidden during search")
+            if split not in ("train", "val", "all"):
+                raise ValueError("split must be one of: train, val, all")
             if split in ("train", "all") and self.task.train_set:
                 examples.extend(self.task.train_set)
             if split in ("val", "all") and self.task.val_set:
                 examples.extend(self.task.val_set)
-            if split in ("test", "all") and self.task.test_set:
-                examples.extend(self.task.test_set)
         else:
             if self.task.train_set:
                 examples.extend(self.task.train_set)
 
         if not examples:
-            score, info = self.evaluate(candidate)
-            return score, {
-                "scores": {"_single": score},
-                "infos": {"_single": info},
-                "num_evaluated": 1,
-                "num_total": 1,
-                "partial": False,
-                "_budget": self.budget.status(),
-            }
+            if split in ("train", "val"):
+                raise ValueError(f"{split} split is not available during search")
+            raise ValueError("No visible examples are available during search")
 
         if self.budget.remaining is not None and self.budget.remaining < len(examples):
             raise BudgetExhausted(
@@ -236,18 +246,39 @@ class EvalServer:
         if errors:
             info["errors"] = errors
 
+        if example_ids is None and split in ("train", "all"):
+            self.record_visible_candidate(avg, candidate, source=f"{split}_aggregate")
+
         return avg, info
 
 
     def validate(self, candidate: str) -> dict[str, Any]:
-        """Evaluate candidate on the full hidden val_set, return aggregate score only."""
+        """Evaluate candidate on the full visible val_set, return aggregate score only."""
         if not self.task.val_set:
             raise ValueError("validate() requires a task with val_set")
 
         val_ids = [ex.id for ex in self.task.val_set]
         avg_score, _ = self.evaluate_examples(candidate, example_ids=val_ids)
+        self.record_visible_candidate(avg_score, candidate, source="validation")
 
         return self.log_progress(avg_score, candidate=candidate)
+
+    def record_visible_candidate(self, score: float, candidate: str, *, source: str) -> None:
+        """Track the best aggregate visible-data candidate.
+
+        Per-example evals update ``best_candidate`` for debugging, but benchmark
+        submission for dataset tasks should use aggregate train/validation
+        selection. This method is the shared bookkeeping path for full train
+        aggregate and validation aggregate scores.
+        """
+        with self._lock:
+            if score > self.best_visible_score:
+                self.best_visible_score = float(score)
+                self.best_visible_candidate = candidate
+                self.best_visible_source = source
+            if source == "validation" and score > self.best_validated_score:
+                self.best_validated_score = float(score)
+                self.best_validated_candidate = candidate
 
     def log_progress(self, val_score: float, candidate: str | None = None, reflection_cost: float = 0.0) -> dict[str, Any]:
         """Record a progress checkpoint."""
@@ -341,7 +372,11 @@ class EvalServer:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
+            if self._thread:
+                self._thread.join(timeout=1)
             self._server = None
+            self._thread = None
         self._pool.shutdown(wait=False)
 
     # ── Internal ────────────────────────────────────────────────────────
@@ -377,6 +412,9 @@ class EvalServer:
         """Capture current run state. Must be called inside ``_lock``."""
         return {
             "best_score": self.best_score,
+            "best_visible_score": self.best_visible_score,
+            "best_visible_source": self.best_visible_source,
+            "best_validated_score": self.best_validated_score,
             "total_evals": self.budget.used,
             "total_cost": self.total_cost,
             "budget": self.budget.status(),
@@ -459,6 +497,9 @@ class EvalServer:
         except BudgetExhausted:
             self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
 
+        except ValueError as e:
+            self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=400)
+
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
 
@@ -514,6 +555,9 @@ class EvalServer:
         except BudgetExhausted:
             self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
 
+        except ValueError as e:
+            self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=400)
+
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
 
@@ -546,6 +590,9 @@ class EvalServer:
             "budget": self.budget.status(),
             "task": self.task.name,
             "best_score": self.best_score,
+            "best_visible_score": self.best_visible_score,
+            "best_visible_source": self.best_visible_source,
+            "best_validated_score": self.best_validated_score,
             "total_evals": self.budget.used,
             "total_cost": self.total_cost,
         })

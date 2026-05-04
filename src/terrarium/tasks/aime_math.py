@@ -64,9 +64,18 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         input = dspy.InputField(desc="The math problem to solve.")
         answer = dspy.OutputField(desc="The final numerical answer.")
 
+    lm = getattr(dspy.settings, "lm", None)
+    history_before = len(getattr(lm, "history", []) or []) if lm is not None else 0
+
     predictor = dspy.ChainOfThought(MathSolverSignature)
     predictor.predict.signature.instructions = candidate
     prediction = predictor(input=example.inputs["input"])
+    history_after = getattr(lm, "history", []) or [] if lm is not None else []
+    new_history = history_after[history_before:]
+    solver_cost = sum(float(entry.get("cost", 0.0) or 0.0) for entry in new_history if isinstance(entry, dict))
+    solver_model = None
+    if new_history and isinstance(new_history[-1], dict):
+        solver_model = new_history[-1].get("model") or new_history[-1].get("response_model")
 
     correct_answer = int(example.expected)
     written_solution = example.inputs.get("solution", "")
@@ -94,6 +103,8 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
             "prompt": candidate,
             "output": prediction.answer,
             "feedback": feedback,
+            "cost": solver_cost,
+            "solver_model": solver_model,
         }
 
     score = float(correct_answer == llm_answer)
@@ -106,6 +117,8 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         "output": prediction.answer,
         "reasoning": getattr(prediction, "reasoning", ""),
         "feedback": feedback,
+        "cost": solver_cost,
+        "solver_model": solver_model,
     }
 
 
@@ -124,6 +137,16 @@ def _make_task() -> Task:
         metadata={
             "type": "generalization",
             "candidate_type": "prompt",
+            "split_provenance": {
+                "source_dataset": "AI-MO/aimo-validation-aime and MathArena/aime_2025",
+                "split_method": "shuffle_aimo_validation_aime_seed_0_half_train_half_val; MathArena/aime_2025_as_test",
+                "split_seed": 0,
+                "split_sizes": {
+                    "train": len(train_set),
+                    "val": len(val_set),
+                    "test": len(test_set),
+                },
+            },
         },
     )
 

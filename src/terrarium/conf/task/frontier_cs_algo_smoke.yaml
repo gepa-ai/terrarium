@@ -6,3 +6,4 @@
 # For a specific problem, override the name directly:
 #   python -m terrarium task.name=frontier_cs_algo_107 adapter=gepa
 name: frontier_cs_algo_smoke
+mode: multi_task

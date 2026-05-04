@@ -27,11 +27,13 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetTracker
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args, prepare_claude_home
 from terrarium.task import Task
 
 if TYPE_CHECKING:
     from terrarium.eval_server import EvalServer
+
+_RALPH_SAFETY_ITERATION_CAP = 1000
 
 
 # Single-task eval script: one POST per call, returns one score.
@@ -67,7 +69,7 @@ fi
 # Dataset eval script: full-split eval or specific example IDs.
 # Usage:
 #   ./eval.sh <candidate_file>                     → eval on train split (default)
-#   ./eval.sh <candidate_file> test                → eval on test split
+#   ./eval.sh <candidate_file> val                 → eval on visible val split
 #   ./eval.sh <candidate_file> --ids id1,id2,id3   → eval on specific examples
 EVAL_SCRIPT_DATASET = """\
 #!/usr/bin/env bash
@@ -122,8 +124,8 @@ fi
 VALIDATE_SCRIPT = """\
 #!/usr/bin/env bash
 # Usage: ./validate.sh <candidate_file>
-# Evaluates the candidate on the held-out validation set.
-# Returns aggregate val_score only (individual scores hidden).
+# Evaluates the candidate on the validation set.
+# Returns aggregate val_score.
 # Exit code 1 if budget exhausted.
 set -euo pipefail
 
@@ -184,6 +186,19 @@ Training examples are in `train/` as individual JSON files.
 ./eval.sh candidate.txt --ids example_0,example_1,example_2
 ```{cost_line}{val_section}"""
 
+_EVAL_MULTI_TASK = """\
+## Evaluation
+This is a **multi-task search** benchmark with {train_size} visible examples.
+Examples are in `train/` as individual JSON files.
+
+```bash
+# Evaluate on all visible examples
+./eval.sh candidate.txt
+
+# Evaluate on specific examples
+./eval.sh candidate.txt --ids example_0,example_1,example_2
+```{cost_line}{val_section}"""
+
 _EVAL_SINGLE = """\
 ## Evaluation
 This is a **single-task** optimization.
@@ -193,12 +208,27 @@ This is a **single-task** optimization.
 
 _VAL_SECTION = """
 ### Validation
-There is a hidden validation set ({val_size} examples).
-You cannot see individual val examples or their scores.
+There is a validation set ({val_size} examples) available during search.
 ```bash
 ./validate.sh candidate.txt
 ```
-Returns only the aggregate val_score.{val_cost}"""
+Returns the aggregate val_score.{val_cost} Validation examples are in `val/`."""
+
+_VISIBLE_VAL_SECTION = """
+### Validation
+This task also exposes a visible validation command over {val_size} examples.
+```bash
+./validate.sh candidate.txt
+```
+Returns the aggregate val_score.{val_cost}"""
+
+
+def _example_preview(ex: Any) -> dict[str, Any]:
+    inputs = dict(getattr(ex, "inputs", {}) or {})
+    data: dict[str, Any] = {"id": ex.id, "inputs": inputs}
+    if ex.expected is not None:
+        data["expected"] = ex.expected
+    return data
 
 
 def _budget_section(budget: BudgetTracker) -> str:
@@ -276,13 +306,12 @@ def _perfect_score_section(perfect_score: float | None) -> str:
 
 def _rules_section(task: Task, budget: BudgetTracker) -> str:
     scripts = "eval.sh, validate.sh" if task.val_set else "eval.sh"
-    val_rule = "\n- You cannot see the validation examples." if task.val_set else ""
     exhaust_rule = (
         "\n- When the budget is exhausted, scripts return BUDGET_EXHAUSTED."
         if budget.max_evals is not None else ""
     )
     return (
-        f"- You cannot modify {scripts} or the server.{val_rule}\n"
+        f"- You cannot modify {scripts} or the server.\n"
         f"- Focus on meaningful improvements each iteration.{exhaust_rule}"
     )
 
@@ -312,10 +341,18 @@ def build_program_md(task: Task, budget: BudgetTracker, *, perfect_score: float 
             val_cost = f" Costs {val_size} budget units." if has_eval_budget else ""
             # Prepend a newline so the validation block is separated from whatever
             # came before (cost line in eval-budget mode, closing fence otherwise).
-            val_section = "\n" + _VAL_SECTION.format(val_size=val_size, val_cost=val_cost)
+            val_template = (
+                _VISIBLE_VAL_SECTION
+                if task.metadata.get("type") == "multi_task" else _VAL_SECTION
+            )
+            val_section = "\n" + val_template.format(val_size=val_size, val_cost=val_cost)
         else:
             val_section = ""
-        eval_section = _EVAL_GENERALIZATION.format(
+        eval_template = (
+            _EVAL_MULTI_TASK
+            if task.metadata.get("type") == "multi_task" else _EVAL_GENERALIZATION
+        )
+        eval_section = eval_template.format(
             train_size=train_size, cost_line=cost_line, val_section=val_section,
         )
     else:
@@ -346,7 +383,8 @@ def materialize_sandbox(
     """Set up the agent's sandbox workspace.
 
     Layout: ``program.md``, ``candidate.txt``, ``best_candidate.txt``,
-    ``eval.sh``, ``validate.sh`` (val_set only), ``train/<id>.json`` (dataset).
+    ``eval.sh``, ``validate.sh`` (val_set only), ``train/<id>.json`` and
+    ``val/<id>.json`` for visible dataset splits.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -368,10 +406,19 @@ def materialize_sandbox(
         train_dir = work_dir / "train"
         train_dir.mkdir(exist_ok=True)
         for ex in task.train_set:
-            data = {"id": ex.id, "inputs": ex.inputs}
-            if ex.expected is not None:
-                data["expected"] = ex.expected
-            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            (train_dir / f"{ex.id}.json").write_text(json.dumps(
+                _example_preview(ex),
+                indent=2,
+            ))
+
+    if task.val_set:
+        val_dir = work_dir / "val"
+        val_dir.mkdir(exist_ok=True)
+        for ex in task.val_set:
+            (val_dir / f"{ex.id}.json").write_text(json.dumps(
+                _example_preview(ex),
+                indent=2,
+            ))
 
 
 
@@ -395,9 +442,15 @@ class ClaudeCodeAdapter:
         stop_at_score: float | None = None,
         max_thinking_tokens: int | None = None,
         sandbox: bool | None = None,
+        ralph: bool = True,
     ) -> None:
+        if max_turns is not None:
+            raise ValueError(
+                "ClaudeCodeAdapter.max_turns is not supported by the installed "
+                "Claude Code CLI; no --max-turns flag is available. Use eval "
+                "and token budgets to bound runs."
+            )
         self.model = model
-        self.max_turns = max_turns
         self.stop_at_score = stop_at_score
         # When set, artifacts (candidate.txt, eval.sh, best_candidate.txt,
         # plus anything Claude writes) persist under this dir. Otherwise a
@@ -412,6 +465,10 @@ class ClaudeCodeAdapter:
         # bubblewrap/Seatbelt + file-tool deny rules). None = take the
         # top-level ``sandbox:`` default from the runner.
         self.sandbox = sandbox
+        # Ralph loop: when claude exits before the LLM/eval budget is out,
+        # resume the session with ``--resume <session_id>`` and keep
+        # iterating. Enabled by default; budgets are the stopping condition.
+        self.ralph = ralph
         # Tempdir whose lifetime spans evolve → process_result, so the
         # adapter's workspace is still readable when process_result runs.
         # Cleaned up by process_result; on an evolve error we let
@@ -466,57 +523,179 @@ class ClaudeCodeAdapter:
         # ``--disallowedTools`` is variadic; pass with ``=`` so it doesn't
         # swallow the trailing positional prompt.
         session_id = str(uuid.uuid4())
-        # bwrap (when sandboxed) scopes writes to work_dir; network is
-        # shared so eval.sh / validate.sh can curl the local eval server
-        # (and claude can reach api.anthropic.com). WebFetch/WebSearch
-        # denied at the tool layer; bypassPermissions gives full file/Bash
-        # access inside the jail.
-        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
-        cmd += [
-            "claude",
-            "--print",
-            "--output-format", "json",
-            "--model", self.model,
-            "--session-id", session_id,
-            "--permission-mode", "bypassPermissions",
-            DENY_WEB_TOOLS,
-        ]
-        if self.sandbox:
-            cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
-        if self.max_thinking_tokens is None and self.effort is not None:
-            cmd.extend(["--effort", self.effort])
-        if budget.max_token_cost is not None:
-            cmd.extend(["--max-budget-usd", str(budget.max_token_cost)])
-        cmd.append(prompt)
+        claude_home = prepare_claude_home(work_dir) if self.sandbox else None
 
         env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+        if claude_home is not None:
+            env["HOME"] = str(claude_home)
         if self.max_thinking_tokens is not None:
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
             env["MAX_THINKING_TOKENS"] = str(self.max_thinking_tokens)
 
         adapter_cost = 0.0
-        proc = subprocess.run(
+        ralph_iterations = 1
+        proc = self._run_claude(
+            work_dir=work_dir,
+            session_id=session_id,
+            prompt=prompt,
+            budget=budget,
+            adapter_cost=adapter_cost,
+            resume=False,
+            env=env,
+            claude_home=claude_home,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "Claude Code subprocess failed "
+                f"(exit {proc.returncode}). "
+                f"stdout_tail={_tail_text(proc.stdout)!r} "
+                f"stderr_tail={_tail_text(proc.stderr)!r}"
+            )
+        if server.budget.used == 0:
+            raise RuntimeError(
+                "Claude Code subprocess completed without calling the Terrarium "
+                "eval server. The run is not a valid optimizer smoke."
+            )
+        adapter_cost += _extract_claude_cost(proc.stdout)
+
+        if self.ralph:
+            # Resume the same session until the budget is out or claude
+            # signals it's done by erroring. Each iteration's
+            # --max-budget-usd is the *remaining* LLM budget so the
+            # final iteration self-caps inside the CLI.
+            continue_prompt = (
+                "Continue iterating on the candidate. Re-read program.md if needed. "
+                + (
+                    "Run ./eval.sh and ./validate.sh as appropriate. "
+                    if task.val_set
+                    else "Run ./eval.sh as appropriate. "
+                )
+                + "Keep refining best_candidate.txt until you exhaust the budget "
+                "or genuinely cannot find another improvement."
+            )
+            while ralph_iterations < _RALPH_SAFETY_ITERATION_CAP:
+                if not self._has_budget_headroom(server, adapter_cost):
+                    break
+                if proc.returncode != 0:
+                    break  # claude errored — don't retry blindly
+                proc = self._run_claude(
+                    work_dir=work_dir,
+                    session_id=session_id,
+                    prompt=continue_prompt,
+                    budget=budget,
+                    adapter_cost=adapter_cost,
+                    resume=True,
+                    env=env,
+                    claude_home=claude_home,
+                )
+                if proc.returncode != 0:
+                    break  # claude errored — don't retry blindly
+                iter_cost = _extract_claude_cost(proc.stdout)
+                adapter_cost += iter_cost
+                ralph_iterations += 1
+                # Defensive: if claude returns success but spent ~$0, it's
+                # likely declining to continue. Stop to avoid a busy loop.
+                if proc.returncode == 0 and iter_cost < 0.001:
+                    break
+
+        submitted_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
+        selection_source = "best_candidate.txt"
+        best_candidate = submitted_candidate
+        best_score = server.best_score
+        if task.val_set and server.best_validated_candidate is not None:
+            best_candidate = server.best_validated_candidate
+            best_score = server.best_validated_score
+            selection_source = "best_validated_candidate"
+        elif task.has_dataset and server.best_visible_source is not None:
+            best_candidate = server.best_visible_candidate
+            best_score = server.best_visible_score
+            selection_source = server.best_visible_source
+        elif server.budget.used > 0:
+            best_candidate = server.best_candidate
+            selection_source = "best_observed_eval"
+
+        return Result(
+            best_candidate=best_candidate,
+            best_score=best_score,
+            total_evals=server.budget.used,
+            eval_log=server.eval_log,
+            metadata={
+                "adapter_cost": adapter_cost,
+                "submitted_candidate_source": selection_source,
+                "best_candidate_txt": submitted_candidate,
+                "session_id": session_id,
+                "work_dir": str(work_dir),
+                "claude_home": str(claude_home) if claude_home is not None else None,
+                "ralph_iterations": ralph_iterations,
+            },
+        )
+
+    def _run_claude(
+        self,
+        *,
+        work_dir: Path,
+        session_id: str,
+        prompt: str,
+        budget: BudgetTracker,
+        adapter_cost: float,
+        resume: bool,
+        env: dict[str, str],
+        claude_home: Path | None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Invoke ``claude --print`` once. ``resume=True`` continues the pinned
+        session via ``--resume <session_id>`` instead of starting a new one.
+        ``--max-budget-usd`` is set to the *remaining* LLM budget so successive
+        iterations don't stack the cap.
+        """
+        # bwrap (when sandboxed) scopes writes to work_dir; network is
+        # shared so eval.sh / validate.sh can curl the local eval server
+        # (and claude can reach api.anthropic.com). WebFetch/WebSearch
+        # denied at the tool layer; bypassPermissions gives full file/Bash
+        # access inside the jail.
+        cmd: list[str] = bwrap_prefix(work_dir, claude_home=claude_home) if self.sandbox else []
+        cmd += [
+            "claude",
+            "--print",
+            "--output-format", "json",
+            "--model", self.model,
+        ]
+        if resume:
+            cmd.extend(["--resume", session_id])
+        else:
+            cmd.extend(["--session-id", session_id])
+        cmd.extend([
+            "--permission-mode", "bypassPermissions",
+            DENY_WEB_TOOLS,
+        ])
+        if self.sandbox:
+            cmd.extend(claude_settings_args(work_dir))  # macOS Seatbelt fallback
+        if self.max_thinking_tokens is None and self.effort is not None:
+            cmd.extend(["--effort", self.effort])
+        if budget.max_token_cost is not None:
+            remaining = max(0.0, budget.max_token_cost - adapter_cost)
+            cmd.extend(["--max-budget-usd", f"{remaining:.6f}"])
+        cmd.append(prompt)
+
+        return subprocess.run(
             cmd,
             cwd=str(work_dir),
             env=env,
             capture_output=True,
             text=True,
         )
-        adapter_cost = _extract_claude_cost(proc.stdout)
 
-        best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
-
-        return Result(
-            best_candidate=best_candidate,
-            best_score=server.best_score,
-            total_evals=server.budget.used,
-            eval_log=server.eval_log,
-            metadata={
-                "adapter_cost": adapter_cost,
-                "session_id": session_id,
-                "work_dir": str(work_dir),
-            },
-        )
+    def _has_budget_headroom(self, server: EvalServer, adapter_cost: float) -> bool:
+        """Whether starting another Ralph iteration is worthwhile. Stops if the
+        eval-count budget is exhausted, or if the LLM budget has < $0.05 left
+        (no point spawning a CLI for pennies).
+        """
+        budget = server.budget
+        if budget.exhausted:
+            return False
+        if budget.max_token_cost is not None:
+            if adapter_cost >= budget.max_token_cost - 0.05:
+                return False
+        return True
 
     def process_result(self, result: Result, output_dir: Path) -> None:
         """Copy the session transcript and (when work dir lives outside
@@ -525,9 +704,15 @@ class ClaudeCodeAdapter:
         """
         work_dir = Path(result.metadata["work_dir"])
         session_id = result.metadata["session_id"]
-        _copy_session_transcript(work_dir, session_id, output_dir / "sessions")
+        claude_home = Path(result.metadata["claude_home"]) if result.metadata.get("claude_home") else None
+        _copy_session_transcript(work_dir, session_id, output_dir / "sessions", claude_home=claude_home)
         if not _is_under(work_dir, output_dir):
-            shutil.copytree(work_dir, output_dir / "work", dirs_exist_ok=True)
+            shutil.copytree(
+                work_dir,
+                output_dir / "work",
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(".terrarium_claude_home"),
+            )
         if self._pending_tempdir is not None:
             self._pending_tempdir.cleanup()
             self._pending_tempdir = None
@@ -549,13 +734,20 @@ def _claude_project_slug(cwd: Path) -> str:
     return _SLUG_RE.sub("-", str(cwd.resolve()))
 
 
-def _copy_session_transcript(cwd: Path, session_id: str, dst_dir: Path) -> None:
+def _copy_session_transcript(
+    cwd: Path,
+    session_id: str,
+    dst_dir: Path,
+    *,
+    claude_home: Path | None = None,
+) -> None:
     """Copy the transcript for ``session_id`` (passed to ``claude --session-id``)
     into ``dst_dir``. Because we pinned the UUID at launch, there is no
     ambiguity about which file belongs to this run — concurrent processes get
     distinct UUIDs.
     """
-    src = Path.home() / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
+    home = claude_home or Path.home()
+    src = home / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
     if not src.exists():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -585,6 +777,13 @@ def _extract_claude_cost(stdout: str) -> float:
         return float(payload.get("total_cost_usd", 0.0) or 0.0)
     except (json.JSONDecodeError, ValueError, TypeError):
         return 0.0
+
+
+def _tail_text(text: str | None, limit: int = 2000) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
 
 
 def create_adapter(**kwargs: Any) -> ClaudeCodeAdapter:

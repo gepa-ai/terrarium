@@ -14,6 +14,14 @@ dependencies = [
 
 [project.optional-dependencies]
 gepa = ["gepa"]
+aime = [
+    "datasets>=2.14",
+    "dspy>=2.6",
+]
+arc_agi = [
+    "datasets>=2.14",
+    "litellm>=1.64",
+]
 # Direct Anthropic SDK reflection LM — used when ``reflection_lm`` is set to
 # ``"anthropic_sdk/<model>"`` to bypass litellm. See
 # ``terrarium.adapters._anthropic_sdk_lm`` for why (litellm + httpx wedges on
@@ -24,6 +32,7 @@ frontier_cs = [
     # terrarium's broader 3.10 support isn't blocked at lock time.
     "frontier-cs @ git+https://github.com/FrontierCS/Frontier-CS ; python_version >= '3.11'",
     "datasets>=2.14",
+    "requests>=2.31",
 ]
 # Can't Be Late: vendored sky-spot simulator. Configs ship with terrarium;
 # the AWS spot-availability traces are an external download (one-time, see

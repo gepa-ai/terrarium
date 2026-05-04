@@ -1,2 +1,3 @@
 # @package task
 name: arc_agi
+mode: generalization

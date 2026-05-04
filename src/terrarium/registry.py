@@ -8,6 +8,7 @@ from terrarium.task import Task
 
 _REGISTRY: dict[str, Task] = {}
 _FACTORIES: dict[str, Callable[[], Task]] = {}
+_RESOLVERS: list[Callable[[str], Callable[[], Task] | None]] = []
 
 
 def register_task(task: Task) -> Task:
@@ -29,6 +30,16 @@ def register_task_factory(name: str, factory: Callable[[], Task]) -> None:
     _FACTORIES[name] = factory
 
 
+def register_task_resolver(resolver: Callable[[str], Callable[[], Task] | None]) -> None:
+    """Register a resolver for dynamic task names.
+
+    Resolvers are consulted only after built-in tasks have been imported and no
+    concrete task/factory exists for the requested name. They let integrations
+    support open-ended names without doing expensive discovery at import time.
+    """
+    _RESOLVERS.append(resolver)
+
+
 def get_task(name: str) -> Task:
     """Retrieve a registered task by name.
 
@@ -42,6 +53,17 @@ def get_task(name: str) -> Task:
         _REGISTRY[name] = task
         return task
     if name not in _REGISTRY:
+        for resolver in _RESOLVERS:
+            factory = resolver(name)
+            if factory is None:
+                continue
+            task = factory()
+            if task.name != name:
+                raise ValueError(
+                    f"Task resolver for {name!r} returned task named {task.name!r}"
+                )
+            _REGISTRY[name] = task
+            return task
         raise KeyError(f"Unknown task '{name}'. Available: {sorted(_REGISTRY | _FACTORIES)}")
     return _REGISTRY[name]
 

@@ -23,12 +23,13 @@ import os
 import subprocess
 import tempfile
 import threading
+from dataclasses import fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import bwrap_prefix, claude_settings_args
+from terrarium.sandbox import bwrap_prefix, claude_settings_args, prepare_claude_home
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -107,9 +108,32 @@ class GEPAAdapter:
         # None ⇒ inherit the runner's top-level ``sandbox:`` default.
         self.sandbox = sandbox
 
+    def effective_sandbox(self, top_level_sandbox: bool | None = None) -> bool:
+        """Whether this GEPA configuration actually creates a sandbox boundary."""
+        sandbox = self.sandbox if self.sandbox is not None else top_level_sandbox
+        if not sandbox:
+            return False
+        lm_name = self.reflection.get("reflection_lm")
+        return isinstance(lm_name, str) and (
+            lm_name.startswith("claude_code/") or lm_name.startswith("claude_code_agent/")
+        )
+
+    def sandbox_scope(self, top_level_sandbox: bool | None = None) -> dict[str, bool]:
+        return {
+            "optimizer_subprocess_sandbox": self.effective_sandbox(top_level_sandbox),
+            "candidate_execution_sandbox": False,
+            "network_namespace_isolated": False,
+        }
+
     def evolve(self, task: Task, server: EvalServer) -> Result:
-        from gepa.lm import LM
-        from gepa.optimize_anything import GEPAConfig, optimize_anything
+        from gepa.optimize_anything import (
+            EngineConfig,
+            GEPAConfig,
+            MergeConfig,
+            ReflectionConfig,
+            RefinerConfig,
+            optimize_anything,
+        )
 
         budget = server.budget
 
@@ -119,39 +143,22 @@ class GEPAAdapter:
         if "reflection_lm" in reflection_kwargs:
             lm_name = reflection_kwargs["reflection_lm"]
             if isinstance(lm_name, str) and lm_name.startswith("claude_code_agent/"):
-                # File-based agent proposer: wired through GEPA's
-                # ``custom_candidate_proposer`` hook, NOT ``reflection_lm``, so
-                # claude receives the structured reflective_dataset (rather
-                # than a pre-rendered prompt). Needs
-                # ``engine.write_agent_state=True`` (set below) so the
-                # run_dir contains agent-readable state files.
                 from terrarium.adapters.gepa_cc_agent import ClaudeCodeAgentProposer
 
                 effort = self.reflection_lm_kwargs.get("reasoning_effort")
-                # Same resolution order other adapters use: adapter-level
-                # override wins, else fall back to the task's fields. These
-                # are what program.md-style proposers need to understand the
-                # scoring rubric — bypassing the reflection_lm path means
-                # we no longer get them for free via the GEPA prompt template.
-                agent_objective = self.objective or task.objective
-                agent_background = self.background or task.background
                 agent_proposer = ClaudeCodeAgentProposer(
                     model=lm_name.split("/", 1)[1],
                     run_dir=self.run_dir,
-                    objective=agent_objective,
-                    background=agent_background,
+                    objective=self.objective or task.objective,
+                    background=self.background or task.background,
                     max_budget_usd=budget.max_token_cost,
                     max_thinking_tokens=self.max_thinking_tokens,
                     effort=effort,
                     sandbox=bool(self.sandbox) if self.sandbox is not None else True,
                 )
-                # Strip reflection_lm — GEPA's validation rejects custom_candidate_proposer
-                # when a reflection_lm is also set.
                 reflection_kwargs.pop("reflection_lm", None)
                 reflection_kwargs["custom_candidate_proposer"] = agent_proposer
             elif isinstance(lm_name, str) and lm_name.startswith("claude_code/"):
-                # Text-only reflection LM: runs claude as a sandboxed subprocess
-                # per reflection call, no filesystem I/O beyond a scratch dir.
                 effort = self.reflection_lm_kwargs.get("reasoning_effort")
                 reflection_lm = ClaudeCodeReflectionProposer(
                     model=lm_name.split("/", 1)[1],
@@ -162,11 +169,11 @@ class GEPAAdapter:
                 )
                 reflection_kwargs["reflection_lm"] = reflection_lm
             elif isinstance(lm_name, str) and lm_name.startswith("anthropic_sdk/"):
-                # Bypass litellm via the official Anthropic SDK.
                 from terrarium.adapters._anthropic_sdk_lm import AnthropicSdkLM
+
                 lm_kwargs = dict(self.reflection_lm_kwargs)
                 lm_kwargs.pop("reasoning_effort", None)
-                if "num_retries" in lm_kwargs:  # litellm naming → SDK naming
+                if "num_retries" in lm_kwargs:
                     lm_kwargs.setdefault("max_retries", lm_kwargs.pop("num_retries"))
                 reflection_lm = AnthropicSdkLM(
                     model=lm_name.split("/", 1)[1],
@@ -175,6 +182,8 @@ class GEPAAdapter:
                 )
                 reflection_kwargs["reflection_lm"] = reflection_lm
             else:
+                from gepa.lm import LM
+
                 lm_kwargs = dict(self.reflection_lm_kwargs)
                 if self.max_thinking_tokens is not None:
                     lm_kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.max_thinking_tokens}
@@ -182,39 +191,22 @@ class GEPAAdapter:
                 reflection_lm = LM(lm_name, **lm_kwargs)
                 reflection_kwargs["reflection_lm"] = reflection_lm
 
-        # Runner-controlled engine fields override whatever the user set.
         engine_kwargs: dict[str, Any] = {
             **self.engine,
             "run_dir": self.run_dir,
             "max_metric_calls": budget.max_evals,
         }
-        # Agent proposer reads history from run_dir → needs the engine to write
-        # its state to disk as agent-readable files. Respect user override.
-        if agent_proposer is not None:
-            engine_kwargs.setdefault("write_agent_state", True)
 
-        cost_source = reflection_lm or agent_proposer
-        # GEPA's ``engine.max_reflection_cost`` wires a ``MaxReflectionCostStopper``
-        # against ``config.reflection.reflection_lm``. On the agent-proposer path
-        # that field is ``None`` (we stripped it for the custom_candidate_proposer
-        # contract), so the auto-wired stopper reads ``0.0`` forever and never
-        # fires. Meanwhile the proposer's own ``raise BudgetExhausted`` is
-        # swallowed by the blanket ``except Exception`` in
-        # ``reflective_mutation.execute_proposal`` — resulting in an infinite
-        # loop of no-op iterations. Wire the stopper ourselves, pointing at
-        # whichever cost source is active.
-        if budget.max_token_cost is not None and cost_source is None:
-            engine_kwargs["max_reflection_cost"] = budget.max_token_cost
+        cost_source = reflection_lm if not isinstance(reflection_lm, str) else None
+        cost_source = cost_source or agent_proposer
 
         cost_callback: _ReflectionCostCallback | None = None
         callbacks = list(self.callbacks)
         if cost_source is not None:
             cost_callback = _ReflectionCostCallback(cost_source, server.tracker, output_dir=self.run_dir)
             callbacks.append(cost_callback)
-
         if agent_proposer is not None:
             callbacks.append(_ReflectiveDatasetDumpCallback(self.run_dir))
-
         if task.val_set:
             callbacks.append(_ProgressCallback(server, reflection_lm=cost_source))
 
@@ -223,17 +215,33 @@ class GEPAAdapter:
             from gepa.utils.stop_condition import ScoreThresholdStopper
             stop_callbacks.append(ScoreThresholdStopper(self.stop_at_score))
         if budget.max_token_cost is not None and cost_source is not None:
-            from gepa.utils.stop_condition import MaxReflectionCostStopper
-            stop_callbacks.append(
-                MaxReflectionCostStopper(budget.max_token_cost, reflection_lm=cost_source)
-            )
+            stop_callbacks.append(_ReflectionCostStopper(budget.max_token_cost, cost_source))
 
-        # GEPAConfig.__post_init__ converts dict -> nested config dataclass.
+        def _filter_config(cls: type[Any], values: dict[str, Any]) -> dict[str, Any]:
+            allowed = {field.name for field in fields(cls)}
+            return {key: value for key, value in values.items() if key in allowed}
+
+        def evaluator(candidate: str, example: Any = None) -> tuple[float, dict[str, Any]]:
+            try:
+                score, info = server.evaluate(candidate, example)
+            except BudgetExhausted:
+                raise
+            except Exception as exc:
+                score = 0.0
+                info = {"error": str(exc), "feedback": str(exc)}
+
+            side_info = dict(info or {})
+            side_info.setdefault("example_id", getattr(example, "id", None))
+            side_info.setdefault("inputs", getattr(example, "inputs", {}))
+            side_info.setdefault("expected", getattr(example, "expected", None))
+            side_info.setdefault("score", float(score))
+            return float(score), side_info
+
         config = GEPAConfig(
-            engine=engine_kwargs,
-            reflection=reflection_kwargs,
-            merge=self.merge,
-            refiner=self.refiner,
+            engine=EngineConfig(**_filter_config(EngineConfig, engine_kwargs)),
+            reflection=ReflectionConfig(**_filter_config(ReflectionConfig, reflection_kwargs)),
+            merge=MergeConfig(**_filter_config(MergeConfig, self.merge)) if self.merge else None,
+            refiner=RefinerConfig(**_filter_config(RefinerConfig, self.refiner)) if self.refiner else None,
             callbacks=callbacks or None,
             stop_callbacks=stop_callbacks or None,
         )
@@ -274,14 +282,22 @@ class GEPAAdapter:
 
         reflection_meta: dict[str, Any] = {}
         adapter_cost = 0.0
-        if cost_callback is not None:
-            reflection_meta = {"reflection_cost_log": cost_callback.cost_log}
-            if cost_callback.cost_log:
-                adapter_cost = cost_callback.cost_log[-1]["reflection_cost"]
+        if cost_source is not None:
+            adapter_cost = float(getattr(cost_source, "total_cost", 0.0) or 0.0)
+            reflection_meta = {
+                "reflection_cost": adapter_cost,
+                "reflection_tokens_in": int(getattr(cost_source, "total_tokens_in", 0) or 0),
+                "reflection_tokens_out": int(getattr(cost_source, "total_tokens_out", 0) or 0),
+            }
+            if cost_callback is not None:
+                reflection_meta["reflection_cost_log"] = cost_callback.cost_log
 
         if gepa_result is not None:
+            best_candidate = gepa_result.best_candidate
+            if isinstance(best_candidate, dict):
+                best_candidate = next(iter(best_candidate.values()))
             return Result(
-                best_candidate=gepa_result.best_candidate,
+                best_candidate=best_candidate,
                 best_score=gepa_result.val_aggregate_scores[gepa_result.best_idx],
                 total_evals=server.budget.used,
                 eval_log=server.eval_log,
@@ -346,12 +362,30 @@ class _ProgressCallback:
     def __init__(self, server: Any, reflection_lm: Any = None) -> None:
         self._server = server
         self._reflection_lm = reflection_lm
+        self.best_candidate: str | None = None
+        self.best_score: float | None = None
 
     def on_valset_evaluated(self, event: dict[str, Any]) -> None:
         candidate_dict = event.get("candidate", {})
         candidate_text = next(iter(candidate_dict.values()), None) if candidate_dict else None
         reflection_cost = self._reflection_lm.total_cost if self._reflection_lm else 0.0
+        average_score = float(event["average_score"])
+        if candidate_text is not None and (self.best_score is None or average_score > self.best_score):
+            self.best_candidate = candidate_text
+            self.best_score = average_score
         self._server.log_progress(event["average_score"], candidate=candidate_text, reflection_cost=reflection_cost)
+
+
+class _ReflectionCostStopper:
+    """GEPA stop condition for custom reflection/proposer cost sources."""
+
+    def __init__(self, max_cost: float, cost_source: Any) -> None:
+        self._max_cost = max_cost
+        self._cost_source = cost_source
+
+    def __call__(self, gepa_state: Any) -> bool:
+        del gepa_state
+        return float(getattr(self._cost_source, "total_cost", 0.0) or 0.0) >= self._max_cost
 
 
 class _ReflectiveDatasetDumpCallback:
@@ -482,7 +516,8 @@ class ClaudeCodeReflectionProposer:
         # sandboxed) is belt; the deny list is braces. Network stays
         # shared (claude needs api.anthropic.com); with no Bash there's
         # nothing to curl from inside the jail anyway.
-        cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
+        claude_home = prepare_claude_home(work_dir) if self.sandbox else None
+        cmd: list[str] = bwrap_prefix(work_dir, claude_home=claude_home) if self.sandbox else []
         cmd += [
             "claude",
             "--print",
@@ -503,6 +538,8 @@ class ClaudeCodeReflectionProposer:
             cmd.extend(["--max-budget-usd", f"{remaining:.4f}"])
 
         env = {**os.environ}
+        if claude_home is not None:
+            env["HOME"] = str(claude_home)
         # Strip CLAUDECODE so nested claude-in-claude doesn't confuse the CLI
         # (same workaround meta-harness uses).
         env.pop("CLAUDECODE", None)

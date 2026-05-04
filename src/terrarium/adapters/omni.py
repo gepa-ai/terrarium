@@ -33,6 +33,8 @@ soft caps that bound each backend's individual share.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -131,26 +133,6 @@ class OmniAdapter:
             raise ValueError(f"OmniAdapter.strategy={self.strategy!r} requires a non-empty configs list")
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
-        from gepa.omni import Task as OmniTask
-
-        # Translate terrarium Task → omni Task. Drop terrarium.test_set; the
-        # terrarium runner already runs a held-out test eval after evolve()
-        # via task.eval_fn directly. Map terrarium.val_set onto omni.test_set
-        # because omni's gepa backend currently reads task.test_set as gepa's
-        # ``valset`` (the in-search candidate-selection split — what terrarium
-        # calls val_set). When omni's gepa backend is updated to read val_set
-        # directly, drop the test_set= line.
-        omni_task = OmniTask(
-            name=task.name,
-            initial_candidate=task.initial_candidate,
-            objective=task.objective,
-            background=task.background,
-            train_set=task.train_set,
-            val_set=task.val_set,
-            test_set=task.val_set,
-            metadata=dict(task.metadata),
-        )
-
         budget = server.budget
         max_token_cost = self.max_token_cost if self.max_token_cost is not None else budget.max_token_cost
         if budget.max_evals is None and max_token_cost is None:
@@ -164,8 +146,27 @@ class OmniAdapter:
             return server.evaluate(candidate, example)
 
         if self.strategy == "single":
+            omni_task = self._to_omni_task(task)
             return self._run_single(omni_task, evaluate, server, budget.max_evals, max_token_cost)
-        return self._run_ensemble(omni_task, evaluate, server, budget.max_evals, max_token_cost)
+        return self._run_ensemble(task, evaluate, server, budget.max_evals, max_token_cost)
+
+    def _to_omni_task(self, task: Task) -> Any:
+        from gepa.omni import Task as OmniTask
+
+        metadata = dict(task.metadata)
+        metadata["omni_test_policy"] = "terrarium_test_set_sealed"
+        return OmniTask(
+            name=task.name,
+            initial_candidate=task.initial_candidate,
+            objective=task.objective,
+            background=task.background,
+            train_set=task.train_set,
+            val_set=task.val_set,
+            # Terrarium owns held-out test reporting after search. GEPA Omni
+            # owns backend-specific train/val visibility policy internally.
+            test_set=None,
+            metadata=metadata,
+        )
 
     def _run_single(
         self,
@@ -176,23 +177,16 @@ class OmniAdapter:
         max_token_cost: float | None,
     ) -> Result:
         from gepa.omni import (
-            BudgetTracker,
             OmniConfig,
-            optimize_anything_with_server,
-        )
-        from gepa.omni import EvalServer as OmniEvalServer
-
-        inner_budget = BudgetTracker(max_evals=max_evals, max_token_cost=max_token_cost)
-        inner_server = OmniEvalServer(
-            omni_task,
-            evaluate,
-            inner_budget,
-            max_concurrency=server.max_concurrency,
-            output_dir=None,
+            optimize_anything,
         )
 
         cfg = OmniConfig(
             backend=self.backend,
+            max_evals=max_evals,
+            max_token_cost=max_token_cost,
+            max_concurrency=server.max_concurrency,
+            output_dir=None,
             run_dir=self.run_dir,
             stop_at_score=self.stop_at_score,
             effort=self.effort,
@@ -201,83 +195,109 @@ class OmniAdapter:
             config=self._build_backend_config(self.backend, self.config),
         )
 
-        inner_server.start()
-        try:
-            omni_result = optimize_anything_with_server(inner_server, cfg)
-        finally:
-            inner_server.stop()
+        omni_result = optimize_anything(omni_task, evaluate, cfg)
 
         return Result(
             best_candidate=omni_result.best_candidate,
             best_score=omni_result.best_score,
+            total_evals=server.budget.used,
+            eval_log=server.eval_log,
             metadata={**omni_result.metadata, "omni_backend": getattr(self.backend, "name", self.backend)},
         )
 
     def _run_ensemble(
         self,
-        omni_task: Any,
+        task: Task,
         evaluate: Any,
         server: EvalServer,
         max_evals: int | None,
         max_token_cost: float | None,
     ) -> Result:
-        from gepa.omni import (
-            BudgetTracker,
-            optimize_best_of_with_server,
-            optimize_parallel_with_server,
-            optimize_sequential_with_server,
-            optimize_vote_with_server,
-        )
-        from gepa.omni import EvalServer as OmniEvalServer
+        from gepa.omni import optimize_anything
 
         n = len(self.configs)
-        omni_configs = [self._materialize_config(entry, idx) for idx, entry in enumerate(self.configs)]
-
         # All ensemble strategies (sequential / parallel / best_of / vote)
-        # use the same fair-share partition: one inner server per config, each
-        # carrying ``total / N`` of the outer budget. Sequential's stages run
-        # one at a time but each stage still has its own pre-partitioned cap,
-        # so a productive early stage can't monopolize the pool.
+        # use the same fair-share budget partition. Sequential's stages run
+        # one at a time but each stage still has its own pre-partitioned cap.
         per_evals = max_evals // n if max_evals is not None else None
         per_cost = (max_token_cost / n) if max_token_cost is not None else None
-        inner_servers = [
-            OmniEvalServer(
-                omni_task,
-                evaluate,
-                BudgetTracker(max_evals=per_evals, max_token_cost=per_cost),
+        omni_configs = [
+            self._materialize_config(
+                entry,
+                idx,
+                max_evals=per_evals,
+                max_token_cost=per_cost,
                 max_concurrency=server.max_concurrency,
-                output_dir=None,
             )
-            for _ in range(n)
+            for idx, entry in enumerate(self.configs)
         ]
 
-        for s in inner_servers:
-            s.start()
-        try:
-            if self.strategy == "sequential":
-                omni_result = optimize_sequential_with_server(inner_servers, omni_configs)
-                return self._wrap_result(omni_result)
-            if self.strategy == "parallel":
-                results = optimize_parallel_with_server(inner_servers, omni_configs, max_workers=self.max_workers)
-                # Convention: surface the first backend's result; full list
-                # in metadata. Callers wanting the best should use best_of.
-                primary = results[0]
-                primary.metadata["all_results"] = results
-                return self._wrap_result(primary)
-            if self.strategy == "best_of":
-                omni_result = optimize_best_of_with_server(inner_servers, omni_configs, max_workers=self.max_workers)
-                return self._wrap_result(omni_result)
-            if self.strategy == "vote":
-                omni_result = optimize_vote_with_server(
-                    inner_servers, omni_configs, evaluate, max_workers=self.max_workers
-                )
-                return self._wrap_result(omni_result)
-            raise ValueError(f"Unknown strategy: {self.strategy!r}")
-        finally:
-            for s in inner_servers:
-                s.stop()
+        if self.strategy == "sequential":
+            stage_results: list[Any] = []
+            current_candidate = task.initial_candidate
+            best_so_far: Any | None = None
+            for entry, cfg in zip(self.configs, omni_configs, strict=True):
+                backend_task = self._to_omni_task(task)
+                backend_task = replace(backend_task, initial_candidate=current_candidate)
+                result = optimize_anything(backend_task, evaluate, cfg)
+                stage_results.append(result)
+                if best_so_far is None or result.best_score > best_so_far.best_score:
+                    best_so_far = result
+                current_candidate = best_so_far.best_candidate
+            final = stage_results[-1]
+            final.metadata["stage_results"] = stage_results
+            if best_so_far is not None:
+                final.metadata["best_stage_score"] = best_so_far.best_score
+                final.metadata["best_stage_candidate"] = best_so_far.best_candidate
+            return self._wrap_result(final, server)
 
-    def _materialize_config(self, entry: dict[str, Any], idx: int) -> Any:
+        # Parallel-family: one omni run per config, using the same fair-share
+        # budget partition as sequential.
+        omni_tasks = [self._to_omni_task(task) for _ in self.configs]
+
+        workers = self.max_workers if self.max_workers is not None else n
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(
+                pool.map(
+                    lambda pair: optimize_anything(pair[0], evaluate, pair[1]),
+                    zip(omni_tasks, omni_configs),
+                )
+            )
+
+        if self.strategy == "parallel":
+            primary = results[0]
+            primary.metadata["all_results"] = results
+            return self._wrap_result(primary, server)
+        if self.strategy == "best_of":
+            winner = max(results, key=lambda r: r.best_score)
+            winner.metadata["all_results"] = results
+            return self._wrap_result(winner, server)
+        if self.strategy == "vote":
+            vote_scores: list[float] = []
+            for r in results:
+                try:
+                    score, _ = evaluate(r.best_candidate)
+                except Exception:
+                    score = float("-inf")
+                vote_scores.append(float(score))
+            winner_idx = max(range(len(results)), key=lambda i: vote_scores[i])
+            winner = results[winner_idx]
+            winner.metadata["vote_scores"] = vote_scores
+            winner.metadata["vote_candidates"] = [r.best_candidate for r in results]
+            winner.metadata["vote_winner_idx"] = winner_idx
+            winner.metadata["all_results"] = results
+            return self._wrap_result(winner, server)
+        raise ValueError(f"Unknown strategy: {self.strategy!r}")
+
+    def _materialize_config(
+        self,
+        entry: dict[str, Any],
+        idx: int,
+        *,
+        max_evals: int | None,
+        max_token_cost: float | None,
+        max_concurrency: int,
+    ) -> Any:
         """Build an :class:`OmniConfig` for one ensemble member.
 
         Per-entry keys (``backend``, ``config``, ``effort``,
@@ -304,6 +324,10 @@ class OmniAdapter:
 
         return OmniConfig(
             backend=backend,
+            max_evals=max_evals,
+            max_token_cost=max_token_cost,
+            max_concurrency=max_concurrency,
+            output_dir=None,
             run_dir=run_dir,
             stop_at_score=stop_at_score,
             effort=effort,
@@ -312,7 +336,7 @@ class OmniAdapter:
             config=self._build_backend_config(backend, backend_config),
         )
 
-    def _wrap_result(self, omni_result: Any) -> Result:
+    def _wrap_result(self, omni_result: Any, server: EvalServer) -> Result:
         backend_name: Any
         if self.strategy == "single":
             backend_name = getattr(self.backend, "name", self.backend)
@@ -321,6 +345,8 @@ class OmniAdapter:
         return Result(
             best_candidate=omni_result.best_candidate,
             best_score=omni_result.best_score,
+            total_evals=server.budget.used,
+            eval_log=server.eval_log,
             metadata={**omni_result.metadata, "omni_backend": backend_name, "omni_strategy": self.strategy},
         )
 

@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args, prepare_claude_home
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -217,11 +217,26 @@ evaluation budget.
 
 _EVAL_DATASET = """\
 This is a **dataset / generalization** task with {train_size} training
-examples{val_note}. The outer loop scores each candidate on the full
-training split; each example costs 1 unit of the evaluation budget, so one
-fully-scored candidate costs {train_size} units. Your candidate must
-generalize across *every* train example, not just one.
+examples{val_note}. When validation is available, the outer loop scores each
+candidate on the full validation split and writes detailed result traces for
+the next iteration, matching the reference Meta-Harness evolution loop. If no
+validation split is available, it scores the full training split. Each example
+costs 1 unit of the evaluation budget.
 """
+
+_EVAL_MULTI_TASK = """\
+This is a **multi-task search** benchmark with {train_size} visible examples{val_note}.
+The outer loop scores each candidate on the full visible training set; each
+example costs 1 unit of the evaluation budget, so one fully-scored candidate
+costs {train_size} units.
+"""
+
+def _example_preview(ex: Any) -> dict[str, Any]:
+    inputs = dict(getattr(ex, "inputs", {}) or {})
+    data: dict[str, Any] = {"id": ex.id, "inputs": inputs}
+    if ex.expected is not None:
+        data["expected"] = ex.expected
+    return data
 
 
 def _build_task_md(task: Task) -> str:
@@ -232,11 +247,12 @@ def _build_task_md(task: Task) -> str:
         optional += f"## Background\n{task.background}\n\n"
 
     if task.has_dataset and task.train_set:
-        val_note = (
-            f" (plus a hidden val set of {len(task.val_set)} examples; not visible to the proposer)"
-            if task.val_set else ""
-        )
-        eval_section = _EVAL_DATASET.format(train_size=len(task.train_set), val_note=val_note)
+        if task.metadata.get("type") == "multi_task":
+            val_note = f" (validation command covers {len(task.val_set)} visible examples)" if task.val_set else ""
+            eval_section = _EVAL_MULTI_TASK.format(train_size=len(task.train_set), val_note=val_note)
+        else:
+            val_note = f" and {len(task.val_set)} validation examples for selection" if task.val_set else ""
+            eval_section = _EVAL_DATASET.format(train_size=len(task.train_set), val_note=val_note)
     else:
         eval_section = _EVAL_SINGLE
 
@@ -264,6 +280,7 @@ def _materialize_sandbox(work_dir: Path, task: Task, budget: BudgetTracker) -> N
                 eval_traces/                    (per-candidate JSONs from eval server,
                                                  populated after each candidate scores)
             train/<id>.json                     (dataset tasks only)
+            val/<id>.json                       (visible validation examples only)
     """
     del budget  # task.md is task-only; budget is dynamic and goes in the per-iteration prompt
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -307,10 +324,13 @@ def _materialize_sandbox(work_dir: Path, task: Task, budget: BudgetTracker) -> N
         train_dir = work_dir / "train"
         train_dir.mkdir(exist_ok=True)
         for ex in task.train_set:
-            data: dict[str, Any] = {"id": ex.id, "inputs": ex.inputs}
-            if ex.expected is not None:
-                data["expected"] = ex.expected
-            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            (train_dir / f"{ex.id}.json").write_text(json.dumps(_example_preview(ex), indent=2))
+
+    if task.val_set:
+        val_dir = work_dir / "val"
+        val_dir.mkdir(exist_ok=True)
+        for ex in task.val_set:
+            (val_dir / f"{ex.id}.json").write_text(json.dumps(_example_preview(ex), indent=2))
 
 
 # ── Proposer subprocess (claude --print stream-json) ────────────────
@@ -328,8 +348,8 @@ def _run_proposer(
     log_dir: Path,
     max_thinking_tokens: int | None = None,
     sandbox: bool = True,
-) -> tuple[int, float, str]:
-    """Launch one proposer session. Returns (exit_code, cost_usd, session_id).
+) -> tuple[int, float, str, Path | None]:
+    """Launch one proposer session. Returns (exit_code, cost_usd, session_id, claude_home).
 
     Uses ``--output-format json`` so the subprocess emits a single, terminal
     JSON object on stdout with the fields we care about:
@@ -358,7 +378,8 @@ def _run_proposer(
     # shared so claude can reach api.anthropic.com; the proposer doesn't
     # need to call the eval server itself. WebFetch/WebSearch denied at
     # the tool layer; bypassPermissions gives full file/Bash access.
-    cmd: list[str] = bwrap_prefix(work_dir) if sandbox else []
+    claude_home = prepare_claude_home(work_dir) if sandbox else None
+    cmd: list[str] = bwrap_prefix(work_dir, claude_home=claude_home) if sandbox else []
     cmd += [
         "claude",
         "--print",
@@ -377,6 +398,8 @@ def _run_proposer(
         cmd.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
 
     env = {**os.environ, "TERRARIUM_WORK_DIR": str(work_dir)}
+    if claude_home is not None:
+        env["HOME"] = str(claude_home)
     # Strip CLAUDECODE so a claude-running-claude situation doesn't confuse
     # the CLI (same workaround the reference proposer uses).
     env.pop("CLAUDECODE", None)
@@ -429,7 +452,7 @@ def _run_proposer(
         },
     }, indent=2))
 
-    return exit_code, cost_usd, session_id
+    return exit_code, cost_usd, session_id, claude_home
 
 
 def _parse_proposer_result(stdout: str, work_dir: Path, session_id: str) -> tuple[float, dict[str, Any]]:
@@ -529,9 +552,13 @@ def _load_candidate(work_dir: Path, relpath: str) -> str | None:
 
 
 def _score_candidate(server: "EvalServer", task: Task, candidate: str) -> tuple[float, dict[str, Any]]:
-    """Score a candidate via the eval server. Dataset tasks prefer val split
-    (matches the other adapters' search-loop convention); fall back to train
-    if no val_set; single-task → evaluate()."""
+    """Score a candidate via the eval server.
+
+    Meta-Harness treats the visible eval/validation split as its search signal:
+    when ``val_set`` exists, evaluate and trace validation examples. This is
+    intentionally different from GEPA's train-reflection/val-selection split
+    and matches the reference Meta-Harness examples' ``frontier_val`` loop.
+    """
     if task.has_dataset:
         if task.val_set:
             return server.evaluate_examples(candidate, split="val")
@@ -747,6 +774,7 @@ class MetaHarnessAdapter:
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         session_ids: list[str] = []
+        claude_homes: dict[str, str] = {}
         total_proposer_cost = 0.0
 
         # Unlimited-iteration mode: use an effective cap derived from budget
@@ -791,7 +819,7 @@ class MetaHarnessAdapter:
 
             # ── Propose ─────────────────────────────────────────
             propose_start = time.time()
-            exit_code, cost, session_id = _run_proposer(
+            exit_code, cost, session_id, claude_home = _run_proposer(
                 work_dir=work_dir,
                 iteration=iteration,
                 model=self.model,
@@ -806,6 +834,8 @@ class MetaHarnessAdapter:
             propose_time = time.time() - propose_start
             total_proposer_cost += cost
             session_ids.append(session_id)
+            if claude_home is not None:
+                claude_homes[session_id] = str(claude_home)
 
             _log(
                 f"  {_cyan('proposer')} exit={exit_code} cost=${cost:.3f} "
@@ -827,7 +857,13 @@ class MetaHarnessAdapter:
                     budget_used=budget.used,
                     propose_time=propose_time,
                 )
-                stop_reason = "proposer_failed"
+                stdout_path = sessions_dir / f"iter{iteration}_stdout.json"
+                stderr_path = sessions_dir / f"iter{iteration}_stderr.txt"
+                raise RuntimeError(
+                    "MetaHarness proposer failed "
+                    f"(iteration {iteration}, exit {exit_code}). "
+                    f"See {stdout_path} and {stderr_path}."
+                )
 
             candidates = _read_pending(pending_path)
             if not candidates:
@@ -846,8 +882,10 @@ class MetaHarnessAdapter:
                     budget_used=budget.used,
                     propose_time=propose_time,
                 )
-                stop_reason = "no_candidates"
-                break
+                raise RuntimeError(
+                    "MetaHarness proposer produced no candidates "
+                    f"(iteration {iteration}). The run is not a valid optimizer smoke."
+                )
 
             _log(f"  {_cyan('benchmarking')} {len(candidates)} candidate(s)...")
 
@@ -878,6 +916,7 @@ class MetaHarnessAdapter:
                 eval_idx_before = len(server.eval_log)
                 try:
                     score, info = _score_candidate(server, task, cand_text)
+                    selection_source = "validation" if task.val_set else "train"
                 except BudgetExhausted:
                     # Capture any traces produced before budget tripped
                     _capture_eval_traces(
@@ -918,7 +957,9 @@ class MetaHarnessAdapter:
 
                 # Mirror this candidate's per-eval JSONs (compile errors,
                 # logs, per-example scores...) into state/eval_traces/<name>/
-                # so the next proposer iteration can read them directly.
+                # so the next proposer iteration can read them directly. When
+                # val_set exists these are validation traces, matching the
+                # reference Meta-Harness frontier_val loop.
                 trace_count = _capture_eval_traces(
                     server, name, (eval_idx_before, len(server.eval_log)), work_dir,
                 )
@@ -934,7 +975,7 @@ class MetaHarnessAdapter:
                 trace_str = f" traces={trace_count}" if trace_count else ""
                 _log(
                     f"    [{ci}/{len(candidates)}] {_bold(name)}: "
-                    f"{_colorize_score(score)} {delta_str} "
+                    f"{_colorize_score(score)} {selection_source} {delta_str} "
                     f"{_dim(f'(budget_used={budget.used}{trace_str})')}"
                 )
 
@@ -949,8 +990,8 @@ class MetaHarnessAdapter:
                     axis=c.get("axis", ""),
                     components=c.get("components", []),
                     outcome=(
-                        f"{score:.4f}" if prev_best is None
-                        else f"{score:.4f} ({score - prev_best:+.4f})"
+                        f"{selection_source} {score:.4f}" if prev_best is None
+                        else f"{selection_source} {score:.4f} ({score - prev_best:+.4f})"
                     ),
                     budget_used=budget.used,
                     propose_time=propose_time if ci == 1 else None,
@@ -996,9 +1037,12 @@ class MetaHarnessAdapter:
 
             bench_time = time.time() - bench_start
 
+            timing = (
+                f"iter {iteration} wall={_elapsed(time.time() - run_start)} "
+                f"propose={_elapsed(propose_time)} bench={_elapsed(bench_time)}"
+            )
             _log(
-                f"  {_dim(f'iter {iteration} wall={_elapsed(time.time() - run_start)} '
-                       f'propose={_elapsed(propose_time)} bench={_elapsed(bench_time)}')}"
+                f"  {_dim(timing)}"
                 + (f" {_green('IMPROVED')}" if iter_improved else "")
             )
 
@@ -1019,12 +1063,14 @@ class MetaHarnessAdapter:
         # server's bookkeeping when the proposer never produced anything.
         best_candidate = server.best_candidate
         best_score = self._best_score(frontier_path)
+        selection_source = "server_best_eval"
         frontier = self._read_frontier(frontier_path)
         best_file = frontier.get("best_candidate_file") if frontier else None
         if best_file:
             loaded = _load_candidate(work_dir, best_file)
             if loaded is not None:
                 best_candidate = loaded
+                selection_source = "frontier_val" if task.val_set else "frontier_train"
         if best_score is None:
             best_score = server.best_score
         return Result(
@@ -1034,16 +1080,19 @@ class MetaHarnessAdapter:
             eval_log=server.eval_log,
             metadata={
                 "adapter_cost": total_proposer_cost,
+                "submitted_candidate_source": selection_source,
                 "meta_harness": {
                     "iterations_run": iteration,
                     "stop_reason": stop_reason,
                     "proposer_cost": total_proposer_cost,
                     "session_ids": session_ids,
+                    "claude_homes": claude_homes,
                     "work_dir": str(work_dir),
                     "frontier": self._read_frontier(frontier_path),
                 },
                 "work_dir": str(work_dir),
                 "session_ids": session_ids,
+                "claude_homes": claude_homes,
             },
         )
 
@@ -1059,14 +1108,21 @@ class MetaHarnessAdapter:
         """
         work_dir = Path(result.metadata.get("work_dir", ""))
         session_ids: list[str] = result.metadata.get("session_ids", []) or []
+        claude_homes: dict[str, str] = result.metadata.get("claude_homes", {}) or {}
 
         transcripts_dir = output_dir / "sessions"
         transcripts_dir.mkdir(parents=True, exist_ok=True)
         for sid in session_ids:
-            _copy_session_transcript(work_dir, sid, transcripts_dir)
+            claude_home = Path(claude_homes[sid]) if sid in claude_homes else None
+            _copy_session_transcript(work_dir, sid, transcripts_dir, claude_home=claude_home)
 
         if work_dir.exists() and not _is_under(work_dir, output_dir):
-            shutil.copytree(work_dir, output_dir / "work", dirs_exist_ok=True)
+            shutil.copytree(
+                work_dir,
+                output_dir / "work",
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(".terrarium_claude_home"),
+            )
 
         if self._pending_tempdir is not None:
             self._pending_tempdir.cleanup()
@@ -1120,8 +1176,15 @@ def _claude_project_slug(cwd: Path) -> str:
     return _SLUG_RE.sub("-", str(cwd.resolve()))
 
 
-def _copy_session_transcript(cwd: Path, session_id: str, dst_dir: Path) -> None:
-    src = Path.home() / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
+def _copy_session_transcript(
+    cwd: Path,
+    session_id: str,
+    dst_dir: Path,
+    *,
+    claude_home: Path | None = None,
+) -> None:
+    home = claude_home or Path.home()
+    src = home / ".claude" / "projects" / _claude_project_slug(cwd) / f"{session_id}.jsonl"
     if not src.exists():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)

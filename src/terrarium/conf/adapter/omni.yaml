@@ -45,8 +45,8 @@ config: {}
 
 # Composition strategy. ``single`` (default) runs one backend (``backend`` /
 # ``config`` above). The rest compose multiple backends from ``configs``:
-#   - ``sequential`` — chain stages; each best seeds the next. One shared
-#     budget pool (per-config budgets ignored).
+#   - ``sequential`` — chain stages; each best seeds the next. Budget is
+#     partitioned ``total // N`` per stage.
 #   - ``parallel``   — run N concurrently; budget partitioned ``total // N``.
 #   - ``best_of``    — parallel + select highest in-search ``best_score``.
 #   - ``vote``       — parallel + one re-score pass via terrarium's outer

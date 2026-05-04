@@ -25,6 +25,8 @@ import json
 import os
 import sys
 import time
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +39,14 @@ from terrarium.adapter import Adapter, Result
 from terrarium.budget import BudgetExhausted, BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.registry import get_task
-from terrarium.task import Task
+from terrarium.task import Example, Task
 from terrarium.tracking import TerrariumTracker, TrackingConfig
 
 CONFIG_PATH = str(Path(__file__).parent / "conf")
+BENCHMARK_MODES = {"single", "multi_task", "generalization"}
+EXECUTION_POLICIES = {"unsandboxed", "sandboxed"}
+HOST_SHARED_NETWORK_POLICIES = {"host_shared", "model_api_and_eval_server_host_shared"}
+NETWORK_ISOLATED_POLICIES = {"network_namespace_isolated", "network_isolated", "none"}
 
 
 def run(
@@ -50,6 +56,7 @@ def run(
     max_evals: int | None = 100,
     max_token_cost: float | None = None,
     max_concurrency: int = 8,
+    benchmark: DictConfig | dict[str, Any] | None = None,
     tracking: TrackingConfig | None = None,
     output_dir: str | Path | None = None,
 ) -> Result:
@@ -67,6 +74,8 @@ def run(
             unlimited. Enforcement is adapter-side (GEPA via
             ``max_reflection_cost``, Claude Code via ``--max-budget-usd``).
         max_concurrency: Max parallel evaluations in the server.
+        benchmark: Optional benchmark contract config. If omitted, the task's
+            metadata declares the mode, falling back to ``single``.
         tracking: Optional wandb/mlflow tracking config.
         output_dir: Directory where incremental log files (``evals/<i>.json``,
             ``summary.json``, ``reflection_cost_log.jsonl``) are written during
@@ -84,17 +93,20 @@ def run(
     """
     if isinstance(task, str):
         task = get_task(task)
+    task = _prepare_task_for_benchmark(task, _benchmark_config(benchmark))
+    official_task = task
+    search_task = replace(task, test_set=None) if task.test_set else task
 
     if isinstance(adapter, str):
         adapter = load_adapter(adapter)
 
     tracker = TerrariumTracker(tracking) if tracking else None
     budget = BudgetTracker(max_evals=max_evals, max_token_cost=max_token_cost)
-    server = EvalServer(task, budget, tracker=tracker, max_concurrency=max_concurrency, output_dir=output_dir)
+    server = EvalServer(search_task, budget, tracker=tracker, max_concurrency=max_concurrency, output_dir=output_dir)
     server.start()
 
     if tracker:
-        tracker.start({"task": task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
+        tracker.start({"task": official_task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
         # Inject GEPA-level callback for iteration/valset metrics. Both the
         # native GEPAAdapter and the OmniAdapter (when ``backend=gepa``)
         # surface a ``.callbacks`` list that flows into the GEPA engine.
@@ -107,7 +119,7 @@ def run(
     start = time.time()
 
     try:
-        result = adapter.evolve(task, server)
+        result = adapter.evolve(search_task, server)
     except BudgetExhausted:
         result = Result(
             best_candidate=server.best_candidate,
@@ -123,8 +135,14 @@ def run(
     result.metadata["wall_time"] = time.time() - start
     result.metadata["budget"] = budget.status()
     adapter_cost = float(result.metadata.get("adapter_cost", 0.0))
+    result.metadata["solver_cost_search"] = server.total_cost
+    result.metadata["solver_cost_test"] = 0.0
+    result.metadata["solver_cost"] = server.total_cost
     result.metadata["total_cost"] = server.total_cost + adapter_cost
     result.metadata["progress_log"] = server.progress_log
+    result.metadata["best_visible_score"] = server.best_visible_score
+    result.metadata["best_visible_source"] = server.best_visible_source
+    result.metadata["best_validated_score"] = server.best_validated_score
 
     # Hand the result back to the adapter for any artifact persistence
     # (logs, transcripts, workspace mirroring, tempdir cleanup, etc.).
@@ -132,16 +150,22 @@ def run(
         adapter.process_result(result, Path(output_dir))
 
     # Evaluate best candidate on held-out test set (outside budget).
-    if isinstance(task, Task) and task.test_set and result.best_candidate:
+    if official_task.test_set and result.best_candidate:
         test_scores: dict[str, float] = {}
-        for ex in task.test_set:
+        test_solver_cost = 0.0
+        for ex in official_task.test_set:
             try:
-                score, _ = task.eval_fn(result.best_candidate, ex)
+                score, info = official_task.eval_fn(result.best_candidate, ex)
+                if isinstance(info, dict):
+                    test_solver_cost += float(info.get("cost", 0.0) or 0.0)
                 test_scores[ex.id] = score
             except Exception:
                 test_scores[ex.id] = 0.0
         result.metadata["test_scores"] = test_scores
         result.metadata["test_score"] = sum(test_scores.values()) / len(test_scores) if test_scores else 0.0
+        result.metadata["solver_cost_test"] = test_solver_cost
+        result.metadata["solver_cost"] = server.total_cost + test_solver_cost
+        result.metadata["total_cost"] = result.metadata["solver_cost"] + adapter_cost
 
     if tracker:
         tracker.log_summary({
@@ -236,6 +260,174 @@ def _build_tracking_config(cfg: DictConfig) -> TrackingConfig | None:
     return TrackingConfig(**raw)  # type: ignore[arg-type]
 
 
+def _plain_config(cfg: Any) -> Any:
+    return OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else cfg
+
+
+def _benchmark_config(cfg: DictConfig | dict[str, Any] | None) -> DictConfig:
+    if cfg is None:
+        return OmegaConf.create({})
+    if isinstance(cfg, DictConfig):
+        return OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    return OmegaConf.create(cfg)
+
+
+def _effective_adapter_sandbox(adapter: Any, top_level_sandbox: bool | None) -> bool | None:
+    effective = getattr(adapter, "effective_sandbox", None)
+    if callable(effective):
+        return effective(top_level_sandbox)
+    if not hasattr(adapter, "sandbox"):
+        return False
+    value = getattr(adapter, "sandbox", None)
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _sandbox_scope(adapter: Any, top_level_sandbox: bool | None) -> dict[str, bool]:
+    scope = getattr(adapter, "sandbox_scope", None)
+    if callable(scope):
+        value = scope(top_level_sandbox)
+        return {
+            "optimizer_subprocess_sandbox": bool(value.get("optimizer_subprocess_sandbox", False)),
+            "candidate_execution_sandbox": bool(value.get("candidate_execution_sandbox", False)),
+            "network_namespace_isolated": bool(value.get("network_namespace_isolated", False)),
+        }
+    return {
+        "optimizer_subprocess_sandbox": bool(_effective_adapter_sandbox(adapter, top_level_sandbox)),
+        "candidate_execution_sandbox": False,
+        "network_namespace_isolated": False,
+    }
+
+
+def _validate_access_policy(access_policy: DictConfig | None, adapter: Any, sandbox: bool | None) -> None:
+    if not access_policy:
+        return
+    execution = access_policy.get("execution")
+    network = access_policy.get("network")
+    scope = _sandbox_scope(adapter, sandbox)
+    if execution is not None and execution not in EXECUTION_POLICIES:
+        raise ValueError("access_policy.execution must be one of: unsandboxed, sandboxed")
+    if execution == "sandboxed" and not scope["candidate_execution_sandbox"]:
+        raise ValueError(
+            "access_policy.execution=sandboxed requires candidate/evaluator execution sandboxing. "
+            "Use access_policy.execution=unsandboxed when only optimizer subprocesses are sandboxed."
+        )
+    if network in NETWORK_ISOLATED_POLICIES and not scope["network_namespace_isolated"]:
+        raise ValueError(
+            f"access_policy.network={network} requires network namespace isolation. "
+            "Use network=model_api_and_eval_server_host_shared or network=host_shared for current sandboxes."
+        )
+    if network is not None and network not in HOST_SHARED_NETWORK_POLICIES | NETWORK_ISOLATED_POLICIES:
+        raise ValueError(
+            "access_policy.network must be one of: "
+            "host_shared, model_api_and_eval_server_host_shared, "
+            "network_namespace_isolated, network_isolated, none"
+        )
+
+
+def _merge_val_into_train(task: Task, metadata: dict[str, Any]) -> tuple[list[Example] | None, None]:
+    """Use all visible development examples for search without a validation channel."""
+    if not task.val_set:
+        return task.train_set, None
+    train_set = list(task.train_set or [])
+    train_set.extend(task.val_set)
+    provenance = metadata.get("split_provenance")
+    if isinstance(provenance, dict):
+        provenance = dict(provenance)
+        provenance["validation_policy"] = "merged_into_train"
+        provenance["run_split_sizes"] = {
+            "train": len(train_set),
+            "val": 0,
+            "test": len(task.test_set or []),
+        }
+        metadata["split_provenance"] = provenance
+    return train_set, None
+
+
+def _example_id_set(task: Task, split_name: str, split: list[Example] | None) -> set[str]:
+    ids: list[str] = [ex.id for ex in split or []]
+    duplicates = sorted(ex_id for ex_id, count in Counter(ids).items() if count > 1)
+    if duplicates:
+        preview = ", ".join(duplicates[:5])
+        raise ValueError(f"Task '{task.name}' has duplicate IDs in {split_name}_set: {preview}")
+    return set(ids)
+
+
+def _validate_generalization_splits(task: Task) -> None:
+    if not task.train_set:
+        raise ValueError(f"benchmark.mode=generalization requires task '{task.name}' to define train_set")
+    if not task.test_set:
+        raise ValueError(f"benchmark.mode=generalization requires task '{task.name}' to define test_set")
+
+    split_ids = {
+        "train": _example_id_set(task, "train", task.train_set),
+        "val": _example_id_set(task, "val", task.val_set),
+        "test": _example_id_set(task, "test", task.test_set),
+    }
+    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+        overlap = sorted(split_ids[left] & split_ids[right])
+        if overlap:
+            preview = ", ".join(overlap[:5])
+            raise ValueError(
+                f"Task '{task.name}' has overlapping example IDs between "
+                f"{left}_set and {right}_set: {preview}"
+            )
+
+
+def _normalize_benchmark_mode(mode: Any) -> str:
+    if mode == "single_task":
+        return "single"
+    if mode in BENCHMARK_MODES:
+        return str(mode)
+    raise ValueError("benchmark.mode must be one of: single, multi_task, generalization")
+
+
+def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) -> Task:
+    """Apply the minimal benchmark contract before adapters see the task."""
+    benchmark_cfg = benchmark_cfg or OmegaConf.create({})
+    mode = _normalize_benchmark_mode(benchmark_cfg.get("mode") or task.metadata.get("type") or "single")
+    if "use_val" in benchmark_cfg:
+        raise ValueError("benchmark.use_val was renamed to benchmark.split_train_val")
+    split_train_val = bool(benchmark_cfg.get("split_train_val", True))
+
+    metadata = dict(task.metadata)
+    metadata_mode = metadata.get("type")
+
+    if metadata_mode in BENCHMARK_MODES | {"single_task"} and _normalize_benchmark_mode(metadata_mode) != mode:
+        raise ValueError(
+            f"Task '{task.name}' declares metadata.type={metadata_mode!r}, "
+            f"but benchmark.mode={mode!r}"
+        )
+    if "val_set" in metadata:
+        raise ValueError(
+            f"Task '{task.name}' stores validation examples in metadata['val_set']; "
+            "use Task.val_set so all adapters get the same split contract."
+        )
+
+    if mode == "generalization":
+        _validate_generalization_splits(task)
+    elif mode == "multi_task" and not task.train_set:
+        raise ValueError(f"benchmark.mode=multi_task requires task '{task.name}' to define train_set")
+
+    train_set = task.train_set
+    val_set = task.val_set
+    if not split_train_val:
+        train_set, val_set = _merge_val_into_train(task, metadata)
+
+    test_set = task.test_set if mode == "generalization" else None
+
+    metadata["type"] = mode
+    prepared = replace(task, train_set=train_set, val_set=val_set, test_set=test_set, metadata=metadata)
+
+    if mode == "single" and prepared.has_dataset:
+        raise ValueError(
+            f"benchmark.mode=single is inconsistent with dataset task '{task.name}'. "
+            "Use benchmark.mode=multi_task or benchmark.mode=generalization."
+        )
+
+    return prepared
+
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
 def main(cfg: DictConfig) -> None:
@@ -273,10 +465,8 @@ def main(cfg: DictConfig) -> None:
         adapter.run_dir = str(adapter_dir)
 
     # Thinking budget: ``max_thinking_tokens`` (fixed) and ``effort``
-    # (adaptive) are independent knobs — set neither, either, or both.
-    # When both are set, the adapter forwards both to the underlying tool;
-    # actual behavior is whatever the runtime (claude CLI / litellm) does
-    # when both are present.
+    # (adaptive) are independent knobs. When both are set, the adapter
+    # forwards both to the underlying runtime.
     max_thinking_tokens = cfg.get("max_thinking_tokens")
     effort = cfg.get("effort")
     if max_thinking_tokens is not None:
@@ -287,6 +477,7 @@ def main(cfg: DictConfig) -> None:
 
     _apply_perfect_score(adapter, cfg.get("perfect_score"))
     _apply_sandbox(adapter, cfg.get("sandbox"))
+    _validate_access_policy(cfg.get("access_policy"), adapter, cfg.get("sandbox"))
 
     tracking = _build_tracking_config(cfg.tracking) if "tracking" in cfg else None
 
@@ -305,12 +496,18 @@ def main(cfg: DictConfig) -> None:
             lm_kwargs['max_tokens'] = cfg.task.solver_max_tokens
         dspy.configure(lm=dspy.LM(solver_lm, **lm_kwargs))
 
+    benchmark_cfg = OmegaConf.create(OmegaConf.to_container(cfg.get("benchmark", {}), resolve=True))
+    if benchmark_cfg.get("mode") is None:
+        benchmark_cfg.mode = cfg.task.get("mode")
+    raw_task = get_task(cfg.task.name)
+
     result = run(
-        cfg.task.name,
+        raw_task,
         adapter,
         max_evals=cfg.budget.get("max_evals"),
         max_token_cost=cfg.budget.get("max_token_cost"),
         max_concurrency=cfg.max_concurrency,
+        benchmark=benchmark_cfg,
         tracking=tracking,
         output_dir=hydra_out,
     )
@@ -319,10 +516,17 @@ def main(cfg: DictConfig) -> None:
         "task": cfg.task.name,
         "adapter": adapter_name,
         "adapter_target": cfg.adapter.get("_target_", "unknown"),
+        "benchmark": _plain_config(benchmark_cfg),
+        "access_policy": _plain_config(cfg.get("access_policy", {})),
+        "sandbox_scope": _sandbox_scope(adapter, cfg.get("sandbox")),
         "adapter_dir": str(adapter_dir),
         "best_score": result.best_score,
         "total_evals": result.total_evals,
         "total_cost": result.metadata.get("total_cost", 0.0),
+        "solver_cost": result.metadata.get("solver_cost"),
+        "solver_cost_search": result.metadata.get("solver_cost_search"),
+        "solver_cost_test": result.metadata.get("solver_cost_test"),
+        "optimizer_cost": float(result.metadata.get("adapter_cost", 0.0)),
         "reflection_cost_log": result.metadata.get("reflection_cost_log"),
         "wall_time": result.metadata.get("wall_time"),
         "budget": result.metadata.get("budget"),
