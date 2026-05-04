@@ -78,12 +78,12 @@ max_token_cost: null
 stop_at_score: null
 
 # ``claude --effort low|medium|high|max`` for backends that spawn Claude Code.
-# Mutex with ``max_thinking_tokens``. Runner threads top-level ``effort``
-# here when null.
+# Independent of ``max_thinking_tokens`` — both can be set together. Runner
+# threads top-level ``effort`` here when null.
 effort: null
 
-# Fixed thinking-token budget. Mutex with ``effort``. Runner threads
-# top-level ``max_thinking_tokens`` here when null.
+# Fixed thinking-token budget. Independent of ``effort`` (both can be set
+# together). Runner threads top-level ``max_thinking_tokens`` here when null.
 max_thinking_tokens: null
 
 # Sandbox subprocess backends in bwrap (Linux) / Seatbelt (macOS). Runner

@@ -1,0 +1,4 @@
+[submodule "gepa"]
+	path = gepa
+	url = git@github.com:gepa-ai/gepa.git
+	branch = feat/optimize-anything-omni
