@@ -19,6 +19,7 @@ from terrarium.adapters.meta_harness import (
     _materialize_sandbox as materialize_meta_sandbox,
 )
 from terrarium.adapters.gepa import GEPAAdapter
+from terrarium.adapters.omni import OmniAdapter
 from terrarium.budget import BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.adapter import Result
@@ -68,7 +69,7 @@ class BenchmarkContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires task 'task' to define test_set"):
             _prepare_task_for_benchmark(
                 task,
-                OmegaConf.create({"mode": "generalization", "use_val": True}),
+                OmegaConf.create({"mode": "generalization", "split_train_val": True}),
             )
 
     def test_generalization_rejects_split_id_overlap_even_when_val_hidden(self) -> None:
@@ -81,10 +82,10 @@ class BenchmarkContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlapping example IDs"):
             _prepare_task_for_benchmark(
                 task,
-                OmegaConf.create({"mode": "generalization", "use_val": False}),
+                OmegaConf.create({"mode": "generalization", "split_train_val": False}),
             )
 
-    def test_use_val_false_removes_val_from_adapter_view(self) -> None:
+    def test_split_train_val_false_merges_val_into_train(self) -> None:
         task = _task(
             train=[Example("train", {}, 1.0)],
             val=[Example("val", {}, 1.0)],
@@ -93,10 +94,11 @@ class BenchmarkContractTests(unittest.TestCase):
 
         prepared = _prepare_task_for_benchmark(
             task,
-            OmegaConf.create({"mode": "generalization", "use_val": False}),
+            OmegaConf.create({"mode": "generalization", "split_train_val": False}),
         )
 
         self.assertIsNone(prepared.val_set)
+        self.assertEqual([ex.id for ex in prepared.train_set or []], ["train", "val"])
         self.assertIsNotNone(prepared.test_set)
 
     def test_run_applies_benchmark_contract_to_programmatic_tasks(self) -> None:
@@ -114,12 +116,14 @@ class BenchmarkContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlapping example IDs"):
             run(task, CaptureAdapter(), max_evals=10, max_concurrency=1)
 
-    def test_run_respects_benchmark_use_val_false(self) -> None:
+    def test_run_respects_benchmark_split_train_val_false(self) -> None:
         seen: dict[str, object] = {}
 
         class CaptureAdapter:
             def evolve(self, task: Task, server: EvalServer) -> Result:
+                seen["adapter_train_ids"] = [ex.id for ex in task.train_set or []]
                 seen["adapter_val_set"] = task.val_set
+                seen["server_train_ids"] = [ex.id for ex in server.task.train_set or []]
                 seen["server_val_set"] = server.task.val_set
                 return Result(best_candidate="seed", best_score=0.0)
 
@@ -134,10 +138,12 @@ class BenchmarkContractTests(unittest.TestCase):
             CaptureAdapter(),
             max_evals=10,
             max_concurrency=1,
-            benchmark={"mode": "generalization", "use_val": False},
+            benchmark={"mode": "generalization", "split_train_val": False},
         )
 
+        self.assertEqual(seen["adapter_train_ids"], ["train", "val"])
         self.assertIsNone(seen["adapter_val_set"])
+        self.assertEqual(seen["server_train_ids"], ["train", "val"])
         self.assertIsNone(seen["server_val_set"])
 
     def test_run_hides_test_set_from_adapter_and_server(self) -> None:
@@ -161,6 +167,22 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertEqual(result.metadata["test_scores"], {"test": 3.0})
         self.assertEqual(result.metadata["test_score"], 3.0)
 
+    def test_omni_adapter_delegates_train_val_policy_to_gepa_omni(self) -> None:
+        task = _task(
+            train=[Example("train", {}, 1.0)],
+            val=[Example("val", {}, 2.0)],
+            test=[Example("test", {}, 3.0)],
+        )
+
+        omni_task = OmniAdapter(backend="meta_harness")._to_omni_task(task)
+
+        self.assertIs(omni_task.train_set, task.train_set)
+        self.assertIs(omni_task.val_set, task.val_set)
+        self.assertIsNone(omni_task.test_set)
+        self.assertNotIn("val_set", omni_task.metadata)
+        self.assertNotIn("validation_policy", omni_task.metadata)
+        self.assertEqual(omni_task.metadata["omni_test_policy"], "terrarium_test_set_sealed")
+
     def test_multi_task_allows_shared_train_and_val(self) -> None:
         examples = [Example("visible", {}, 1.0)]
         task = _task(
@@ -172,7 +194,7 @@ class BenchmarkContractTests(unittest.TestCase):
 
         prepared = _prepare_task_for_benchmark(
             task,
-            OmegaConf.create({"mode": "multi_task", "use_val": True}),
+            OmegaConf.create({"mode": "multi_task", "split_train_val": True}),
         )
 
         self.assertEqual(prepared.metadata["type"], "multi_task")
@@ -184,7 +206,7 @@ class BenchmarkContractTests(unittest.TestCase):
 
         prepared = _prepare_task_for_benchmark(
             task,
-            OmegaConf.create({"mode": None, "use_val": True}),
+            OmegaConf.create({"mode": None, "split_train_val": True}),
         )
 
         self.assertEqual(prepared.metadata["type"], "single")
@@ -265,7 +287,7 @@ class BenchmarkContractTests(unittest.TestCase):
         finally:
             server.stop()
 
-    def test_eval_server_http_rejects_hidden_val_after_use_val_false(self) -> None:
+    def test_eval_server_http_rejects_val_split_after_split_train_val_false(self) -> None:
         task = _task(
             train=[Example("train", {}, 1.0)],
             val=[Example("val", {}, 2.0)],
@@ -273,7 +295,7 @@ class BenchmarkContractTests(unittest.TestCase):
         )
         prepared = _prepare_task_for_benchmark(
             task,
-            OmegaConf.create({"mode": "generalization", "use_val": False}),
+            OmegaConf.create({"mode": "generalization", "split_train_val": False}),
         )
         server = EvalServer(prepared, BudgetTracker(max_evals=10), max_concurrency=1)
         server.start()
@@ -389,8 +411,8 @@ class BenchmarkContractTests(unittest.TestCase):
 
     def test_claude_materialization_writes_visible_splits_not_test(self) -> None:
         task = _task(
-            train=[Example("train", {"x": 1}, 1.0)],
-            val=[Example("val", {"x": 2}, 2.0)],
+            train=[Example("train", {"x": 1, "solution": "train-sol"}, 1.0)],
+            val=[Example("val", {"x": 2, "solution": "val-sol"}, 2.0)],
             test=[Example("test", {"x": 3}, 3.0)],
         )
 
@@ -406,11 +428,17 @@ class BenchmarkContractTests(unittest.TestCase):
             self.assertTrue((work_dir / "train" / "train.json").exists())
             self.assertTrue((work_dir / "val" / "val.json").exists())
             self.assertFalse((work_dir / "test").exists())
+            train_payload = json.loads((work_dir / "train" / "train.json").read_text())
+            val_payload = json.loads((work_dir / "val" / "val.json").read_text())
+            self.assertEqual(train_payload["expected"], 1.0)
+            self.assertEqual(train_payload["inputs"]["solution"], "train-sol")
+            self.assertEqual(val_payload["expected"], 2.0)
+            self.assertEqual(val_payload["inputs"]["solution"], "val-sol")
 
     def test_meta_harness_materialization_writes_visible_splits_not_test(self) -> None:
         task = _task(
-            train=[Example("train", {"x": 1}, 1.0)],
-            val=[Example("val", {"x": 2}, 2.0)],
+            train=[Example("train", {"x": 1, "solution": "train-sol"}, 1.0)],
+            val=[Example("val", {"x": 2, "solution": "val-sol"}, 2.0)],
             test=[Example("test", {"x": 3}, 3.0)],
         )
 
@@ -421,6 +449,29 @@ class BenchmarkContractTests(unittest.TestCase):
             self.assertTrue((work_dir / "train" / "train.json").exists())
             self.assertTrue((work_dir / "val" / "val.json").exists())
             self.assertFalse((work_dir / "test").exists())
+            train_payload = json.loads((work_dir / "train" / "train.json").read_text())
+            val_payload = json.loads((work_dir / "val" / "val.json").read_text())
+            self.assertEqual(train_payload["expected"], 1.0)
+            self.assertEqual(train_payload["inputs"]["solution"], "train-sol")
+            self.assertEqual(val_payload["expected"], 2.0)
+            self.assertEqual(val_payload["inputs"]["solution"], "val-sol")
+
+    def test_eval_server_tracks_aggregate_visible_selection(self) -> None:
+        task = _task(
+            train=[Example("train", {}, 1.0)],
+            val=[Example("val", {}, 0.5)],
+            test=[Example("test", {}, 1.0)],
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=3))
+        train_score, _ = server.evaluate_examples("train-candidate", split="train")
+        val_result = server.validate("val-candidate")
+
+        self.assertEqual(train_score, 1.0)
+        self.assertEqual(val_result["val_score"], 0.5)
+        self.assertEqual(server.best_visible_candidate, "train-candidate")
+        self.assertEqual(server.best_visible_source, "train_aggregate")
+        self.assertEqual(server.best_validated_candidate, "val-candidate")
+        self.assertEqual(server.best_validated_score, 0.5)
 
     def test_meta_harness_transcript_copy_uses_isolated_claude_home(self) -> None:
         session_id = "session-123"
@@ -484,6 +535,47 @@ class BenchmarkContractTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_claude_code_submits_best_validated_candidate_not_last_file(self) -> None:
+        def eval_candidate(candidate: str, example: Example | None = None) -> tuple[float, dict]:
+            del example
+            return (1.0 if candidate == "validated" else 0.0), {}
+
+        task = Task(
+            name="task",
+            initial_candidate="seed",
+            eval_fn=eval_candidate,
+            train_set=[Example("train", {}, 1.0)],
+            val_set=[Example("val", {}, 1.0)],
+            test_set=[Example("test", {}, 1.0)],
+            metadata={"type": "generalization"},
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=3))
+        server.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                adapter = ClaudeCodeAdapter(run_dir=tmp, sandbox=False)
+
+                def fake_run(cmd, **kwargs):
+                    work_dir = Path(kwargs["cwd"])
+                    (work_dir / "best_candidate.txt").write_text("unvalidated-last-edit")
+                    server.validate("validated")
+                    return subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=0,
+                        stdout='{"total_cost_usd":0.01}',
+                        stderr="",
+                    )
+
+                with patch("terrarium.adapters.claude_code.subprocess.run", side_effect=fake_run):
+                    result = adapter.evolve(task, server)
+        finally:
+            server.stop()
+
+        self.assertEqual(result.best_candidate, "validated")
+        self.assertEqual(result.best_score, 1.0)
+        self.assertEqual(result.metadata["submitted_candidate_source"], "best_validated_candidate")
+        self.assertEqual(result.metadata["best_candidate_txt"], "unvalidated-last-edit")
+
     def test_claude_code_ralph_continue_prompt_omits_validate_without_val_set(self) -> None:
         task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
         server = EvalServer(task, BudgetTracker(max_evals=2, max_token_cost=1.0))
@@ -494,8 +586,6 @@ class BenchmarkContractTests(unittest.TestCase):
                 adapter = ClaudeCodeAdapter(
                     run_dir=tmp,
                     sandbox=False,
-                    ralph=True,
-                    ralph_max_iterations=2,
                 )
 
                 def fake_run(cmd, **kwargs):
@@ -532,8 +622,6 @@ class BenchmarkContractTests(unittest.TestCase):
                 adapter = ClaudeCodeAdapter(
                     run_dir=tmp,
                     sandbox=False,
-                    ralph=True,
-                    ralph_max_iterations=2,
                 )
 
                 def fake_run(cmd, **kwargs):
@@ -590,6 +678,62 @@ class BenchmarkContractTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "produced no candidates"):
                     adapter.evolve(task, server)
+
+    def test_meta_harness_uses_validation_as_search_signal_with_val_traces(self) -> None:
+        def eval_candidate(candidate: str, example: Example | None = None) -> tuple[float, dict]:
+            assert example is not None
+            if example.id == "train":
+                return (0.25 if candidate == "candidate" else 0.0), {"split": "train"}
+            return (1.0 if candidate == "candidate" else 0.0), {"split": "val"}
+
+        task = Task(
+            name="task",
+            initial_candidate="seed",
+            eval_fn=eval_candidate,
+            train_set=[Example("train", {}, 0.25)],
+            val_set=[Example("val", {}, 1.0)],
+            test_set=[Example("test", {}, 1.0)],
+            metadata={"type": "generalization"},
+        )
+        with tempfile.TemporaryDirectory() as out_tmp, tempfile.TemporaryDirectory() as tmp:
+            server = EvalServer(task, BudgetTracker(max_evals=4), output_dir=out_tmp)
+            try:
+                work_dir = Path(tmp)
+                adapter = MetaHarnessAdapter(
+                    run_dir=str(work_dir),
+                    max_iterations=1,
+                    max_candidates_per_iter=1,
+                    sandbox=False,
+                )
+
+                def fake_proposer(**kwargs):
+                    wd = kwargs["work_dir"]
+                    (wd / "agents" / "iter1_candidate.txt").write_text("candidate")
+                    kwargs["pending_path"].write_text(json.dumps({
+                        "iteration": 1,
+                        "candidates": [{
+                            "name": "candidate",
+                            "file": "agents/iter1_candidate.txt",
+                            "hypothesis": "test",
+                            "axis": "test",
+                            "components": [],
+                        }],
+                    }))
+                    return (0, 0.0, "session-123", None)
+
+                with patch("terrarium.adapters.meta_harness._run_proposer", side_effect=fake_proposer):
+                    result = adapter.evolve(task, server)
+
+                trace_files = list((work_dir / "state" / "eval_traces" / "candidate").glob("*.json"))
+                trace_payload = json.loads(trace_files[0].read_text())
+            finally:
+                server.stop()
+
+        self.assertEqual(result.best_candidate, "candidate")
+        self.assertEqual(result.best_score, 1.0)
+        self.assertEqual(result.metadata["submitted_candidate_source"], "frontier_val")
+        self.assertEqual(len(trace_files), 1)
+        self.assertEqual(trace_payload["info"]["split"], "val")
 
     def test_arc_test_scoring_accepts_grid_predictions_and_attempt_lists(self) -> None:
         gold = [[[1, 2], [3, 4]]]

@@ -135,8 +135,14 @@ def run(
     result.metadata["wall_time"] = time.time() - start
     result.metadata["budget"] = budget.status()
     adapter_cost = float(result.metadata.get("adapter_cost", 0.0))
+    result.metadata["solver_cost_search"] = server.total_cost
+    result.metadata["solver_cost_test"] = 0.0
+    result.metadata["solver_cost"] = server.total_cost
     result.metadata["total_cost"] = server.total_cost + adapter_cost
     result.metadata["progress_log"] = server.progress_log
+    result.metadata["best_visible_score"] = server.best_visible_score
+    result.metadata["best_visible_source"] = server.best_visible_source
+    result.metadata["best_validated_score"] = server.best_validated_score
 
     # Hand the result back to the adapter for any artifact persistence
     # (logs, transcripts, workspace mirroring, tempdir cleanup, etc.).
@@ -146,14 +152,20 @@ def run(
     # Evaluate best candidate on held-out test set (outside budget).
     if official_task.test_set and result.best_candidate:
         test_scores: dict[str, float] = {}
+        test_solver_cost = 0.0
         for ex in official_task.test_set:
             try:
-                score, _ = official_task.eval_fn(result.best_candidate, ex)
+                score, info = official_task.eval_fn(result.best_candidate, ex)
+                if isinstance(info, dict):
+                    test_solver_cost += float(info.get("cost", 0.0) or 0.0)
                 test_scores[ex.id] = score
             except Exception:
                 test_scores[ex.id] = 0.0
         result.metadata["test_scores"] = test_scores
         result.metadata["test_score"] = sum(test_scores.values()) / len(test_scores) if test_scores else 0.0
+        result.metadata["solver_cost_test"] = test_solver_cost
+        result.metadata["solver_cost"] = server.total_cost + test_solver_cost
+        result.metadata["total_cost"] = result.metadata["solver_cost"] + adapter_cost
 
     if tracker:
         tracker.log_summary({
@@ -314,53 +326,23 @@ def _validate_access_policy(access_policy: DictConfig | None, adapter: Any, sand
         )
 
 
-def _split_limit(task_cfg: DictConfig | None, split_name: str) -> int | None:
-    if task_cfg is None:
-        return None
-    value = task_cfg.get(f"{split_name}_limit")
-    if value is None:
-        return None
-    value = int(value)
-    if value < 0:
-        raise ValueError(f"task.{split_name}_limit must be >= 0")
-    return value
-
-
-def _limit_examples(examples: list[Example] | None, limit: int | None) -> list[Example] | None:
-    if examples is None or limit is None:
-        return examples
-    return examples[:limit]
-
-
-def _apply_task_split_limits(task: Task, task_cfg: DictConfig | None) -> Task:
-    """Apply optional task.<split>_limit knobs for smoke/debug runs."""
-    limits = {
-        "train": _split_limit(task_cfg, "train"),
-        "val": _split_limit(task_cfg, "val"),
-        "test": _split_limit(task_cfg, "test"),
-    }
-    if all(limit is None for limit in limits.values()):
-        return task
-
-    metadata = dict(task.metadata)
+def _merge_val_into_train(task: Task, metadata: dict[str, Any]) -> tuple[list[Example] | None, None]:
+    """Use all visible development examples for search without a validation channel."""
+    if not task.val_set:
+        return task.train_set, None
+    train_set = list(task.train_set or [])
+    train_set.extend(task.val_set)
     provenance = metadata.get("split_provenance")
     if isinstance(provenance, dict):
         provenance = dict(provenance)
-        provenance["limited_for_run"] = {k: v for k, v in limits.items() if v is not None}
+        provenance["validation_policy"] = "merged_into_train"
         provenance["run_split_sizes"] = {
-            "train": len(_limit_examples(task.train_set, limits["train"]) or []),
-            "val": len(_limit_examples(task.val_set, limits["val"]) or []),
-            "test": len(_limit_examples(task.test_set, limits["test"]) or []),
+            "train": len(train_set),
+            "val": 0,
+            "test": len(task.test_set or []),
         }
         metadata["split_provenance"] = provenance
-
-    return replace(
-        task,
-        train_set=_limit_examples(task.train_set, limits["train"]),
-        val_set=_limit_examples(task.val_set, limits["val"]),
-        test_set=_limit_examples(task.test_set, limits["test"]),
-        metadata=metadata,
-    )
+    return train_set, None
 
 
 def _example_id_set(task: Task, split_name: str, split: list[Example] | None) -> set[str]:
@@ -405,7 +387,9 @@ def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) ->
     """Apply the minimal benchmark contract before adapters see the task."""
     benchmark_cfg = benchmark_cfg or OmegaConf.create({})
     mode = _normalize_benchmark_mode(benchmark_cfg.get("mode") or task.metadata.get("type") or "single")
-    use_val = bool(benchmark_cfg.get("use_val", True))
+    if "use_val" in benchmark_cfg:
+        raise ValueError("benchmark.use_val was renamed to benchmark.split_train_val")
+    split_train_val = bool(benchmark_cfg.get("split_train_val", True))
 
     metadata = dict(task.metadata)
     metadata_mode = metadata.get("type")
@@ -426,14 +410,15 @@ def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) ->
     elif mode == "multi_task" and not task.train_set:
         raise ValueError(f"benchmark.mode=multi_task requires task '{task.name}' to define train_set")
 
+    train_set = task.train_set
     val_set = task.val_set
-    if not use_val:
-        val_set = None
+    if not split_train_val:
+        train_set, val_set = _merge_val_into_train(task, metadata)
 
     test_set = task.test_set if mode == "generalization" else None
 
     metadata["type"] = mode
-    prepared = replace(task, val_set=val_set, test_set=test_set, metadata=metadata)
+    prepared = replace(task, train_set=train_set, val_set=val_set, test_set=test_set, metadata=metadata)
 
     if mode == "single" and prepared.has_dataset:
         raise ValueError(
@@ -480,10 +465,8 @@ def main(cfg: DictConfig) -> None:
         adapter.run_dir = str(adapter_dir)
 
     # Thinking budget: ``max_thinking_tokens`` (fixed) and ``effort``
-    # (adaptive) are independent knobs — set neither, either, or both.
-    # When both are set, the adapter forwards both to the underlying tool;
-    # actual behavior is whatever the runtime (claude CLI / litellm) does
-    # when both are present.
+    # (adaptive) are independent knobs. When both are set, the adapter
+    # forwards both to the underlying runtime.
     max_thinking_tokens = cfg.get("max_thinking_tokens")
     effort = cfg.get("effort")
     if max_thinking_tokens is not None:
@@ -516,7 +499,7 @@ def main(cfg: DictConfig) -> None:
     benchmark_cfg = OmegaConf.create(OmegaConf.to_container(cfg.get("benchmark", {}), resolve=True))
     if benchmark_cfg.get("mode") is None:
         benchmark_cfg.mode = cfg.task.get("mode")
-    raw_task = _apply_task_split_limits(get_task(cfg.task.name), cfg.task)
+    raw_task = get_task(cfg.task.name)
 
     result = run(
         raw_task,
@@ -540,6 +523,10 @@ def main(cfg: DictConfig) -> None:
         "best_score": result.best_score,
         "total_evals": result.total_evals,
         "total_cost": result.metadata.get("total_cost", 0.0),
+        "solver_cost": result.metadata.get("solver_cost"),
+        "solver_cost_search": result.metadata.get("solver_cost_search"),
+        "solver_cost_test": result.metadata.get("solver_cost_test"),
+        "optimizer_cost": float(result.metadata.get("adapter_cost", 0.0)),
         "reflection_cost_log": result.metadata.get("reflection_cost_log"),
         "wall_time": result.metadata.get("wall_time"),
         "budget": result.metadata.get("budget"),

@@ -12,7 +12,7 @@
 
 defaults:
   - task: circle_packing
-  - adapter: gepa
+  - adapter: omni
   - tracking: none
   - _self_
 
@@ -21,10 +21,12 @@ defaults:
 #   - single: one fixed objective, no dataset splits
 #   - multi_task: visible dataset search, optional visible validation, no hidden test
 #   - generalization: train/optional val during search, hidden test after search
-# use_val: expose the validation split during search when the task has one.
+# split_train_val: when true, keep train_set and val_set as separate visible
+# channels during search. When false, merge validation examples into train_set
+# so all visible development examples remain available through one train channel.
 benchmark:
   mode: null
-  use_val: true
+  split_train_val: true
 
 # Access policy for this benchmark condition. The sandbox/harness should
 # enforce these fields where possible; the runner logs them in summary.json so

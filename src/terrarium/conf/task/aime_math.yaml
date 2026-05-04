@@ -4,6 +4,3 @@ mode: generalization
 solver_lm: gpt-4.1-mini
 solver_temperature: 1.0
 solver_max_tokens: 32000
-train_limit: null
-val_limit: null
-test_limit: null

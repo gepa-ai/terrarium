@@ -33,6 +33,8 @@ from terrarium.task import Task
 if TYPE_CHECKING:
     from terrarium.eval_server import EvalServer
 
+_RALPH_SAFETY_ITERATION_CAP = 1000
+
 
 # Single-task eval script: one POST per call, returns one score.
 # Usage: ./eval.sh <candidate_file>
@@ -221,6 +223,14 @@ This task also exposes a visible validation command over {val_size} examples.
 Returns the aggregate val_score.{val_cost}"""
 
 
+def _example_preview(ex: Any) -> dict[str, Any]:
+    inputs = dict(getattr(ex, "inputs", {}) or {})
+    data: dict[str, Any] = {"id": ex.id, "inputs": inputs}
+    if ex.expected is not None:
+        data["expected"] = ex.expected
+    return data
+
+
 def _budget_section(budget: BudgetTracker) -> str:
     lines: list[str] = []
     if budget.max_evals is not None:
@@ -396,19 +406,19 @@ def materialize_sandbox(
         train_dir = work_dir / "train"
         train_dir.mkdir(exist_ok=True)
         for ex in task.train_set:
-            data = {"id": ex.id, "inputs": ex.inputs}
-            if ex.expected is not None:
-                data["expected"] = ex.expected
-            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            (train_dir / f"{ex.id}.json").write_text(json.dumps(
+                _example_preview(ex),
+                indent=2,
+            ))
 
     if task.val_set:
         val_dir = work_dir / "val"
         val_dir.mkdir(exist_ok=True)
         for ex in task.val_set:
-            data = {"id": ex.id, "inputs": ex.inputs}
-            if ex.expected is not None:
-                data["expected"] = ex.expected
-            (val_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            (val_dir / f"{ex.id}.json").write_text(json.dumps(
+                _example_preview(ex),
+                indent=2,
+            ))
 
 
 
@@ -432,8 +442,7 @@ class ClaudeCodeAdapter:
         stop_at_score: float | None = None,
         max_thinking_tokens: int | None = None,
         sandbox: bool | None = None,
-        ralph: bool = False,
-        ralph_max_iterations: int = 50,
+        ralph: bool = True,
     ) -> None:
         if max_turns is not None:
             raise ValueError(
@@ -458,9 +467,8 @@ class ClaudeCodeAdapter:
         self.sandbox = sandbox
         # Ralph loop: when claude exits before the LLM/eval budget is out,
         # resume the session with ``--resume <session_id>`` and keep
-        # iterating. Off by default to preserve single-shot behavior.
+        # iterating. Enabled by default; budgets are the stopping condition.
         self.ralph = ralph
-        self.ralph_max_iterations = ralph_max_iterations
         # Tempdir whose lifetime spans evolve → process_result, so the
         # adapter's workspace is still readable when process_result runs.
         # Cleaned up by process_result; on an evolve error we let
@@ -565,7 +573,7 @@ class ClaudeCodeAdapter:
                 + "Keep refining best_candidate.txt until you exhaust the budget "
                 "or genuinely cannot find another improvement."
             )
-            for _ in range(self.ralph_max_iterations - 1):
+            while ralph_iterations < _RALPH_SAFETY_ITERATION_CAP:
                 if not self._has_budget_headroom(server, adapter_cost):
                     break
                 if proc.returncode != 0:
@@ -590,15 +598,31 @@ class ClaudeCodeAdapter:
                 if proc.returncode == 0 and iter_cost < 0.001:
                     break
 
-        best_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
+        submitted_candidate = best_file.read_text() if best_file.exists() else task.initial_candidate
+        selection_source = "best_candidate.txt"
+        best_candidate = submitted_candidate
+        best_score = server.best_score
+        if task.val_set and server.best_validated_candidate is not None:
+            best_candidate = server.best_validated_candidate
+            best_score = server.best_validated_score
+            selection_source = "best_validated_candidate"
+        elif task.has_dataset and server.best_visible_source is not None:
+            best_candidate = server.best_visible_candidate
+            best_score = server.best_visible_score
+            selection_source = server.best_visible_source
+        elif server.budget.used > 0:
+            best_candidate = server.best_candidate
+            selection_source = "best_observed_eval"
 
         return Result(
             best_candidate=best_candidate,
-            best_score=server.best_score,
+            best_score=best_score,
             total_evals=server.budget.used,
             eval_log=server.eval_log,
             metadata={
                 "adapter_cost": adapter_cost,
+                "submitted_candidate_source": selection_source,
+                "best_candidate_txt": submitted_candidate,
                 "session_id": session_id,
                 "work_dir": str(work_dir),
                 "claude_home": str(claude_home) if claude_home is not None else None,

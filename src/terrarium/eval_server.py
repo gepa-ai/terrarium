@@ -86,6 +86,11 @@ class EvalServer:
         self.max_concurrency = max_concurrency
         self.best_score: float = float("-inf")
         self.best_candidate: str = task.initial_candidate
+        self.best_visible_score: float = float("-inf")
+        self.best_visible_candidate: str = task.initial_candidate
+        self.best_visible_source: str | None = None
+        self.best_validated_score: float = float("-inf")
+        self.best_validated_candidate: str | None = None
         self.total_cost: float = 0.0
         self.eval_log: list[dict[str, Any]] = []
         self._start_time: float = time.time()
@@ -241,6 +246,9 @@ class EvalServer:
         if errors:
             info["errors"] = errors
 
+        if example_ids is None and split in ("train", "all"):
+            self.record_visible_candidate(avg, candidate, source=f"{split}_aggregate")
+
         return avg, info
 
 
@@ -251,8 +259,26 @@ class EvalServer:
 
         val_ids = [ex.id for ex in self.task.val_set]
         avg_score, _ = self.evaluate_examples(candidate, example_ids=val_ids)
+        self.record_visible_candidate(avg_score, candidate, source="validation")
 
         return self.log_progress(avg_score, candidate=candidate)
+
+    def record_visible_candidate(self, score: float, candidate: str, *, source: str) -> None:
+        """Track the best aggregate visible-data candidate.
+
+        Per-example evals update ``best_candidate`` for debugging, but benchmark
+        submission for dataset tasks should use aggregate train/validation
+        selection. This method is the shared bookkeeping path for full train
+        aggregate and validation aggregate scores.
+        """
+        with self._lock:
+            if score > self.best_visible_score:
+                self.best_visible_score = float(score)
+                self.best_visible_candidate = candidate
+                self.best_visible_source = source
+            if source == "validation" and score > self.best_validated_score:
+                self.best_validated_score = float(score)
+                self.best_validated_candidate = candidate
 
     def log_progress(self, val_score: float, candidate: str | None = None, reflection_cost: float = 0.0) -> dict[str, Any]:
         """Record a progress checkpoint."""
@@ -386,6 +412,9 @@ class EvalServer:
         """Capture current run state. Must be called inside ``_lock``."""
         return {
             "best_score": self.best_score,
+            "best_visible_score": self.best_visible_score,
+            "best_visible_source": self.best_visible_source,
+            "best_validated_score": self.best_validated_score,
             "total_evals": self.budget.used,
             "total_cost": self.total_cost,
             "budget": self.budget.status(),
@@ -561,6 +590,9 @@ class EvalServer:
             "budget": self.budget.status(),
             "task": self.task.name,
             "best_score": self.best_score,
+            "best_visible_score": self.best_visible_score,
+            "best_visible_source": self.best_visible_source,
+            "best_validated_score": self.best_validated_score,
             "total_evals": self.budget.used,
             "total_cost": self.total_cost,
         })

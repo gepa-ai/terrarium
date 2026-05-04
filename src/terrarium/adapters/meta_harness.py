@@ -217,10 +217,11 @@ evaluation budget.
 
 _EVAL_DATASET = """\
 This is a **dataset / generalization** task with {train_size} training
-examples{val_note}. The outer loop scores each candidate on the full
-training split; each example costs 1 unit of the evaluation budget, so one
-fully-scored candidate costs {train_size} units. Your candidate must
-generalize across *every* train example, not just one.
+examples{val_note}. When validation is available, the outer loop scores each
+candidate on the full validation split and writes detailed result traces for
+the next iteration, matching the reference Meta-Harness evolution loop. If no
+validation split is available, it scores the full training split. Each example
+costs 1 unit of the evaluation budget.
 """
 
 _EVAL_MULTI_TASK = """\
@@ -229,6 +230,13 @@ The outer loop scores each candidate on the full visible training set; each
 example costs 1 unit of the evaluation budget, so one fully-scored candidate
 costs {train_size} units.
 """
+
+def _example_preview(ex: Any) -> dict[str, Any]:
+    inputs = dict(getattr(ex, "inputs", {}) or {})
+    data: dict[str, Any] = {"id": ex.id, "inputs": inputs}
+    if ex.expected is not None:
+        data["expected"] = ex.expected
+    return data
 
 
 def _build_task_md(task: Task) -> str:
@@ -243,7 +251,7 @@ def _build_task_md(task: Task) -> str:
             val_note = f" (validation command covers {len(task.val_set)} visible examples)" if task.val_set else ""
             eval_section = _EVAL_MULTI_TASK.format(train_size=len(task.train_set), val_note=val_note)
         else:
-            val_note = f" and {len(task.val_set)} visible validation examples" if task.val_set else ""
+            val_note = f" and {len(task.val_set)} validation examples for selection" if task.val_set else ""
             eval_section = _EVAL_DATASET.format(train_size=len(task.train_set), val_note=val_note)
     else:
         eval_section = _EVAL_SINGLE
@@ -316,19 +324,13 @@ def _materialize_sandbox(work_dir: Path, task: Task, budget: BudgetTracker) -> N
         train_dir = work_dir / "train"
         train_dir.mkdir(exist_ok=True)
         for ex in task.train_set:
-            data: dict[str, Any] = {"id": ex.id, "inputs": ex.inputs}
-            if ex.expected is not None:
-                data["expected"] = ex.expected
-            (train_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            (train_dir / f"{ex.id}.json").write_text(json.dumps(_example_preview(ex), indent=2))
 
     if task.val_set:
         val_dir = work_dir / "val"
         val_dir.mkdir(exist_ok=True)
         for ex in task.val_set:
-            data = {"id": ex.id, "inputs": ex.inputs}
-            if ex.expected is not None:
-                data["expected"] = ex.expected
-            (val_dir / f"{ex.id}.json").write_text(json.dumps(data, indent=2))
+            (val_dir / f"{ex.id}.json").write_text(json.dumps(_example_preview(ex), indent=2))
 
 
 # ── Proposer subprocess (claude --print stream-json) ────────────────
@@ -550,9 +552,13 @@ def _load_candidate(work_dir: Path, relpath: str) -> str | None:
 
 
 def _score_candidate(server: "EvalServer", task: Task, candidate: str) -> tuple[float, dict[str, Any]]:
-    """Score a candidate via the eval server. Dataset tasks prefer val split
-    (matches the other adapters' search-loop convention); fall back to train
-    if no val_set; single-task → evaluate()."""
+    """Score a candidate via the eval server.
+
+    Meta-Harness treats the visible eval/validation split as its search signal:
+    when ``val_set`` exists, evaluate and trace validation examples. This is
+    intentionally different from GEPA's train-reflection/val-selection split
+    and matches the reference Meta-Harness examples' ``frontier_val`` loop.
+    """
     if task.has_dataset:
         if task.val_set:
             return server.evaluate_examples(candidate, split="val")
@@ -910,6 +916,7 @@ class MetaHarnessAdapter:
                 eval_idx_before = len(server.eval_log)
                 try:
                     score, info = _score_candidate(server, task, cand_text)
+                    selection_source = "validation" if task.val_set else "train"
                 except BudgetExhausted:
                     # Capture any traces produced before budget tripped
                     _capture_eval_traces(
@@ -950,7 +957,9 @@ class MetaHarnessAdapter:
 
                 # Mirror this candidate's per-eval JSONs (compile errors,
                 # logs, per-example scores...) into state/eval_traces/<name>/
-                # so the next proposer iteration can read them directly.
+                # so the next proposer iteration can read them directly. When
+                # val_set exists these are validation traces, matching the
+                # reference Meta-Harness frontier_val loop.
                 trace_count = _capture_eval_traces(
                     server, name, (eval_idx_before, len(server.eval_log)), work_dir,
                 )
@@ -966,7 +975,7 @@ class MetaHarnessAdapter:
                 trace_str = f" traces={trace_count}" if trace_count else ""
                 _log(
                     f"    [{ci}/{len(candidates)}] {_bold(name)}: "
-                    f"{_colorize_score(score)} {delta_str} "
+                    f"{_colorize_score(score)} {selection_source} {delta_str} "
                     f"{_dim(f'(budget_used={budget.used}{trace_str})')}"
                 )
 
@@ -981,8 +990,8 @@ class MetaHarnessAdapter:
                     axis=c.get("axis", ""),
                     components=c.get("components", []),
                     outcome=(
-                        f"{score:.4f}" if prev_best is None
-                        else f"{score:.4f} ({score - prev_best:+.4f})"
+                        f"{selection_source} {score:.4f}" if prev_best is None
+                        else f"{selection_source} {score:.4f} ({score - prev_best:+.4f})"
                     ),
                     budget_used=budget.used,
                     propose_time=propose_time if ci == 1 else None,
@@ -1054,12 +1063,14 @@ class MetaHarnessAdapter:
         # server's bookkeeping when the proposer never produced anything.
         best_candidate = server.best_candidate
         best_score = self._best_score(frontier_path)
+        selection_source = "server_best_eval"
         frontier = self._read_frontier(frontier_path)
         best_file = frontier.get("best_candidate_file") if frontier else None
         if best_file:
             loaded = _load_candidate(work_dir, best_file)
             if loaded is not None:
                 best_candidate = loaded
+                selection_source = "frontier_val" if task.val_set else "frontier_train"
         if best_score is None:
             best_score = server.best_score
         return Result(
@@ -1069,6 +1080,7 @@ class MetaHarnessAdapter:
             eval_log=server.eval_log,
             metadata={
                 "adapter_cost": total_proposer_cost,
+                "submitted_candidate_source": selection_source,
                 "meta_harness": {
                     "iterations_run": iteration,
                     "stop_reason": stop_reason,

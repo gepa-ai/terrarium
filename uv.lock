@@ -791,76 +791,35 @@ wheels = [
 name = "dspy"
 version = "2.6.27"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version < '3.11'",
-]
 dependencies = [
-    { name = "anyio", marker = "python_full_version < '3.11'" },
-    { name = "asyncer", marker = "python_full_version < '3.11'" },
-    { name = "backoff", marker = "python_full_version < '3.11'" },
-    { name = "cachetools", marker = "python_full_version < '3.11'" },
-    { name = "cloudpickle", marker = "python_full_version < '3.11'" },
-    { name = "datasets", marker = "python_full_version < '3.11'" },
-    { name = "diskcache", marker = "python_full_version < '3.11'" },
-    { name = "joblib", marker = "python_full_version < '3.11'" },
-    { name = "json-repair", marker = "python_full_version < '3.11'" },
-    { name = "litellm", marker = "python_full_version < '3.11'" },
-    { name = "magicattr", marker = "python_full_version < '3.11'" },
+    { name = "anyio" },
+    { name = "asyncer" },
+    { name = "backoff" },
+    { name = "cachetools" },
+    { name = "cloudpickle" },
+    { name = "datasets" },
+    { name = "diskcache" },
+    { name = "joblib" },
+    { name = "json-repair" },
+    { name = "litellm" },
+    { name = "magicattr" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "openai", marker = "python_full_version < '3.11'" },
-    { name = "optuna", marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "openai" },
+    { name = "optuna" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pydantic", marker = "python_full_version < '3.11'" },
-    { name = "regex", marker = "python_full_version < '3.11'" },
-    { name = "requests", marker = "python_full_version < '3.11'" },
-    { name = "rich", marker = "python_full_version < '3.11'" },
-    { name = "tenacity", marker = "python_full_version < '3.11'" },
-    { name = "tqdm", marker = "python_full_version < '3.11'" },
-    { name = "ujson", marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pydantic" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "rich" },
+    { name = "tenacity" },
+    { name = "tqdm" },
+    { name = "ujson" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/38/8a/f7ff1a6d3b5294678f13d17ecfc596f49a59e494b190e4e30f7dea7df1dc/dspy-2.6.27.tar.gz", hash = "sha256:de1c4f6f6d127e0efed894e1915dac40f5d5623e7f1cf3d749c98d790066477a", size = 234604, upload-time = "2025-06-03T17:47:13.411Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5a/bb/8a75d44bc1b54dea0fa0428eb52b13e7ee533b85841d2c53a53dfc360646/dspy-2.6.27-py3-none-any.whl", hash = "sha256:54e55fd6999b6a46e09b0e49e8c4b71be7dd56a881e66f7a60b8d657650c1a74", size = 297296, upload-time = "2025-06-03T17:47:11.526Z" },
-]
-
-[[package]]
-name = "dspy"
-version = "3.2.0"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
-dependencies = [
-    { name = "anyio", marker = "python_full_version >= '3.11'" },
-    { name = "asyncer", marker = "python_full_version >= '3.11'" },
-    { name = "cachetools", marker = "python_full_version >= '3.11'" },
-    { name = "cloudpickle", marker = "python_full_version >= '3.11'" },
-    { name = "diskcache", marker = "python_full_version >= '3.11'" },
-    { name = "gepa", version = "0.0.27", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "json-repair", marker = "python_full_version >= '3.11'" },
-    { name = "litellm", marker = "python_full_version >= '3.11'" },
-    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "openai", marker = "python_full_version >= '3.11'" },
-    { name = "orjson", marker = "python_full_version >= '3.11'" },
-    { name = "pydantic", marker = "python_full_version >= '3.11'" },
-    { name = "regex", marker = "python_full_version >= '3.11'" },
-    { name = "requests", marker = "python_full_version >= '3.11'" },
-    { name = "tenacity", marker = "python_full_version >= '3.11'" },
-    { name = "tqdm", marker = "python_full_version >= '3.11'" },
-    { name = "typeguard", marker = "python_full_version >= '3.11'" },
-    { name = "xxhash", marker = "python_full_version >= '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/9e/38/ab4b3ba261962cf1cd0456113253290329de5c80296ce968f060195c4a03/dspy-3.2.0.tar.gz", hash = "sha256:70593061e8d3df7924e6b7bfe5e61d064e5990f1505b82380b49252b00a88fd7", size = 278448, upload-time = "2026-04-21T17:15:49.917Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/aa/5b064672fe12bdeb36bda5a70213a773122166ded763d2ccf4dad6eb145b/dspy-3.2.0-py3-none-any.whl", hash = "sha256:cbf82a3ddcd69df071db6cdf7455e7304d66cd47fcb09c856454739414e16d89", size = 331038, upload-time = "2026-04-21T17:15:48.703Z" },
 ]
 
 [[package]]
@@ -1119,31 +1078,8 @@ http = [
 
 [[package]]
 name = "gepa"
-version = "0.0.27"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4e/99/6840f84498f2dcbfd27e8a15eeb4e637e84e9dbbd6331977b71f6ffad9c7/gepa-0.0.27.tar.gz", hash = "sha256:02ecb19e4aa6a1f5bb2994cd54b2057f25cd5e8cd662fee514303b2a8ba0a738", size = 155106, upload-time = "2026-01-28T00:33:51.72Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/bd/f9e83519099a9fd5d090520ab0c51a6278e473b914a9b32d1e812662dd3b/gepa-0.0.27-py3-none-any.whl", hash = "sha256:592beb084fd638d525edae84ca75ad8e9e9c3758e5498b933c17153addf5dd2d", size = 146454, upload-time = "2026-01-28T00:33:50.262Z" },
-]
-
-[[package]]
-name = "gepa"
 version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version < '3.11'",
-]
 sdist = { url = "https://files.pythonhosted.org/packages/e4/62/10f5a8f24c075e3b64f952be73ba8e15f0055584bbcdf9ce48d754a36679/gepa-0.1.1.tar.gz", hash = "sha256:643fda01c23de4c9f01306e01305dd69facc29bcb34ad59e4cd07e6621d34aa1", size = 272251, upload-time = "2026-03-16T10:17:53.131Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dc/b7/8c72dedbb950d88a6f64588fcbc590d2a21e2b9f19b36aa6c5016c54ec75/gepa-0.1.1-py3-none-any.whl", hash = "sha256:71ead7c591eafcc727b83509cdc4182f20264800a6ddf8520d61419daeb47466", size = 244246, upload-time = "2026-03-16T10:17:51.922Z" },
@@ -2498,13 +2434,14 @@ name = "optuna"
 version = "4.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "alembic", marker = "python_full_version < '3.11'" },
-    { name = "colorlog", marker = "python_full_version < '3.11'" },
+    { name = "alembic" },
+    { name = "colorlog" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "packaging", marker = "python_full_version < '3.11'" },
-    { name = "pyyaml", marker = "python_full_version < '3.11'" },
-    { name = "sqlalchemy", marker = "python_full_version < '3.11'" },
-    { name = "tqdm", marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging" },
+    { name = "pyyaml" },
+    { name = "sqlalchemy" },
+    { name = "tqdm" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bf/9b/62f120fb2ecbc4338bee70c5a3671c8e561714f3aa1a046b897ff142050e/optuna-4.8.0.tar.gz", hash = "sha256:6f7043e9f8ecb5e607af86a7eb00fb5ec2be26c3b08c201209a73d36aff37a38", size = 482603, upload-time = "2026-03-16T04:59:58.659Z" }
 wheels = [
@@ -4185,8 +4122,7 @@ dependencies = [
 [package.optional-dependencies]
 aime = [
     { name = "datasets" },
-    { name = "dspy", version = "2.6.27", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "dspy", version = "3.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "dspy" },
 ]
 anthropic-sdk = [
     { name = "anthropic" },
@@ -4221,8 +4157,7 @@ frontier-cs = [
     { name = "requests" },
 ]
 gepa = [
-    { name = "gepa", version = "0.0.27", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "gepa", version = "0.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "gepa" },
 ]
 
 [package.metadata]
@@ -4404,18 +4339,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/16/e1/3079a9ff9b8e11b846c6ac5c8b5bfb7ff225eee721825310c91b3b50304f/tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf", size = 78374, upload-time = "2026-02-03T17:35:50.982Z" },
-]
-
-[[package]]
-name = "typeguard"
-version = "4.4.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "typing-extensions", marker = "python_full_version >= '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/34/53/f701077a29ddf65ed4556119961ef517d767c07f15f6cdf0717ad985426b/typeguard-4.4.3.tar.gz", hash = "sha256:be72b9c85f322c20459b29060c5c099cd733d5886c4ee14297795e62b0c0d59b", size = 75072, upload-time = "2025-06-04T21:47:07.733Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5c/18/662e2a14fcdbbc9e7842ad801a7f9292fcd6cf7df43af94e59ac9c0da9af/typeguard-4.4.3-py3-none-any.whl", hash = "sha256:7d8b4a3d280257fd1aa29023f22de64e29334bda0b172ff1040f05682223795e", size = 34855, upload-time = "2025-06-04T21:47:03.683Z" },
 ]
 
 [[package]]
