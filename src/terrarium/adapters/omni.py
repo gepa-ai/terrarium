@@ -256,23 +256,33 @@ class OmniAdapter:
         try:
             if self.strategy == "sequential":
                 omni_result = optimize_sequential_with_server(inner_servers, omni_configs)
-                return self._wrap_result(omni_result)
-            if self.strategy == "parallel":
+            elif self.strategy == "parallel":
                 results = optimize_parallel_with_server(inner_servers, omni_configs, max_workers=self.max_workers)
                 # Convention: surface the first backend's result; full list
                 # in metadata. Callers wanting the best should use best_of.
-                primary = results[0]
-                primary.metadata["all_results"] = results
-                return self._wrap_result(primary)
-            if self.strategy == "best_of":
-                omni_result = optimize_best_of_with_server(inner_servers, omni_configs, max_workers=self.max_workers)
-                return self._wrap_result(omni_result)
-            if self.strategy == "vote":
+                omni_result = results[0]
+                omni_result.metadata["all_results"] = results
+            elif self.strategy == "best_of":
+                omni_result = optimize_best_of_with_server(
+                    inner_servers, omni_configs, max_workers=self.max_workers
+                )
+            elif self.strategy == "vote":
                 omni_result = optimize_vote_with_server(
                     inner_servers, omni_configs, evaluate, max_workers=self.max_workers
                 )
-                return self._wrap_result(omni_result)
-            raise ValueError(f"Unknown strategy: {self.strategy!r}")
+            else:
+                raise ValueError(f"Unknown strategy: {self.strategy!r}")
+
+            # Each branch's per-branch ``adapter_cost`` is left intact by the
+            # omni helpers. terrarium's runner reads the wrapped result's
+            # ``adapter_cost`` to compute total spend (runner.py:125-126), so
+            # sum across branches here before wrapping — otherwise it would
+            # only see the winning branch's slice.
+            branches = omni_result.metadata["all_results"]
+            omni_result.metadata["adapter_cost"] = sum(
+                float(r.metadata.get("adapter_cost", 0.0) or 0.0) for r in branches
+            )
+            return self._wrap_result(omni_result)
         finally:
             for s in inner_servers:
                 s.stop()

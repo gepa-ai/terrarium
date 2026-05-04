@@ -39,6 +39,7 @@ Usage::
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import logging
 import os
@@ -51,6 +52,30 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+# Hard ceiling on a single judge evaluation. The Docker judge occasionally
+# wedges (TCP read never returns) under concurrent load — without a timeout
+# the calling thread blocks forever and the gepa loop's iteration 0 never
+# completes. With this in place a wedged eval surfaces as a TimeoutError,
+# we retry once, and on a second timeout return a 0-score "timeout" info
+# so the run keeps moving.
+EVAL_TIMEOUT_SEC = 300
+
+
+def _eval_with_timeout(runner: Any, problem_id: str, candidate: str) -> Any:
+    """Run ``runner.evaluate(problem_id, candidate)`` with a hard timeout.
+
+    Returns the runner's result on success, raises ``TimeoutError`` on
+    timeout, propagates any other exception. The orphaned worker thread (if
+    we did time out) is left to die in the background — Python can't preempt
+    threads, so ``shutdown(wait=False)`` is the cleanest we can do.
+    """
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(runner.evaluate, str(problem_id), candidate).result(timeout=EVAL_TIMEOUT_SEC)
+    finally:
+        ex.shutdown(wait=False)
+
 
 _FRONTIER_CS_REPO_URL = "https://github.com/FrontierCS/Frontier-CS"
 _JUDGE_PORT = 8081
@@ -123,8 +148,7 @@ def _ensure_repo(base: Path) -> None:
         )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
-            f"git clone of {_FRONTIER_CS_REPO_URL} failed ({e}). "
-            f"Clone manually to {base} and/or set FRONTIER_CS_DIR."
+            f"git clone of {_FRONTIER_CS_REPO_URL} failed ({e}). Clone manually to {base} and/or set FRONTIER_CS_DIR."
         ) from e
 
 
@@ -256,7 +280,40 @@ def _evaluate(candidate: str, *, problem_id: str) -> tuple[float, dict[str, Any]
 
     try:
         runner = AlgorithmicLocalRunner(base_dir=base, auto_start=False)
-        result = runner.evaluate(str(problem_id), candidate)
+    except Exception as e:
+        return 0.0, {
+            "score": 0.0,
+            "problem_id": problem_id,
+            "status": "error",
+            "message": f"{type(e).__name__}: {e}",
+            "logs": "",
+        }
+
+    # Run runner.evaluate in a worker thread so we can enforce a hard
+    # timeout. Try once, then retry on timeout. A timed-out thread can't
+    # be preempted, so we orphan it via shutdown(wait=False) and move on.
+    try:
+        result = _eval_with_timeout(runner, problem_id, candidate)
+    except concurrent.futures.TimeoutError:
+        logger.warning("frontier_cs eval timeout 1/2 on problem %s — retrying", problem_id)
+        try:
+            result = _eval_with_timeout(runner, problem_id, candidate)
+        except concurrent.futures.TimeoutError:
+            return 0.0, {
+                "score": 0.0,
+                "problem_id": problem_id,
+                "status": "timeout",
+                "message": f"eval exceeded {EVAL_TIMEOUT_SEC}s on both attempts",
+                "logs": "",
+            }
+        except Exception as e:
+            return 0.0, {
+                "score": 0.0,
+                "problem_id": problem_id,
+                "status": "error",
+                "message": f"{type(e).__name__}: {e}",
+                "logs": "",
+            }
     except Exception as e:
         return 0.0, {
             "score": 0.0,
@@ -281,9 +338,7 @@ def _make_problem_task(problem_id: str) -> Task:
     """Factory for a single-problem task. Runs on first get_task() access."""
     rows = _algorithmic_rows()
     if problem_id not in rows:
-        raise KeyError(
-            f"Frontier-CS algorithmic problem {problem_id!r} not found in HF dataset."
-        )
+        raise KeyError(f"Frontier-CS algorithmic problem {problem_id!r} not found in HF dataset.")
     row = rows[problem_id]
 
     def eval_fn(candidate: str) -> tuple[float, dict[str, Any]]:
@@ -333,9 +388,7 @@ def _make_smoke_task() -> Task:
     def eval_fn(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         return _evaluate(candidate, problem_id=example.inputs["problem_id"])
 
-    statements = "\n\n---\n\n".join(
-        f"### Problem {pid}\n\n{rows[pid]['statement']}" for pid in available
-    )
+    statements = "\n\n---\n\n".join(f"### Problem {pid}\n\n{rows[pid]['statement']}" for pid in available)
     return Task(
         name="frontier_cs_algo_smoke",
         objective=_OBJECTIVE,
