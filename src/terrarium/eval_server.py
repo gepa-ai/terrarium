@@ -136,7 +136,7 @@ class EvalServer:
                 score, info = self.task.eval_fn(candidate)
 
             self.budget.record(score)
-            self._track(candidate, score, info)
+            self._track(candidate, score, info, example_id=example.id if example else None)
 
             info["_budget"] = self.budget.status()
             return score, info
@@ -346,8 +346,26 @@ class EvalServer:
 
     # ── Internal ────────────────────────────────────────────────────────
 
-    def _track(self, candidate: str, score: float, info: dict[str, Any] | None = None) -> None:
+    def _track(
+        self,
+        candidate: str,
+        score: float,
+        info: dict[str, Any] | None = None,
+        example_id: str | None = None,
+    ) -> None:
         cost = float(info.get("cost", 0.0)) if info else 0.0
+        # Determine which split this example belongs to so trajectory plots
+        # can filter (e.g. val-only curves) without lossy basename-matching.
+        # Cache the id→split lookup once on first use.
+        split: str | None = None
+        if example_id is not None and self.task.has_dataset:
+            if not hasattr(self, "_split_index"):
+                idx_map: dict[str, str] = {}
+                for s in ("train", "val", "test"):
+                    for ex in (getattr(self.task, f"{s}_set", None) or []):
+                        idx_map[ex.id] = s
+                self._split_index = idx_map  # type: ignore[attr-defined]
+            split = self._split_index.get(example_id)  # type: ignore[attr-defined]
         with self._lock:
             self.total_cost += cost
             idx = len(self.eval_log)  # 0-indexed file name for per-eval JSON
@@ -358,6 +376,10 @@ class EvalServer:
                 "wall_time": time.time() - self._start_time,
                 "cumulative_cost": self.total_cost,
             }
+            if example_id is not None:
+                entry["example_id"] = example_id
+            if split is not None:
+                entry["split"] = split
             if cost:
                 entry["cost"] = cost
             self.eval_log.append(entry)
