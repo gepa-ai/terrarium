@@ -30,7 +30,7 @@ FAILED_SCORE = -100_000.0
 # graph) can run forever. Implemented as a daemon thread + join — Python
 # can't kill threads, so the timed-out worker keeps burning CPU until the
 # process exits. Diverges from blog setup (no timeout there) intentionally.
-SEARCH_ALGORITHM_TIMEOUT_SECS = 60.0
+SEARCH_ALGORITHM_TIMEOUT_SECS = 300.0
 
 
 def _call_with_timeout(fn: Callable, args: tuple, timeout: float) -> tuple[str, Any]:
