@@ -64,8 +64,8 @@ class OmniAdapter:
             - ``"single"`` (default) — run one backend (``self.backend``).
               Backward-compatible with the original adapter.
             - ``"sequential"`` — chain backends; each best becomes the next
-              backend's seed. All stages share **one** inner server (one
-              budget pool); per-config budgets are ignored.
+              backend's seed. Budget is fair-shared: each stage gets its own
+              ``total / N`` partition, same as the parallel-family strategies.
             - ``"parallel"`` — run N backends concurrently against N inner
               servers (budget pre-partitioned ``total / N``). Returns the
               first backend's result by convention; full per-backend results
@@ -85,10 +85,11 @@ class OmniAdapter:
         stop_at_score: Score threshold for early stop. Forwarded as
             ``OmniConfig.stop_at_score``.
         effort: ``claude --effort`` for backends that spawn Claude Code.
-            Mutex with ``max_thinking_tokens``. Runner threads top-level
-            ``effort`` here when null.
-        max_thinking_tokens: Fixed thinking-token budget. Mutex with ``effort``.
-            Runner threads top-level ``max_thinking_tokens`` here when null.
+            Independent of ``max_thinking_tokens`` — both can be set together.
+            Runner threads top-level ``effort`` here when null.
+        max_thinking_tokens: Fixed thinking-token budget. Independent of
+            ``effort`` (both can be set together). Runner threads top-level
+            ``max_thinking_tokens`` here when null.
         sandbox: Whether to wrap subprocess backends in bwrap/Seatbelt.
             Runner threads top-level ``sandbox`` here when null.
         callbacks: Optional GEPA callback list. Only consumed by ``gepa``
@@ -229,24 +230,11 @@ class OmniAdapter:
         n = len(self.configs)
         omni_configs = [self._materialize_config(entry, idx) for idx, entry in enumerate(self.configs)]
 
-        if self.strategy == "sequential":
-            # Single shared inner server — all stages draw from one budget pool
-            # equal to the outer server's budget. Per-config budgets ignored.
-            inner_server = OmniEvalServer(
-                omni_task,
-                evaluate,
-                BudgetTracker(max_evals=max_evals, max_token_cost=max_token_cost),
-                max_concurrency=server.max_concurrency,
-                output_dir=None,
-            )
-            inner_server.start()
-            try:
-                omni_result = optimize_sequential_with_server(inner_server, omni_configs)
-            finally:
-                inner_server.stop()
-            return self._wrap_result(omni_result)
-
-        # Parallel-family: one inner server per config, budgets pre-partitioned.
+        # All ensemble strategies (sequential / parallel / best_of / vote)
+        # use the same fair-share partition: one inner server per config, each
+        # carrying ``total / N`` of the outer budget. Sequential's stages run
+        # one at a time but each stage still has its own pre-partitioned cap,
+        # so a productive early stage can't monopolize the pool.
         per_evals = max_evals // n if max_evals is not None else None
         per_cost = (max_token_cost / n) if max_token_cost is not None else None
         inner_servers = [
@@ -263,22 +251,35 @@ class OmniAdapter:
         for s in inner_servers:
             s.start()
         try:
-            if self.strategy == "parallel":
+            if self.strategy == "sequential":
+                omni_result = optimize_sequential_with_server(inner_servers, omni_configs)
+            elif self.strategy == "parallel":
                 results = optimize_parallel_with_server(inner_servers, omni_configs, max_workers=self.max_workers)
                 # Convention: surface the first backend's result; full list
                 # in metadata. Callers wanting the best should use best_of.
-                primary = results[0]
-                primary.metadata["all_results"] = results
-                return self._wrap_result(primary)
-            if self.strategy == "best_of":
-                omni_result = optimize_best_of_with_server(inner_servers, omni_configs, max_workers=self.max_workers)
-                return self._wrap_result(omni_result)
-            if self.strategy == "vote":
+                omni_result = results[0]
+                omni_result.metadata["all_results"] = results
+            elif self.strategy == "best_of":
+                omni_result = optimize_best_of_with_server(
+                    inner_servers, omni_configs, max_workers=self.max_workers
+                )
+            elif self.strategy == "vote":
                 omni_result = optimize_vote_with_server(
                     inner_servers, omni_configs, evaluate, max_workers=self.max_workers
                 )
-                return self._wrap_result(omni_result)
-            raise ValueError(f"Unknown strategy: {self.strategy!r}")
+            else:
+                raise ValueError(f"Unknown strategy: {self.strategy!r}")
+
+            # Each branch's per-branch ``adapter_cost`` is left intact by the
+            # omni helpers. terrarium's runner reads the wrapped result's
+            # ``adapter_cost`` to compute total spend (runner.py:125-126), so
+            # sum across branches here before wrapping — otherwise it would
+            # only see the winning branch's slice.
+            branches = omni_result.metadata["all_results"]
+            omni_result.metadata["adapter_cost"] = sum(
+                float(r.metadata.get("adapter_cost", 0.0) or 0.0) for r in branches
+            )
+            return self._wrap_result(omni_result)
         finally:
             for s in inner_servers:
                 s.stop()

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,15 @@ _SIMULATOR_DIR = Path(__file__).resolve().parent / "simulator"
 # Program file management (cached per process)
 # ---------------------------------------------------------------------------
 
+# ``_cache_lock`` serializes the check + evict + write sequence so two
+# threads can't simultaneously rmtree+rewrite the cache mid-mutation.
+# Note: it does NOT prevent a third thread from evicting the tempdir
+# *after* ``get_program_path`` has returned to a caller still using the
+# path (e.g. running its simulator subprocess). That residual race is
+# acceptable in practice because callers typically run a candidate's
+# evals in a tight burst before the next candidate flips the cache.
+_cache_lock = threading.RLock()
+
 _program_cache: dict[str, Any] = {
     "code": None,
     "path": None,
@@ -41,36 +51,41 @@ _program_cache: dict[str, Any] = {
 
 def get_program_path(program_code: str) -> str:
     """Write the candidate program to a temp file if it has changed; return its path."""
-    if _program_cache["code"] != program_code:
-        _evict_cached_program()
-        _write_program_to_cache(program_code)
-    return _program_cache["path"]
+    with _cache_lock:
+        if _program_cache["code"] != program_code:
+            _evict_cached_program()
+            _write_program_to_cache(program_code)
+        return _program_cache["path"]
 
 
 def syntax_is_valid(program_path: str) -> bool:
     """Return True if the cached program passed the syntax and structure check."""
-    return _program_cache["syntax_ok"] is True
+    with _cache_lock:
+        return _program_cache["syntax_ok"] is True
 
 
 def syntax_failure_info(example: dict[str, Any]) -> SideInfo:
     """Build a SideInfo dict describing a syntax or structure validation failure."""
-    return {
-        "scores": {"cost": FAILED_SCORE},
-        "Input": {
-            "trace_file": os.path.basename(example.get("trace_file", "?")),
-            "config": example.get("config", {}),
-        },
-        "Error": _program_cache["syntax_error"] or "Syntax validation failed",
-    }
+    with _cache_lock:
+        return {
+            "scores": {"cost": FAILED_SCORE},
+            "Input": {
+                "trace_file": os.path.basename(example.get("trace_file", "?")),
+                "config": example.get("config", {}),
+            },
+            "Error": _program_cache["syntax_error"] or "Syntax validation failed",
+        }
 
 
 def _evict_cached_program() -> None:
+    # Caller already holds ``_cache_lock``.
     if _program_cache["tmpdir"]:
         shutil.rmtree(_program_cache["tmpdir"], ignore_errors=True)
     _program_cache.update(code=None, path=None, tmpdir=None, syntax_ok=None, syntax_error=None)
 
 
 def _write_program_to_cache(code: str) -> None:
+    # Caller already holds ``_cache_lock``.
     tmpdir = tempfile.mkdtemp(prefix="cant_be_late_eval_")
     path = os.path.join(tmpdir, "strategy.py")
     with open(path, "w", encoding="utf-8") as f:
