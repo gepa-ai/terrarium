@@ -7,6 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from omegaconf import OmegaConf
@@ -26,6 +27,8 @@ from terrarium.adapter import Result
 from terrarium.registry import get_task, list_tasks
 from terrarium.runner import (
     _effective_adapter_sandbox,
+    _apply_task_runtime_config,
+    _evaluate_heldout_test,
     _prepare_task_for_benchmark,
     _sandbox_scope,
     _validate_access_policy,
@@ -33,6 +36,7 @@ from terrarium.runner import (
 )
 from terrarium.task import Example, Task
 from terrarium.tasks.arc_agi import _evaluate_test
+from terrarium.tasks import aime_math
 from terrarium.tasks import frontier_cs
 
 
@@ -167,6 +171,46 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertEqual(result.metadata["test_scores"], {"test": 3.0})
         self.assertEqual(result.metadata["test_score"], 3.0)
 
+    def test_heldout_test_eval_uses_separate_parallel_budget(self) -> None:
+        calls: list[str] = []
+
+        def eval_fn(candidate: str, example: Example) -> tuple[float, dict]:
+            del candidate
+            calls.append(example.id)
+            return float(example.expected or 0.0), {"cost": 0.25}
+
+        task = Task(
+            name="heldout",
+            initial_candidate="seed",
+            eval_fn=eval_fn,
+            test_set=[Example("a", {}, 1.0), Example("b", {}, 0.0)],
+            metadata={"type": "generalization"},
+        )
+
+        scores, cost, errors = _evaluate_heldout_test(task, "candidate", max_concurrency=2)
+
+        self.assertEqual(scores, {"a": 1.0, "b": 0.0})
+        self.assertEqual(cost, 0.5)
+        self.assertEqual(errors, {})
+        self.assertCountEqual(calls, ["a", "b"])
+
+    def test_run_reports_optimizer_budget_status(self) -> None:
+        class CostAdapter:
+            def evolve(self, task: Task, server: EvalServer) -> Result:
+                del task, server
+                return Result(
+                    best_candidate="seed",
+                    best_score=0.0,
+                    metadata={"adapter_cost": 0.75},
+                )
+
+        task = _task(train=[Example("train", {}, 1.0)], test=[Example("test", {}, 1.0)])
+
+        result = run(task, CostAdapter(), max_evals=10, max_token_cost=0.5, max_concurrency=1)
+
+        self.assertEqual(result.metadata["budget"]["optimizer_cost_used"], 0.75)
+        self.assertTrue(result.metadata["budget"]["optimizer_budget_exhausted"])
+
     def test_omni_adapter_delegates_train_val_policy_to_gepa_omni(self) -> None:
         task = _task(
             train=[Example("train", {}, 1.0)],
@@ -182,6 +226,451 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertNotIn("val_set", omni_task.metadata)
         self.assertNotIn("validation_policy", omni_task.metadata)
         self.assertEqual(omni_task.metadata["omni_test_policy"], "terrarium_test_set_sealed")
+
+    def test_omni_adapter_translates_budget_exhaustion_for_omni_backends(self) -> None:
+        from gepa.omni.budget import BudgetExhausted as OmniBudgetExhausted
+
+        task = _task(mode="single")
+        server = EvalServer(task, BudgetTracker(max_evals=1), max_concurrency=1)
+        adapter = OmniAdapter(backend="gepa")
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del omni_task, cfg
+            evaluate("first")
+            with self.assertRaises(OmniBudgetExhausted):
+                evaluate("second")
+            return SimpleNamespace(best_candidate="first", best_score=1.0, metadata={})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(result.best_candidate, "first")
+
+    def test_gepa_omni_backend_recovers_saved_result_on_budget_exhaustion(self) -> None:
+        from gepa.omni import OmniConfig, Task as OmniTask
+        from gepa.omni.backends.gepa import GepaBackend
+        from gepa.omni.budget import BudgetExhausted as OmniBudgetExhausted
+
+        class FakeReflectionLM:
+            total_cost = 1.25
+            total_tokens_in = 100
+            total_tokens_out = 20
+
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = GepaBackend(
+                OmniConfig(
+                    backend="gepa",
+                    run_dir=tmp,
+                    config={"reflection": {"reflection_lm": FakeReflectionLM()}},
+                )
+            )
+            task = OmniTask(
+                name="unit",
+                initial_candidate="seed",
+                objective="objective",
+                train_set=[Example("train", {}, 1.0)],
+                val_set=[Example("val", {}, 1.0)],
+            )
+            server = SimpleNamespace(
+                budget=SimpleNamespace(max_evals=10, max_token_cost=None, used=10),
+                tracker=None,
+                eval_log=[],
+                best_candidate="seed",
+                best_score=0.0,
+            )
+            recovered = SimpleNamespace(
+                best_candidate="validated-best",
+                best_idx=0,
+                val_aggregate_scores=[0.75],
+            )
+
+            with (
+                patch("gepa.optimize_anything.optimize_anything", side_effect=OmniBudgetExhausted("done")),
+                patch.object(backend, "_load_result_from_state", return_value=recovered),
+            ):
+                result = backend.run(task, server)
+
+        self.assertEqual(result.best_candidate, "validated-best")
+        self.assertEqual(result.best_score, 0.75)
+        self.assertEqual(result.metadata["adapter_cost"], 0.0)
+        self.assertEqual(result.metadata["reflection_cost_initial"], 1.25)
+        self.assertEqual(result.metadata["reflection_cost_final"], 1.25)
+
+    def test_gepa_claude_code_agent_defaults_to_omni_token_budget(self) -> None:
+        from gepa.omni import OmniConfig
+        from gepa.omni.backends.gepa import GepaBackend
+
+        seen: dict[str, object] = {}
+
+        class FakeProposer:
+            def __init__(self, **kwargs) -> None:
+                seen.update(kwargs)
+
+        backend = GepaBackend(
+            OmniConfig(
+                backend="gepa",
+                run_dir="/tmp/gepa-cc-agent",
+                config={"claude_code_agent": {"model": "sonnet"}},
+            )
+        )
+
+        with patch("gepa.omni.proposers.ClaudeCodeAgentProposer", FakeProposer):
+            backend._build_claude_code_agent("objective", "background", default_max_budget_usd=0.5)
+
+        self.assertEqual(seen["max_budget_usd"], 0.5)
+        self.assertEqual(seen["model"], "sonnet")
+
+    def test_omni_meta_harness_frontier_has_terminal_bench_best_alias(self) -> None:
+        from gepa.omni.backends.meta_harness import _update_frontier
+
+        with tempfile.TemporaryDirectory() as tmp:
+            frontier = Path(tmp) / "frontier.json"
+            improved = _update_frontier(
+                frontier,
+                name="candidate",
+                file="agents/iter1_candidate.txt",
+                score=0.75,
+                per_example_scores={"ex1": 1.0, "ex2": 0.0},
+            )
+            data = json.loads(frontier.read_text())
+
+        self.assertTrue(improved)
+        self.assertEqual(data["best_name"], "candidate")
+        self.assertEqual(data["_best"]["agent"], "candidate")
+        self.assertEqual(data["_best"]["avg_pass_rate"], 0.75)
+        self.assertEqual(data["_best"]["candidate_file"], "agents/iter1_candidate.txt")
+        self.assertEqual(data["per_example"]["ex1"]["best_name"], "candidate")
+
+    def test_omni_sequential_rich_handoff_passes_manifest_paths_only(self) -> None:
+        task = _task(mode="single")
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1, output_dir=output_dir)
+            adapter = OmniAdapter(
+                strategy="sequential",
+                configs=[{"backend": "gepa"}, {"backend": "claude_code"}],
+                run_dir=str(output_dir / "omni"),
+                handoff={"mode": "rich", "max_evals": 5},
+            )
+            seen: dict[str, object] = {}
+
+            def fake_optimize(omni_task, evaluate, cfg):
+                del cfg
+                if omni_task.initial_candidate == "seed":
+                    evaluate("stage0-candidate")
+                    return SimpleNamespace(best_candidate="stage0-best", best_score=0.4, metadata={})
+                seen["initial_candidate"] = omni_task.initial_candidate
+                seen["metadata"] = omni_task.metadata
+                evaluate("stage1-candidate")
+                return SimpleNamespace(best_candidate="stage1-best", best_score=0.5, metadata={})
+
+            with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+                result = adapter.evolve(task, server)
+
+            self.assertEqual(seen["initial_candidate"], "stage0-best")
+            handoffs = seen["metadata"]["omni_handoffs"]  # type: ignore[index]
+            self.assertEqual(len(handoffs), 1)
+            manifest = handoffs[0]
+            self.assertNotIn("evals", manifest)
+            self.assertTrue(Path(manifest["summary_path"]).exists())
+            self.assertTrue(Path(manifest["best_candidate_path"]).exists())
+            eval_trace_dir = Path(manifest["eval_trace_dir"])
+            self.assertTrue((eval_trace_dir / "0.json").exists())
+            self.assertEqual(json.loads((eval_trace_dir / "0.json").read_text())["candidate"], "stage0-candidate")
+            self.assertEqual(result.metadata["omni_handoffs"][0]["backend"], "gepa")
+
+    def test_omni_sequential_entries_can_choose_split_policy(self) -> None:
+        raw_task = _task(
+            train=[Example("train", {}, 1.0)],
+            val=[Example("val", {}, 1.0)],
+            test=[Example("test", {}, 1.0)],
+        )
+        task = _prepare_task_for_benchmark(
+            raw_task,
+            OmegaConf.create({"mode": "generalization", "split_train_val": False}),
+        )
+        adapter = OmniAdapter(
+            strategy="sequential",
+            configs=[
+                {"backend": "gepa", "split_train_val": True},
+                {"backend": "claude_code", "split_train_val": False},
+            ],
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1)
+        seen: list[tuple[int, int]] = []
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del evaluate, cfg
+            seen.append((len(omni_task.train_set or []), len(omni_task.val_set or [])))
+            return SimpleNamespace(best_candidate=f"stage-{len(seen)}", best_score=float(len(seen)), metadata={})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            adapter.evolve(task, server)
+
+        self.assertEqual(seen, [(1, 1), (2, 0)])
+
+    def test_omni_sequential_stops_before_next_stage_when_budget_exhausted(self) -> None:
+        task = _task(mode="single")
+        adapter = OmniAdapter(
+            strategy="sequential",
+            configs=[{"backend": "gepa"}, {"backend": "claude_code"}],
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=1), max_concurrency=1)
+        calls: list[str] = []
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del cfg
+            calls.append(str(omni_task.initial_candidate))
+            evaluate("stage0")
+            return SimpleNamespace(best_candidate="stage0-best", best_score=1.0, metadata={})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(calls, ["seed"])
+        self.assertEqual(result.best_candidate, "stage0-best")
+        self.assertEqual(result.total_evals, 1)
+
+    def test_omni_sequential_sums_stage_adapter_costs(self) -> None:
+        task = _task(mode="single")
+        adapter = OmniAdapter(
+            strategy="sequential",
+            configs=[{"backend": "claude_code"}, {"backend": "gepa"}],
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1)
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del evaluate, cfg
+            if omni_task.initial_candidate == "seed":
+                return SimpleNamespace(
+                    best_candidate="stage0",
+                    best_score=0.4,
+                    metadata={"adapter_cost": 1.25},
+                )
+            return SimpleNamespace(
+                best_candidate="stage1",
+                best_score=0.7,
+                metadata={"adapter_cost": 2.5},
+            )
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(result.metadata["adapter_cost"], 3.75)
+        self.assertEqual(
+            result.metadata["stage_adapter_costs"],
+            [
+                {"idx": 0, "backend": "claude_code", "adapter_cost": 1.25, "best_score": 0.4},
+                {"idx": 1, "backend": "gepa", "adapter_cost": 2.5, "best_score": 0.7},
+            ],
+        )
+
+    def test_omni_adaptive_sequential_switches_on_plateau_and_returns_global_best(self) -> None:
+        task = _task(mode="single")
+        adapter = OmniAdapter(
+            strategy="adaptive_sequential",
+            configs=[{"backend": "gepa"}, {"backend": "claude_code"}],
+            scheduler={"plateau_evals": 1, "patience": 1, "min_evals_per_stage": 1, "cycle": False},
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=3), max_concurrency=1)
+        calls: list[tuple[str, str]] = []
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            backend = cfg.backend
+            calls.append((str(backend), omni_task.initial_candidate))
+            evaluate(f"{backend}-candidate")
+            if len(calls) <= 2:
+                return SimpleNamespace(best_candidate="gepa-best", best_score=0.8, metadata={"adapter_cost": 1.0})
+            return SimpleNamespace(best_candidate="regressed", best_score=0.2, metadata={"adapter_cost": 2.0})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(calls, [("gepa", "seed"), ("gepa", "gepa-best"), ("claude_code", "gepa-best")])
+        self.assertEqual(result.best_candidate, "gepa-best")
+        self.assertEqual(result.best_score, 0.8)
+        self.assertEqual(result.metadata["adapter_cost"], 4.0)
+        self.assertEqual(result.metadata["adaptive_switches"], 1)
+        self.assertEqual(
+            [(row["backend"], row["improved"]) for row in result.metadata["adaptive_schedule"]],
+            [("gepa", True), ("gepa", False), ("claude_code", False)],
+        )
+
+    def test_omni_adaptive_sequential_reuses_budget_without_equal_prepartition(self) -> None:
+        task = _task(mode="single")
+        adapter = OmniAdapter(
+            strategy="adaptive_sequential",
+            configs=[{"backend": "gepa"}, {"backend": "claude_code"}],
+            scheduler={"plateau_evals": 1, "patience": 1, "min_evals_per_stage": 1, "cycle": False},
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=5), max_concurrency=1)
+        calls: list[str] = []
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del omni_task
+            calls.append(str(cfg.backend))
+            evaluate(f"{cfg.backend}-{len(calls)}")
+            if len(calls) <= 2:
+                return SimpleNamespace(best_candidate="gepa-best", best_score=0.4, metadata={})
+            return SimpleNamespace(best_candidate="cc-best", best_score=0.6, metadata={})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(calls, ["gepa", "gepa", "claude_code", "claude_code"])
+        self.assertEqual(result.total_evals, 4)
+        self.assertEqual(result.best_candidate, "cc-best")
+        self.assertEqual(result.best_score, 0.6)
+
+    def test_omni_adaptive_sequential_does_not_start_low_budget_tail_slice(self) -> None:
+        task = _task(mode="single")
+        adapter = OmniAdapter(
+            strategy="adaptive_sequential",
+            configs=[{"backend": "gepa"}, {"backend": "claude_code"}],
+            scheduler={"plateau_evals": 2, "patience": 1, "min_evals_per_stage": 2, "cycle": True},
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=3), max_concurrency=1)
+        calls: list[str] = []
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del omni_task
+            calls.append(str(cfg.backend))
+            evaluate("candidate-a")
+            evaluate("candidate-b")
+            return SimpleNamespace(best_candidate="best", best_score=0.1, metadata={})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(calls, ["gepa"])
+        self.assertEqual(result.total_evals, 2)
+        self.assertEqual(result.metadata["adaptive_stop_reason"], "scheduler_stopped")
+
+    def test_omni_adaptive_sequential_stops_on_token_cost_cap(self) -> None:
+        task = _task(mode="single")
+        adapter = OmniAdapter(
+            strategy="adaptive_sequential",
+            configs=[{"backend": "gepa"}, {"backend": "claude_code"}],
+            scheduler={"plateau_evals": 1, "patience": 1, "min_evals_per_stage": 1, "cycle": True},
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=10, max_token_cost=1.0), max_concurrency=1)
+        calls: list[str] = []
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del omni_task
+            calls.append(str(cfg.backend))
+            evaluate(f"{cfg.backend}-candidate")
+            return SimpleNamespace(best_candidate="best", best_score=0.1, metadata={"adapter_cost": 1.5})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(calls, ["gepa"])
+        self.assertEqual(result.metadata["adapter_cost"], 1.5)
+        self.assertEqual(result.metadata["adaptive_schedule"][0]["backend"], "gepa")
+
+    def test_omni_adaptive_sequential_uses_backend_aggregate_not_per_example_server_best(self) -> None:
+        examples = [Example("a", {}, 0.0), Example("b", {}, 0.0)]
+        task = Task(
+            name="dataset",
+            initial_candidate="seed",
+            eval_fn=lambda candidate, example: (1.0 if candidate == "spiky" and example.id == "a" else 0.0, {}),
+            train_set=examples,
+            metadata={"type": "generalization"},
+        )
+        adapter = OmniAdapter(
+            strategy="adaptive_sequential",
+            configs=[{"backend": "gepa"}, {"backend": "claude_code"}],
+            scheduler={"plateau_evals": 2, "patience": 1, "min_evals_per_stage": 2, "cycle": False},
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=4), max_concurrency=1)
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            if cfg.backend == "gepa":
+                evaluate("spiky", examples[0])
+                evaluate("spiky", examples[1])
+                return SimpleNamespace(best_candidate="aggregate-best", best_score=0.5, metadata={})
+            self.assertEqual(omni_task.initial_candidate, "aggregate-best")
+            evaluate("next", examples[0])
+            return SimpleNamespace(best_candidate="next", best_score=0.1, metadata={})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(server.best_candidate, "spiky")
+        self.assertEqual(server.best_score, 1.0)
+        self.assertEqual(result.best_candidate, "aggregate-best")
+        self.assertEqual(result.best_score, 0.5)
+
+    def test_omni_parallel_entries_can_choose_split_policy(self) -> None:
+        raw_task = _task(
+            train=[Example("train", {}, 1.0)],
+            val=[Example("val", {}, 1.0)],
+            test=[Example("test", {}, 1.0)],
+        )
+        task = _prepare_task_for_benchmark(
+            raw_task,
+            OmegaConf.create({"mode": "generalization", "split_train_val": False}),
+        )
+        adapter = OmniAdapter(
+            strategy="best_of",
+            configs=[
+                {"backend": "gepa", "split_train_val": True},
+                {"backend": "meta_harness", "split_train_val": False},
+            ],
+            max_workers=1,
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1)
+        seen: list[tuple[int, int]] = []
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del evaluate, cfg
+            seen.append((len(omni_task.train_set or []), len(omni_task.val_set or [])))
+            return SimpleNamespace(best_candidate=f"stage-{len(seen)}", best_score=float(len(seen)), metadata={})
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            adapter.evolve(task, server)
+
+        self.assertEqual(seen, [(1, 1), (2, 0)])
+
+    def test_omni_best_of_sums_member_adapter_costs(self) -> None:
+        task = _task(mode="single")
+        adapter = OmniAdapter(
+            strategy="best_of",
+            configs=[{"backend": "claude_code"}, {"backend": "gepa"}],
+            max_workers=1,
+        )
+        server = EvalServer(task, BudgetTracker(max_evals=10), max_concurrency=1)
+        calls = 0
+
+        def fake_optimize(omni_task, evaluate, cfg):
+            del omni_task, evaluate, cfg
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return SimpleNamespace(
+                    best_candidate="member0",
+                    best_score=0.4,
+                    metadata={"adapter_cost": 1.25},
+                )
+            return SimpleNamespace(
+                best_candidate="member1",
+                best_score=0.7,
+                metadata={"adapter_cost": 2.5},
+            )
+
+        with patch("gepa.omni.optimize_anything", side_effect=fake_optimize):
+            result = adapter.evolve(task, server)
+
+        self.assertEqual(result.best_candidate, "member1")
+        self.assertEqual(result.metadata["adapter_cost"], 3.75)
+        self.assertEqual(
+            result.metadata["member_adapter_costs"],
+            [
+                {"idx": 0, "backend": "claude_code", "adapter_cost": 1.25, "best_score": 0.4},
+                {"idx": 1, "backend": "gepa", "adapter_cost": 2.5, "best_score": 0.7},
+            ],
+        )
 
     def test_multi_task_allows_shared_train_and_val(self) -> None:
         examples = [Example("visible", {}, 1.0)]
@@ -745,6 +1234,140 @@ class BenchmarkContractTests(unittest.TestCase):
         score, results = _evaluate_test([[[[9]], [[1, 2], [3, 4]]]], gold)
         self.assertEqual(score, 1.0)
         self.assertTrue(results[0]["correct"])
+
+    def test_aime_solver_parse_error_scores_zero(self) -> None:
+        from dspy.utils.exceptions import AdapterParseError
+
+        class FakeSignature:
+            output_fields = {"reasoning": object(), "answer": object()}
+
+        class FakePredict:
+            def __init__(self) -> None:
+                self.signature = type("SignatureConfig", (), {"instructions": ""})()
+
+        class FakeChainOfThought:
+            def __init__(self, _signature) -> None:
+                self.predict = FakePredict()
+
+            def __call__(self, **_kwargs):
+                raise AdapterParseError("JSONAdapter", FakeSignature(), "{0, 1, 2}")
+
+        example = Example("aime", {"input": "What is 1+1?", "solution": "It is 2."}, "2")
+
+        with patch("dspy.ChainOfThought", FakeChainOfThought):
+            score, info = aime_math.evaluate("answer with an integer", example)
+
+        self.assertEqual(score, 0.0)
+        self.assertEqual(info["score"], 0.0)
+        self.assertEqual(info["error"], "solver_parse_error")
+        self.assertIn("{0, 1, 2}", info["output"])
+
+    def test_aime_runtime_config_threads_isolated_solver_settings(self) -> None:
+        calls: dict[str, object] = {}
+
+        def fake_eval(
+            candidate: str,
+            example: Example,
+            *,
+            solver_lm: str | None,
+            solver_temperature: float | None,
+            solver_max_tokens: int | None,
+            solver_timeout: float | None,
+            solver_num_retries: int | None,
+        ) -> tuple[float, dict]:
+            calls["candidate"] = candidate
+            calls["example"] = example
+            calls["solver_lm"] = solver_lm
+            calls["solver_temperature"] = solver_temperature
+            calls["solver_max_tokens"] = solver_max_tokens
+            calls["solver_timeout"] = solver_timeout
+            calls["solver_num_retries"] = solver_num_retries
+            return 1.0, {"score": 1.0, "cost": 0.5}
+
+        task = Task(
+            name="aime_math",
+            initial_candidate="seed",
+            eval_fn=lambda candidate, example: (0.0, {}),
+            train_set=[Example("train", {}, 1.0)],
+            test_set=[Example("test", {}, 1.0)],
+            metadata={"type": "generalization"},
+        )
+
+        with patch("terrarium.tasks.aime_math.evaluate_with_solver", side_effect=fake_eval):
+            configured = _apply_task_runtime_config(
+                task,
+                OmegaConf.create({
+                    "solver_lm": "anthropic/claude-haiku-4-5",
+                    "solver_temperature": 0.0,
+                    "solver_max_tokens": 32000,
+                    "solver_timeout": 180,
+                    "solver_num_retries": 0,
+                }),
+            )
+            score, info = configured.eval_fn("candidate", Example("ex", {}, 1.0))
+
+        self.assertEqual(score, 1.0)
+        self.assertEqual(info["cost"], 0.5)
+        self.assertEqual(calls["solver_lm"], "anthropic/claude-haiku-4-5")
+        self.assertEqual(calls["solver_temperature"], 0.0)
+        self.assertEqual(calls["solver_max_tokens"], 32000)
+        self.assertEqual(calls["solver_timeout"], 180.0)
+        self.assertEqual(calls["solver_num_retries"], 0)
+        self.assertEqual(configured.metadata["solver_temperature"], 0.0)
+        self.assertEqual(configured.metadata["solver_timeout"], 180.0)
+
+    def test_aime_solver_runtime_error_scores_zero(self) -> None:
+        class FakePredict:
+            def __init__(self) -> None:
+                self.signature = type("SignatureConfig", (), {"instructions": ""})()
+
+        class FakeChainOfThought:
+            def __init__(self, _signature) -> None:
+                self.predict = FakePredict()
+
+            def __call__(self, **_kwargs):
+                raise TimeoutError("solver timed out")
+
+        example = Example("aime", {"input": "What is 1+1?", "solution": "It is 2."}, "2")
+
+        with patch("dspy.ChainOfThought", FakeChainOfThought):
+            score, info = aime_math.evaluate("answer with an integer", example)
+
+        self.assertEqual(score, 0.0)
+        self.assertEqual(info["score"], 0.0)
+        self.assertEqual(info["error"], "TimeoutError")
+        self.assertIn("solver timed out", info["output"])
+
+    def test_arc_runtime_config_threads_solver_settings(self) -> None:
+        calls: dict[str, object] = {}
+
+        def fake_eval(candidate: str, example: Example, *, model_id: str, max_llm_calls: int):
+            calls["candidate"] = candidate
+            calls["example"] = example
+            calls["model_id"] = model_id
+            calls["max_llm_calls"] = max_llm_calls
+            return 0.5, {"score": 0.5}
+
+        task = Task(
+            name="arc_agi",
+            initial_candidate="seed",
+            eval_fn=lambda candidate, example: (0.0, {}),
+            train_set=[Example("train", {}, 1.0)],
+            test_set=[Example("test", {}, 1.0)],
+            metadata={"type": "generalization"},
+        )
+        with patch("terrarium.tasks.arc_agi.evaluate", side_effect=fake_eval):
+            configured = _apply_task_runtime_config(
+                task,
+                OmegaConf.create({"solver_lm": "test/model", "max_llm_calls": 3}),
+            )
+            score, _ = configured.eval_fn("candidate", Example("ex", {}, 1.0))
+
+        self.assertEqual(score, 0.5)
+        self.assertEqual(calls["model_id"], "test/model")
+        self.assertEqual(calls["max_llm_calls"], 3)
+        self.assertEqual(configured.metadata["solver_lm"], "test/model")
+        self.assertEqual(configured.metadata["max_llm_calls"], 3)
 
     def test_listing_tasks_does_not_load_frontier_cs_dataset(self) -> None:
         with patch.object(

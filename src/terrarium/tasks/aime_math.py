@@ -6,6 +6,7 @@ language prompt that guides an LLM to solve AIME-style math problems.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 from terrarium.registry import register_task_factory
@@ -53,30 +54,52 @@ def _load_dataset() -> tuple[list[Example], list[Example], list[Example]]:
 
 
 def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
+    """Evaluate using the currently configured DSPy LM."""
+    return evaluate_with_solver(candidate, example)
+
+
+def evaluate_with_solver(
+    candidate: str,
+    example: Example,
+    *,
+    solver_lm: str | None = None,
+    solver_temperature: float | None = None,
+    solver_max_tokens: int | None = None,
+    solver_timeout: float | None = None,
+    solver_num_retries: int | None = None,
+) -> tuple[float, dict[str, Any]]:
     """Evaluate a prompt on a single AIME math example.
 
     Uses richer feedback including the full solution when available,
     matching the working examples/aime_math setup.
     """
     import dspy
+    from dspy.utils.exceptions import AdapterParseError
 
     class MathSolverSignature(dspy.Signature):
         input = dspy.InputField(desc="The math problem to solve.")
         answer = dspy.OutputField(desc="The final numerical answer.")
 
-    lm = getattr(dspy.settings, "lm", None)
-    history_before = len(getattr(lm, "history", []) or []) if lm is not None else 0
+    lm = _build_eval_lm(
+        solver_lm=solver_lm,
+        solver_temperature=solver_temperature,
+        solver_max_tokens=solver_max_tokens,
+        solver_timeout=solver_timeout,
+        solver_num_retries=solver_num_retries,
+    )
+
+    def new_solver_history() -> list[Any]:
+        return list(getattr(lm, "history", []) or []) if lm is not None else []
+
+    def solver_cost_and_model(history: list[Any]) -> tuple[float, str | None]:
+        solver_cost = sum(float(entry.get("cost", 0.0) or 0.0) for entry in history if isinstance(entry, dict))
+        solver_model = None
+        if history and isinstance(history[-1], dict):
+            solver_model = history[-1].get("model") or history[-1].get("response_model")
+        return solver_cost, solver_model
 
     predictor = dspy.ChainOfThought(MathSolverSignature)
     predictor.predict.signature.instructions = candidate
-    prediction = predictor(input=example.inputs["input"])
-    history_after = getattr(lm, "history", []) or [] if lm is not None else []
-    new_history = history_after[history_before:]
-    solver_cost = sum(float(entry.get("cost", 0.0) or 0.0) for entry in new_history if isinstance(entry, dict))
-    solver_model = None
-    if new_history and isinstance(new_history[-1], dict):
-        solver_model = new_history[-1].get("model") or new_history[-1].get("response_model")
-
     correct_answer = int(example.expected)
     written_solution = example.inputs.get("solution", "")
     solution_suffix = (
@@ -86,6 +109,50 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         if written_solution
         else ""
     )
+
+    lm_context = dspy.context(lm=lm) if lm is not None else nullcontext()
+
+    try:
+        with lm_context:
+            prediction = predictor(input=example.inputs["input"])
+    except AdapterParseError as exc:
+        new_history = new_solver_history()
+        solver_cost, solver_model = solver_cost_and_model(new_history)
+        raw_output = getattr(exc, "lm_response", None) or str(exc)
+        feedback = (
+            "The solver response could not be parsed into the required structured answer fields. "
+            f"The correct answer is '{correct_answer}'.{solution_suffix}"
+        )
+        return 0.0, {
+            "score": 0.0,
+            "input": example.inputs["input"],
+            "prompt": candidate,
+            "output": raw_output,
+            "feedback": feedback,
+            "error": "solver_parse_error",
+            "cost": solver_cost,
+            "solver_model": solver_model,
+        }
+    except Exception as exc:
+        new_history = new_solver_history()
+        solver_cost, solver_model = solver_cost_and_model(new_history)
+        feedback = (
+            "The solver call failed before producing a valid structured answer. "
+            f"The correct answer is '{correct_answer}'.{solution_suffix}"
+        )
+        return 0.0, {
+            "score": 0.0,
+            "input": example.inputs["input"],
+            "prompt": candidate,
+            "output": str(exc),
+            "feedback": feedback,
+            "error": type(exc).__name__,
+            "cost": solver_cost,
+            "solver_model": solver_model,
+        }
+
+    new_history = new_solver_history()
+    solver_cost, solver_model = solver_cost_and_model(new_history)
 
     try:
         llm_answer = int(prediction.answer)
@@ -120,6 +187,52 @@ def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         "cost": solver_cost,
         "solver_model": solver_model,
     }
+
+
+def _build_eval_lm(
+    *,
+    solver_lm: str | None,
+    solver_temperature: float | None,
+    solver_max_tokens: int | None,
+    solver_timeout: float | None,
+    solver_num_retries: int | None,
+) -> Any | None:
+    """Build a per-evaluation DSPy LM so parallel evals do not share history."""
+    import dspy
+
+    if solver_lm is not None:
+        kwargs: dict[str, Any] = {}
+        if solver_temperature is not None:
+            kwargs["temperature"] = solver_temperature
+        if solver_max_tokens is not None:
+            kwargs["max_tokens"] = solver_max_tokens
+        if solver_timeout is not None:
+            kwargs["timeout"] = solver_timeout
+        if solver_num_retries is not None:
+            kwargs["num_retries"] = solver_num_retries
+        return dspy.LM(solver_lm, **kwargs)
+
+    configured = getattr(dspy.settings, "lm", None)
+    if configured is None:
+        return None
+
+    model = getattr(configured, "model", None)
+    if not model:
+        return configured
+
+    kwargs = dict(getattr(configured, "kwargs", {}) or {})
+    if solver_timeout is not None:
+        kwargs["timeout"] = solver_timeout
+    if solver_num_retries is not None:
+        kwargs["num_retries"] = solver_num_retries
+    return dspy.LM(
+        model,
+        model_type=getattr(configured, "model_type", "chat"),
+        cache=bool(getattr(configured, "cache", True)),
+        cache_in_memory=bool(getattr(configured, "cache_in_memory", True)),
+        num_retries=int(getattr(configured, "num_retries", 3)),
+        **kwargs,
+    )
 
 
 def _make_task() -> Task:

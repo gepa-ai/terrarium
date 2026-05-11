@@ -47,6 +47,8 @@ config: {}
 # ``config`` above). The rest compose multiple backends from ``configs``:
 #   - ``sequential`` — chain stages; each best seeds the next. Budget is
 #     partitioned ``total // N`` per stage.
+#   - ``adaptive_sequential`` — run bounded slices, switch backend after a
+#     score plateau, and keep feeding the best aggregate backend result forward.
 #   - ``parallel``   — run N concurrently; budget partitioned ``total // N``.
 #   - ``best_of``    — parallel + select highest in-search ``best_score``.
 #   - ``vote``       — parallel + one re-score pass via terrarium's outer
@@ -55,13 +57,40 @@ strategy: single
 
 # List of per-backend overrides for ensemble strategies. Each entry may carry
 # ``backend``, ``config``, ``effort``, ``max_thinking_tokens``,
-# ``stop_at_score``, ``sandbox``, ``run_dir``. Required when ``strategy != single``.
+# ``stop_at_score``, ``sandbox``, ``run_dir``, and ``split_train_val``.
+# ``split_train_val`` lets GEPA-like stages keep a real validation split while
+# agentic stages receive train+val merged, within the same sequential/parallel
+# Omni composition.
+# Required when ``strategy != single``.
 # Example: [{backend: gepa, config: {reflection: {reflection_lm: openai/gpt-5}}},
 #           {backend: claude_code, config: {model: sonnet}}]
 configs: []
 
 # Thread-pool size for parallel-family ensembles. Defaults to ``len(configs)``.
 max_workers: null
+
+# Scheduler settings for ``strategy=adaptive_sequential``. ``plateau_evals``
+# bounds each backend slice. After ``patience`` non-improving slices and at
+# least ``min_evals_per_stage`` evals for that backend, the scheduler rotates
+# to the next config. ``cycle`` lets it keep rotating until the shared budget
+# is exhausted; set false for a one-pass chain.
+scheduler:
+  plateau_evals: 100
+  patience: 1
+  min_evals_per_stage: 100
+  improvement_epsilon: 0.0
+  cycle: true
+  max_switches: null
+
+# Sequential-stage handoff. Default ``none`` preserves current behavior.
+# ``mode: rich`` writes prior-stage eval JSON files under
+# ``<run_dir>/handoff/`` and passes only manifest paths through Omni
+# Task.metadata; full trace blobs are not embedded in metadata.
+handoff:
+  mode: none
+  max_evals: 100
+  max_eval_bytes: 2000000
+  include_best_candidate: true
 
 # Workspace for omni's per-run artifacts (evals/, progress_log.jsonl,
 # summary.json, sessions/, …). Left null — runner injects

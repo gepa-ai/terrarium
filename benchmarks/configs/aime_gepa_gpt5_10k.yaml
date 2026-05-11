@@ -1,0 +1,47 @@
+# AIME GEPA run with GPT-5 as the reflection model.
+#
+# Split contract:
+# - train: 45 examples from AI-MO/aimo-validation-aime after seed-0 shuffle
+# - val:   45 examples from AI-MO/aimo-validation-aime after seed-0 shuffle
+# - test:  30 held-out examples from MathArena/aime_2025, evaluated after search
+#
+# Solver model is Qwen3-8B served through the OpenAI-compatible Arbor endpoint.
+# Metric calls count individual problem evaluations. The held-out test pass is
+# outside the 10k search budget.
+name: aime_gepa_gpt5_10k
+source_zshrc: true
+max_workers: 1
+
+tasks:
+  - name: aime_math
+    task: aime_math
+    overrides:
+      - task.solver_lm=openai/arbor:qwen/qwen3-8b
+      - task.solver_temperature=0.0
+      - task.solver_max_tokens=32000
+      - task.solver_timeout=180
+      - task.solver_num_retries=0
+
+seeds: [0]
+
+budget:
+  max_evals: 10000
+  max_token_cost: null
+
+defaults:
+  - benchmark.split_train_val=true
+  - max_concurrency=32
+
+algorithms:
+  - name: gepa_gpt5
+    algorithm: omni
+    overrides:
+      - adapter.backend=gepa
+      - ++adapter.config.reflection.reflection_lm=openai/gpt-5
+      - "++adapter.config.reflection_lm_kwargs={timeout: 3600, num_retries: 2}"
+      - ++adapter.config.engine.parallel=true
+      - ++adapter.config.engine.max_workers=32
+      - ++adapter.config.engine.cache_evaluation=true
+      - ++adapter.config.engine.cache_evaluation_storage=auto
+    seed_overrides:
+      - ++adapter.config.engine.seed={seed}

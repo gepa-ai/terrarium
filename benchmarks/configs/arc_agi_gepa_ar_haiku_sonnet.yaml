@@ -1,0 +1,59 @@
+# Full ARC-AGI comparison: GEPA vs GEPA x Claude Code vs AutoResearch/Claude Code.
+#
+# Solver/evaluator LM:
+#   task.solver_lm=anthropic/claude-haiku-4-5
+#
+# Optimizer/reflection LM:
+#   GEPA reflection_lm=anthropic/claude-sonnet-4-6
+#   AR model=sonnet
+name: arc_agi_gepa_ar_haiku_sonnet
+source_zshrc: true
+max_parallel_runs: 8
+
+tasks:
+  - name: arc_agi
+    task: arc_agi
+    overrides:
+      - task.solver_lm=anthropic/claude-haiku-4-5
+      - task.max_llm_calls=10
+
+seeds: [0]
+
+budget:
+  max_evals: 3000
+  max_token_cost: 10.0
+
+defaults:
+  - max_concurrency=32
+
+algorithms:
+  - name: gepa
+    algorithm: omni
+    overrides:
+      - adapter.backend=gepa
+      - ++adapter.config.reflection.reflection_lm=anthropic/claude-sonnet-4-6
+      - ++adapter.config.engine.parallel=true
+      - ++adapter.config.engine.max_workers=32
+      - benchmark.split_train_val=true
+    seed_overrides:
+      - ++adapter.config.engine.seed={seed}
+
+  - name: gepa_cc_agent
+    algorithm: omni
+    overrides:
+      - adapter.backend=gepa
+      - ++adapter.config.reflection.reflection_lm=null
+      - ++adapter.config.claude_code_agent.model=sonnet
+      - ++adapter.config.engine.parallel=true
+      - ++adapter.config.engine.max_workers=32
+      - benchmark.split_train_val=true
+    seed_overrides:
+      - ++adapter.config.engine.seed={seed}
+
+  - name: autoresearch
+    algorithm: omni
+    overrides:
+      - adapter.backend=claude_code
+      - ++adapter.config.model=sonnet
+      - ++adapter.config.ralph=true
+      - benchmark.split_train_val=false

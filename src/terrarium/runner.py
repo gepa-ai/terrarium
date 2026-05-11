@@ -135,6 +135,9 @@ def run(
     result.metadata["wall_time"] = time.time() - start
     result.metadata["budget"] = budget.status()
     adapter_cost = float(result.metadata.get("adapter_cost", 0.0))
+    if max_token_cost is not None:
+        result.metadata["budget"]["optimizer_cost_used"] = adapter_cost
+        result.metadata["budget"]["optimizer_budget_exhausted"] = adapter_cost >= float(max_token_cost)
     result.metadata["solver_cost_search"] = server.total_cost
     result.metadata["solver_cost_test"] = 0.0
     result.metadata["solver_cost"] = server.total_cost
@@ -151,18 +154,15 @@ def run(
 
     # Evaluate best candidate on held-out test set (outside budget).
     if official_task.test_set and result.best_candidate:
-        test_scores: dict[str, float] = {}
-        test_solver_cost = 0.0
-        for ex in official_task.test_set:
-            try:
-                score, info = official_task.eval_fn(result.best_candidate, ex)
-                if isinstance(info, dict):
-                    test_solver_cost += float(info.get("cost", 0.0) or 0.0)
-                test_scores[ex.id] = score
-            except Exception:
-                test_scores[ex.id] = 0.0
+        test_scores, test_solver_cost, test_errors = _evaluate_heldout_test(
+            official_task,
+            result.best_candidate,
+            max_concurrency=max_concurrency,
+        )
         result.metadata["test_scores"] = test_scores
         result.metadata["test_score"] = sum(test_scores.values()) / len(test_scores) if test_scores else 0.0
+        if test_errors:
+            result.metadata["test_errors"] = test_errors
         result.metadata["solver_cost_test"] = test_solver_cost
         result.metadata["solver_cost"] = server.total_cost + test_solver_cost
         result.metadata["total_cost"] = result.metadata["solver_cost"] + adapter_cost
@@ -177,6 +177,38 @@ def run(
         tracker.end()
 
     return result
+
+
+def _evaluate_heldout_test(
+    task: Task,
+    candidate: str,
+    *,
+    max_concurrency: int,
+) -> tuple[dict[str, float], float, dict[str, str]]:
+    """Evaluate held-out test examples concurrently, outside search budget."""
+    test_set = list(task.test_set or [])
+    if not test_set:
+        return {}, 0.0, {}
+
+    eval_task = replace(
+        task,
+        train_set=test_set,
+        val_set=None,
+        test_set=None,
+        metadata={**task.metadata, "type": "heldout_test"},
+    )
+    test_server = EvalServer(
+        eval_task,
+        BudgetTracker(max_evals=len(test_set)),
+        max_concurrency=max_concurrency,
+    )
+    try:
+        _, info = test_server.evaluate_examples(candidate, split="train")
+        scores = {str(k): float(v) for k, v in (info.get("scores") or {}).items()}
+        errors = {str(k): str(v) for k, v in (info.get("errors") or {}).items()}
+        return scores, test_server.total_cost, errors
+    finally:
+        test_server.stop()
 
 
 def load_adapter(path: str, **_: Any) -> Adapter:
@@ -412,6 +444,12 @@ def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) ->
 
     train_set = task.train_set
     val_set = task.val_set
+    # Omni composition can run heterogeneous backends in one adapter call.
+    # Preserve the original visible split so each member can choose whether
+    # it wants a real validation channel or a merged train+val view.
+    metadata["_terrarium_source_train_set"] = list(task.train_set) if task.train_set is not None else None
+    metadata["_terrarium_source_val_set"] = list(task.val_set) if task.val_set is not None else None
+    metadata["_terrarium_split_train_val"] = split_train_val
     if not split_train_val:
         train_set, val_set = _merge_val_into_train(task, metadata)
 
@@ -427,6 +465,58 @@ def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) ->
         )
 
     return prepared
+
+
+def _apply_task_runtime_config(task: Task, task_cfg: DictConfig) -> Task:
+    """Thread Hydra task runtime knobs into task evaluators that need them."""
+    if task.name == "aime_math":
+        from terrarium.tasks.aime_math import evaluate_with_solver
+
+        model_id = task_cfg.get("solver_lm")
+        temperature = task_cfg.get("solver_temperature")
+        max_tokens = task_cfg.get("solver_max_tokens")
+        timeout = task_cfg.get("solver_timeout")
+        num_retries = task_cfg.get("solver_num_retries")
+
+        def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
+            return evaluate_with_solver(
+                candidate,
+                example,
+                solver_lm=str(model_id) if model_id is not None else None,
+                solver_temperature=float(temperature) if temperature is not None else None,
+                solver_max_tokens=int(max_tokens) if max_tokens is not None else None,
+                solver_timeout=float(timeout) if timeout is not None else None,
+                solver_num_retries=int(num_retries) if num_retries is not None else None,
+            )
+
+        metadata = dict(task.metadata)
+        if model_id is not None:
+            metadata["solver_lm"] = str(model_id)
+        if temperature is not None:
+            metadata["solver_temperature"] = float(temperature)
+        if max_tokens is not None:
+            metadata["solver_max_tokens"] = int(max_tokens)
+        if timeout is not None:
+            metadata["solver_timeout"] = float(timeout)
+        if num_retries is not None:
+            metadata["solver_num_retries"] = int(num_retries)
+        return replace(task, eval_fn=evaluate, metadata=metadata)
+
+    if task.name != "arc_agi":
+        return task
+
+    from terrarium.tasks.arc_agi import evaluate as evaluate_arc_agi
+
+    model_id = str(task_cfg.get("solver_lm") or "openrouter/google/gemini-3-flash-preview")
+    max_llm_calls = int(task_cfg.get("max_llm_calls") or 10)
+
+    def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
+        return evaluate_arc_agi(candidate, example, model_id=model_id, max_llm_calls=max_llm_calls)
+
+    metadata = dict(task.metadata)
+    metadata["solver_lm"] = model_id
+    metadata["max_llm_calls"] = max_llm_calls
+    return replace(task, eval_fn=evaluate, metadata=metadata)
 
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
@@ -494,12 +584,17 @@ def main(cfg: DictConfig) -> None:
             lm_kwargs['temperature'] = cfg.task.solver_temperature
         if cfg.task.get('solver_max_tokens') is not None:
             lm_kwargs['max_tokens'] = cfg.task.solver_max_tokens
+        if cfg.task.get('solver_timeout') is not None:
+            lm_kwargs['timeout'] = cfg.task.solver_timeout
+        if cfg.task.get('solver_num_retries') is not None:
+            lm_kwargs['num_retries'] = cfg.task.solver_num_retries
         dspy.configure(lm=dspy.LM(solver_lm, **lm_kwargs))
 
     benchmark_cfg = OmegaConf.create(OmegaConf.to_container(cfg.get("benchmark", {}), resolve=True))
     if benchmark_cfg.get("mode") is None:
         benchmark_cfg.mode = cfg.task.get("mode")
     raw_task = get_task(cfg.task.name)
+    raw_task = _apply_task_runtime_config(raw_task, cfg.task)
 
     result = run(
         raw_task,

@@ -258,7 +258,12 @@ def _run_agent(
     }
 
 
-def evaluate(candidate: str, example: Example, model_id: str = "openrouter/google/gemini-3-flash-preview") -> tuple[float, dict[str, Any]]:
+def evaluate(
+    candidate: str,
+    example: Example,
+    model_id: str = "openrouter/google/gemini-3-flash-preview",
+    max_llm_calls: int = 10,
+) -> tuple[float, dict[str, Any]]:
     """Evaluate an ARC-AGI agent on a single puzzle."""
     result = _run_agent(
         agent_code=candidate,
@@ -267,7 +272,7 @@ def evaluate(candidate: str, example: Example, model_id: str = "openrouter/googl
         test_in=example.inputs["test_in"],
         test_out=example.expected,
         model_id=model_id,
-        max_llm_calls=10,
+        max_llm_calls=max_llm_calls,
     )
 
     llms = result["llms"]
