@@ -48,6 +48,8 @@ def get_task(name: str) -> Task:
     """
     if not _REGISTRY and not _FACTORIES:
         _load_builtin_tasks()
+    if name not in _REGISTRY and name not in _FACTORIES:
+        _maybe_register_dynamic_task(name)
     if name in _FACTORIES:
         task = _FACTORIES.pop(name)()
         _REGISTRY[name] = task
@@ -78,3 +80,12 @@ def list_tasks() -> list[str]:
 def _load_builtin_tasks() -> None:
     """Import the tasks subpackage to trigger registration of built-in tasks."""
     import terrarium.tasks  # noqa: F401
+
+
+def _maybe_register_dynamic_task(name: str) -> None:
+    """Register known patterned tasks without expensive import-time discovery."""
+    if name.startswith("frontier_cs_algo_") and name != "frontier_cs_algo_smoke":
+        from terrarium.tasks.frontier_cs import _make_problem_task
+
+        problem_id = name.removeprefix("frontier_cs_algo_")
+        register_task_factory(name, lambda p=problem_id: _make_problem_task(p))

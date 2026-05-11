@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from terrarium.adapter import Result
 from terrarium.budget import BudgetExhausted
 from terrarium.sandbox import bwrap_prefix, claude_settings_args, prepare_claude_home
+from terrarium.solver_lm import SolverBudgetExhausted
 from terrarium.task import Task
 
 if TYPE_CHECKING:
@@ -277,6 +278,8 @@ class GEPAAdapter:
 
         try:
             gepa_result = optimize_anything(**oa_kwargs)
+        except SolverBudgetExhausted:
+            raise
         except BudgetExhausted:
             gepa_result = None
 

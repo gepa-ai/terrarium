@@ -26,8 +26,7 @@ POST /evaluate_examples
     Status 429 when budget is insufficient to evaluate all requested examples.
 
     Val is reachable only via /validate (aggregate-only). Test is not
-    reachable from HTTP — only the in-process Python API can score on it,
-    which the runner uses for held-out reporting.
+    reachable from HTTP or the search-time Python API.
 
 GET /status
     Response: {"budget": {...}, "task": "<name>", "best_score": 1.23, "total_evals": 5, "total_cost": 0.42}
@@ -47,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from terrarium.budget import BudgetExhausted, BudgetTracker
+from terrarium.solver_lm import SolverBudgetExhausted
 from terrarium.task import Example, Task
 from terrarium.tracking import TerrariumTracker
 
@@ -137,6 +137,7 @@ class EvalServer:
             self.budget.check()
 
             if example is not None:
+                self._validate_visible_example(example)
                 score, info = self.task.eval_fn(candidate, example)
             else:
                 score, info = self.task.eval_fn(candidate)
@@ -148,6 +149,13 @@ class EvalServer:
             return score, info
         finally:
             self._eval_semaphore.release()
+
+    def _validate_visible_example(self, example: Example) -> None:
+        """Reject direct evaluation of examples outside the server-visible task."""
+        if not self.task.has_dataset:
+            return
+        if example.id not in self._examples:
+            raise ValueError(f"Unknown or sealed example_id: {example.id!r}")
 
     def evaluate_examples(
         self,
@@ -176,7 +184,9 @@ class EvalServer:
                 "_budget": self.budget.status(),
             }
 
-        # Resolve examples
+        # Resolve examples. The search API can only see train/val examples.
+        # Empty or unknown explicit id lists are errors for dataset tasks; they
+        # should not silently fall back to single-task scoring.
         examples: list[Example] = []
         if example_ids is not None:
             if not example_ids:
@@ -221,6 +231,8 @@ class EvalServer:
             try:
                 score, info = self.evaluate(candidate, ex)
                 return (ex.id, score, info, None)
+            except BudgetExhausted:
+                raise
             except Exception as e:
                 return (ex.id, 0.0, None, str(e))
 
@@ -516,8 +528,19 @@ class EvalServer:
             score, info = self.evaluate(candidate, example)
             self._send_json(handler, {"score": score, "info": info, "budget": self.budget.status()})
 
+        except SolverBudgetExhausted as e:
+            self._send_json(
+                handler,
+                {"error": str(e), "error_type": "solver_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
+
         except BudgetExhausted:
-            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            self._send_json(
+                handler,
+                {"error": "Budget exhausted", "error_type": "eval_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
 
         except ValueError as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=400)
@@ -538,9 +561,7 @@ class EvalServer:
             return
 
         # Lock the HTTP surface to train only. val is exposed via /validate
-        # (aggregate-only); test is not exposed at all. The Python API
-        # (evaluate_examples) is unchanged so the runner can still score on
-        # val/test directly for held-out reporting.
+        # (aggregate-only); test is not exposed at all.
         if split not in ("train", None):
             self._send_json(
                 handler,
@@ -549,6 +570,9 @@ class EvalServer:
             )
             return
         if example_ids is not None:
+            if not example_ids:
+                self._send_json(handler, {"error": "example_ids must not be empty"}, status=400)
+                return
             train_ids = self._train_ids()
             invalid = [eid for eid in example_ids if eid not in train_ids]
             if invalid:
@@ -574,8 +598,19 @@ class EvalServer:
                 "budget": self.budget.status(),
             })
 
+        except SolverBudgetExhausted as e:
+            self._send_json(
+                handler,
+                {"error": str(e), "error_type": "solver_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
+
         except BudgetExhausted:
-            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            self._send_json(
+                handler,
+                {"error": "Budget exhausted", "error_type": "eval_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
 
         except ValueError as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=400)
@@ -601,8 +636,19 @@ class EvalServer:
             result = self.validate(candidate)
             self._send_json(handler, {**result, "budget": self.budget.status()})
 
+        except SolverBudgetExhausted as e:
+            self._send_json(
+                handler,
+                {"error": str(e), "error_type": "solver_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
+
         except BudgetExhausted:
-            self._send_json(handler, {"error": "Budget exhausted", "budget": self.budget.status()}, status=429)
+            self._send_json(
+                handler,
+                {"error": "Budget exhausted", "error_type": "eval_budget_exhausted", "budget": self.budget.status()},
+                status=429,
+            )
 
         except Exception as e:
             self._send_json(handler, {"error": str(e), "budget": self.budget.status()}, status=500)
@@ -628,7 +674,7 @@ class EvalServer:
             "has_dataset": self.task.has_dataset,
             "train_size": len(self.task.train_set) if self.task.train_set else 0,
             "val_size": len(self.task.val_set) if self.task.val_set else 0,
-            "test_size": len(self.task.test_set) if self.task.test_set else 0,
+            "test_size": 0,
             "metadata": {k: v for k, v in self.task.metadata.items() if isinstance(v, (str, int, float, bool))},
         })
 

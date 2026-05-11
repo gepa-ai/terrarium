@@ -44,9 +44,13 @@ access_policy:
 # max_evals: total number of eval calls allowed.
 # max_token_cost: max USD spend on adapter LLM tokens
 #   (GEPA → max_reflection_cost, Claude Code → --max-budget-usd).
+# max_solver_cost: max USD spend on task-level solver LLM calls, such as
+#   AIME's DSPy solver. This is tracked separately from optimizer/reflection
+#   spend and included in total_cost.
 budget:
   max_evals: 100
   max_token_cost: null
+  max_solver_cost: null
 
 # Max parallel evaluations in the server.
 max_concurrency: 8

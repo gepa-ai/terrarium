@@ -43,38 +43,49 @@ where each grid is a 2D list of integers, in the same order as the inputs.
             and all(not isinstance(cell, list) for row in value for cell in row)
         )
 
-    def add_grids(value, out):
+    def grids_from(value):
         if is_grid(value):
-            out.append(value)
-        elif isinstance(value, list):
+            return [value]
+        if isinstance(value, list):
+            if all(is_grid(item) for item in value):
+                return value
+            out = []
             for item in value:
-                if is_grid(item):
-                    out.append(item)
+                out.extend(grids_from(item))
+            return out
+        return []
 
-    def extract_json_grids(text):
-        grids = []
+    def first_json_value(text):
         for start, ch in enumerate(text):
-            if ch != "[":
+            if ch not in "[{":
                 continue
+            close = "]" if ch == "[" else "}"
             depth = 0
             for end in range(start, len(text)):
-                if text[end] == "[":
+                if text[end] == ch:
                     depth += 1
-                elif text[end] == "]":
+                elif text[end] == close:
                     depth -= 1
                     if depth == 0:
                         try:
-                            add_grids(json.loads(text[start:end + 1]), grids)
+                            return json.loads(text[start:end + 1])
                         except Exception:
                             pass
                         break
-        return grids
+        return None
 
-    grids = extract_json_grids(response)
-    n_train = len(train_inputs)
+    parsed = first_json_value(response)
+    if isinstance(parsed, dict):
+        train = grids_from(parsed.get("train", []))
+        test = grids_from(parsed.get("test", []))
+    else:
+        grids = grids_from(parsed)
+        n_train = len(train_inputs)
+        train = grids[:n_train]
+        test = grids[n_train:]
     return {
-        "train": grids[:n_train],
-        "test": grids[n_train:]
+        "train": train,
+        "test": test
     }
 '''
 
@@ -96,7 +107,7 @@ def _load_dataset() -> tuple[list[Example], list[Example], list[Example]]:
                 train_in = [ex["input"] for ex in train_items]
                 train_out = [ex["output"] for ex in train_items]
                 test_in = [ex["input"] for ex in test_items]
-                test_out = [ex.get("output") for ex in test_items]
+                test_out = _test_outputs_or_none([ex.get("output") for ex in test_items])
             else:
                 train_in = item["train_in"]
                 train_out = item["train_out"]
@@ -119,6 +130,13 @@ def _load_dataset() -> tuple[list[Example], list[Example], list[Example]]:
     return examples[:train_end], examples[train_end:val_end], examples[val_end:]
 
 
+def _test_outputs_or_none(outputs: list[Any] | None) -> list[Any] | None:
+    """Return test outputs only when every test item has a gold grid."""
+    if not outputs or any(output is None for output in outputs):
+        return None
+    return outputs
+
+
 @dataclass
 class _TrackedLLM:
     model_id: str
@@ -129,7 +147,7 @@ class _TrackedLLM:
     def total_cost(self) -> float:
         return sum(float(call.get("cost", 0.0)) for call in self.calls)
 
-    def __call__(self, prompt: str, temperature: float = 1.0) -> str:
+    def __call__(self, prompt: str, temperature: float = 0.0) -> str:
         if len(self.calls) >= self.max_llm_calls:
             raise RuntimeError(f"LLM budget exhausted ({self.max_llm_calls} calls)")
 
@@ -144,17 +162,41 @@ class _TrackedLLM:
         )
         msg = resp.choices[0].message
         content = msg.content or ""
+        reasoning = getattr(msg, "reasoning_content", None) or ""
         try:
             cost = litellm.completion_cost(completion_response=resp)
         except Exception:
             cost = 0.0
-        self.calls.append({
+        call_data = {
             "prompt": prompt,
             "response": content,
             "cost": cost,
             "duration": time.time() - start,
-        })
+        }
+        if reasoning:
+            call_data["reasoning"] = reasoning
+        self.calls.append(call_data)
         return content
+
+    def get_traces(self) -> dict[str, Any]:
+        """Return full LLM traces for ARC side-info reflection."""
+        trajectory = []
+        for call in self.calls:
+            entry = {
+                "prompt": call["prompt"],
+                "response": call["response"],
+                "cost": call.get("cost", 0.0),
+                "duration": call.get("duration", 0.0),
+            }
+            if call.get("reasoning"):
+                entry["reasoning"] = call["reasoning"]
+            trajectory.append(entry)
+        return {
+            "llm_calls": len(self.calls),
+            "llm_budget": self.max_llm_calls,
+            "total_cost": self.total_cost,
+            "trajectory": trajectory,
+        }
 
 
 def _compare_grid(pred: Any, gold: Any) -> tuple[bool, str]:
@@ -215,9 +257,13 @@ def _evaluate_test(test_preds: list[Any], test_out: list[Any] | None) -> tuple[f
             attempts = [pred]
         attempt_results = [_compare_grid(attempt, gold) for attempt in attempts]
         correct = any(item[0] for item in attempt_results)
-        feedback = next((item[1] for item in attempt_results if item[0]), attempt_results[0][1] if attempt_results else "No prediction.")
+        feedback = next(
+            (item[1] for item in attempt_results if item[0]),
+            attempt_results[0][1] if attempt_results else "No prediction.",
+        )
         results.append({"idx": i, "correct": correct, "feedback": feedback})
-    return (1.0 if all(result["correct"] for result in results) else 0.0), results
+    score = sum(1 for result in results if result["correct"]) / len(results) if results else 0.0
+    return score, results
 
 
 def _run_agent(
@@ -242,17 +288,46 @@ def _run_agent(
             "test_score": 0.0,
             "training_results": [],
             "test_results": [],
+            "train_examples": [],
+            "test_examples": [],
             "error": str(e),
             "llms": llms,
         }
 
     training_score, training_results = _evaluate_predictions(train_preds, train_out)
     test_score, test_results = _evaluate_test(test_preds, test_out)
+
+    train_examples = []
+    for i, (inp, gold, result) in enumerate(zip(train_in, train_out, training_results)):
+        pred = train_preds[i] if i < len(train_preds) else None
+        train_examples.append({
+            "input": inp,
+            "gold": gold,
+            "prediction": pred,
+            "correct": result["correct"],
+            "feedback": result["feedback"],
+        })
+
+    test_examples = []
+    for i, result in enumerate(test_results):
+        inp = test_in[i] if i < len(test_in) else None
+        gold = test_out[i] if test_out and i < len(test_out) else None
+        pred = test_preds[i] if i < len(test_preds) else None
+        test_examples.append({
+            "input": inp,
+            "gold": gold,
+            "prediction": pred,
+            "correct": result["correct"],
+            "feedback": result["feedback"],
+        })
+
     return {
         "training_score": training_score,
         "test_score": test_score,
         "training_results": training_results,
         "test_results": test_results,
+        "train_examples": train_examples,
+        "test_examples": test_examples,
         "error": None,
         "llms": llms,
     }
@@ -281,10 +356,16 @@ def evaluate(
     return score, {
         "score": score,
         "problem_id": example.id,
+        "agent_code": candidate,
         "training_score": result["training_score"],
         "test_score": result["test_score"],
         "cost": llms.total_cost,
         "error": result["error"],
+        "training_results": result["training_results"],
+        "test_results": result["test_results"],
+        "train_examples": result["train_examples"],
+        "test_examples": result["test_examples"],
+        **llms.get_traces(),
     }
 
 

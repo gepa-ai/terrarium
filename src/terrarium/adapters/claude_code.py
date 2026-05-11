@@ -61,7 +61,12 @@ BODY=$(echo "$RESPONSE" | sed '$d')
 echo "$BODY"
 
 if [ "$HTTP_CODE" = "429" ]; then
-    echo "BUDGET_EXHAUSTED" >&2
+    ERROR_TYPE=$(echo "$BODY" | jq -r '.error_type // "eval_budget_exhausted"')
+    if [ "$ERROR_TYPE" = "solver_budget_exhausted" ]; then
+        echo "SOLVER_BUDGET_EXHAUSTED" >&2
+    else
+        echo "BUDGET_EXHAUSTED" >&2
+    fi
     exit 1
 fi
 """
@@ -116,7 +121,12 @@ BODY=$(echo "$RESPONSE" | sed '$d')
 echo "$BODY"
 
 if [ "$HTTP_CODE" = "429" ]; then
-    echo "BUDGET_EXHAUSTED" >&2
+    ERROR_TYPE=$(echo "$BODY" | jq -r '.error_type // "eval_budget_exhausted"')
+    if [ "$ERROR_TYPE" = "solver_budget_exhausted" ]; then
+        echo "SOLVER_BUDGET_EXHAUSTED" >&2
+    else
+        echo "BUDGET_EXHAUSTED" >&2
+    fi
     exit 1
 fi
 """
@@ -145,7 +155,12 @@ BODY=$(echo "$RESPONSE" | sed '$d')
 echo "$BODY"
 
 if [ "$HTTP_CODE" = "429" ]; then
-    echo "BUDGET_EXHAUSTED" >&2
+    ERROR_TYPE=$(echo "$BODY" | jq -r '.error_type // "eval_budget_exhausted"')
+    if [ "$ERROR_TYPE" = "solver_budget_exhausted" ]; then
+        echo "SOLVER_BUDGET_EXHAUSTED" >&2
+    else
+        echo "BUDGET_EXHAUSTED" >&2
+    fi
     exit 1
 fi
 """

@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any
 
+from terrarium.budget import BudgetExhausted
 from terrarium.registry import register_task_factory
 from terrarium.task import Example, Task
 
@@ -100,6 +101,7 @@ def evaluate_with_solver(
 
     predictor = dspy.ChainOfThought(MathSolverSignature)
     predictor.predict.signature.instructions = candidate
+
     correct_answer = int(example.expected)
     written_solution = example.inputs.get("solution", "")
     solution_suffix = (
@@ -155,11 +157,31 @@ def evaluate_with_solver(
     solver_cost, solver_model = solver_cost_and_model(new_history)
 
     try:
-        llm_answer = int(prediction.answer)
-    except (ValueError, TypeError):
+        prediction = predictor(input=example.inputs["input"])
+    except BudgetExhausted:
+        raise
+    except Exception as e:
+        return 0.0, {
+            "score": 0.0,
+            "input": example.inputs["input"],
+            "prompt": candidate,
+            "output": "",
+            "feedback": (
+                f"The solver call failed or returned an unparsable response "
+                f"({type(e).__name__}: {e}). The correct answer is "
+                f"'{correct_answer}'.{solution_suffix}"
+            ),
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+    try:
+        raw_answer = prediction.answer
+        llm_answer = int(raw_answer)
+    except Exception as e:
+        raw_answer = getattr(prediction, "answer", "")
         feedback = (
             f"The final answer must be a valid integer and nothing else. "
-            f"You responded with \'{prediction.answer}\', which couldn\'t be parsed as a python integer. "
+            f"You responded with \'{raw_answer}\', which couldn\'t be parsed as a python integer. "
             f"Please ensure your answer is a valid integer without any additional text or formatting. "
             f"The correct answer is \'{correct_answer}\'.{solution_suffix}"
             f"{' and ensure your final answer is a valid integer.' if written_solution else ''}"
@@ -168,10 +190,11 @@ def evaluate_with_solver(
             "score": 0.0,
             "input": example.inputs["input"],
             "prompt": candidate,
-            "output": prediction.answer,
+            "output": raw_answer,
             "feedback": feedback,
             "cost": solver_cost,
             "solver_model": solver_model,
+            "error": f"{type(e).__name__}: {e}",
         }
 
     score = float(correct_answer == llm_answer)

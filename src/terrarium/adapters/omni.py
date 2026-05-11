@@ -151,6 +151,23 @@ class OmniAdapter:
             raise ValueError(f"OmniAdapter.strategy={self.strategy!r} requires a non-empty configs list")
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
+        from gepa.omni import Task as OmniTask
+
+        # Translate terrarium Task → omni Task. The runner already stripped
+        # terrarium.test_set before calling this adapter; keep omni.test_set
+        # empty so the inner omni server cannot run a second held-out eval or
+        # expose validation examples as a fake test split.
+        omni_task = OmniTask(
+            name=task.name,
+            initial_candidate=task.initial_candidate,
+            objective=task.objective,
+            background=task.background,
+            train_set=task.train_set,
+            val_set=task.val_set,
+            test_set=None,
+            metadata=dict(task.metadata),
+        )
+
         budget = server.budget
         max_token_cost = self.max_token_cost if self.max_token_cost is not None else budget.max_token_cost
         if budget.max_evals is None and max_token_cost is None:
