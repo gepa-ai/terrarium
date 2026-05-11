@@ -147,7 +147,7 @@ class _TrackedLLM:
     def total_cost(self) -> float:
         return sum(float(call.get("cost", 0.0)) for call in self.calls)
 
-    def __call__(self, prompt: str, temperature: float = 1.0) -> str:
+    def __call__(self, prompt: str, temperature: float = 0.0) -> str:
         if len(self.calls) >= self.max_llm_calls:
             raise RuntimeError(f"LLM budget exhausted ({self.max_llm_calls} calls)")
 
@@ -162,17 +162,41 @@ class _TrackedLLM:
         )
         msg = resp.choices[0].message
         content = msg.content or ""
+        reasoning = getattr(msg, "reasoning_content", None) or ""
         try:
             cost = litellm.completion_cost(completion_response=resp)
         except Exception:
             cost = 0.0
-        self.calls.append({
+        call_data = {
             "prompt": prompt,
             "response": content,
             "cost": cost,
             "duration": time.time() - start,
-        })
+        }
+        if reasoning:
+            call_data["reasoning"] = reasoning
+        self.calls.append(call_data)
         return content
+
+    def get_traces(self) -> dict[str, Any]:
+        """Return full LLM traces for ARC side-info reflection."""
+        trajectory = []
+        for call in self.calls:
+            entry = {
+                "prompt": call["prompt"],
+                "response": call["response"],
+                "cost": call.get("cost", 0.0),
+                "duration": call.get("duration", 0.0),
+            }
+            if call.get("reasoning"):
+                entry["reasoning"] = call["reasoning"]
+            trajectory.append(entry)
+        return {
+            "llm_calls": len(self.calls),
+            "llm_budget": self.max_llm_calls,
+            "total_cost": self.total_cost,
+            "trajectory": trajectory,
+        }
 
 
 def _compare_grid(pred: Any, gold: Any) -> tuple[bool, str]:
@@ -264,17 +288,46 @@ def _run_agent(
             "test_score": 0.0,
             "training_results": [],
             "test_results": [],
+            "train_examples": [],
+            "test_examples": [],
             "error": str(e),
             "llms": llms,
         }
 
     training_score, training_results = _evaluate_predictions(train_preds, train_out)
     test_score, test_results = _evaluate_test(test_preds, test_out)
+
+    train_examples = []
+    for i, (inp, gold, result) in enumerate(zip(train_in, train_out, training_results)):
+        pred = train_preds[i] if i < len(train_preds) else None
+        train_examples.append({
+            "input": inp,
+            "gold": gold,
+            "prediction": pred,
+            "correct": result["correct"],
+            "feedback": result["feedback"],
+        })
+
+    test_examples = []
+    for i, result in enumerate(test_results):
+        inp = test_in[i] if i < len(test_in) else None
+        gold = test_out[i] if test_out and i < len(test_out) else None
+        pred = test_preds[i] if i < len(test_preds) else None
+        test_examples.append({
+            "input": inp,
+            "gold": gold,
+            "prediction": pred,
+            "correct": result["correct"],
+            "feedback": result["feedback"],
+        })
+
     return {
         "training_score": training_score,
         "test_score": test_score,
         "training_results": training_results,
         "test_results": test_results,
+        "train_examples": train_examples,
+        "test_examples": test_examples,
         "error": None,
         "llms": llms,
     }
@@ -298,10 +351,16 @@ def evaluate(candidate: str, example: Example, model_id: str = "openrouter/googl
     return score, {
         "score": score,
         "problem_id": example.id,
+        "agent_code": candidate,
         "training_score": result["training_score"],
         "test_score": result["test_score"],
         "cost": llms.total_cost,
         "error": result["error"],
+        "training_results": result["training_results"],
+        "test_results": result["test_results"],
+        "train_examples": result["train_examples"],
+        "test_examples": result["test_examples"],
+        **llms.get_traces(),
     }
 
 
