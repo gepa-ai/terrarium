@@ -39,15 +39,43 @@ Usage::
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import logging
 import os
 import shutil
 import subprocess
 import time
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import requests
+
+# Hard ceiling on a single judge evaluation. The Docker judge occasionally
+# wedges (TCP read never returns) under concurrent load — without a timeout
+# the calling thread blocks forever and the gepa loop's iteration 0 never
+# completes. With this in place a wedged eval surfaces as a TimeoutError,
+# we retry once, and on a second timeout return a 0-score "timeout" info
+# so the run keeps moving.
+EVAL_TIMEOUT_SEC = 300
+
+
+def _eval_with_timeout(runner: Any, problem_id: str, candidate: str) -> Any:
+    """Run ``runner.evaluate(problem_id, candidate)`` with a hard timeout.
+
+    Returns the runner's result on success, raises ``TimeoutError`` on
+    timeout, propagates any other exception. The orphaned worker thread (if
+    we did time out) is left to die in the background — Python can't preempt
+    threads, so ``shutdown(wait=False)`` is the cleanest we can do.
+    """
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(runner.evaluate, str(problem_id), candidate).result(timeout=EVAL_TIMEOUT_SEC)
+    finally:
+        ex.shutdown(wait=False)
+
 
 _FRONTIER_CS_REPO_URL = "https://github.com/FrontierCS/Frontier-CS"
 _JUDGE_PORT = 8081
@@ -55,7 +83,7 @@ _JUDGE_URL = f"http://localhost:{_JUDGE_PORT}"
 
 logger = logging.getLogger(__name__)
 
-from terrarium.registry import register_task_factory, register_task_resolver
+from terrarium.registry import register_task_factory
 from terrarium.task import Example, Task
 
 # Minimal compilable C++ seed. Starts from "the beginning" — the LM must
@@ -120,8 +148,7 @@ def _ensure_repo(base: Path) -> None:
         )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
-            f"git clone of {_FRONTIER_CS_REPO_URL} failed ({e}). "
-            f"Clone manually to {base} and/or set FRONTIER_CS_DIR."
+            f"git clone of {_FRONTIER_CS_REPO_URL} failed ({e}). Clone manually to {base} and/or set FRONTIER_CS_DIR."
         ) from e
 
 
@@ -147,11 +174,6 @@ def _algorithmic_rows() -> dict[str, dict[str, Any]]:
 
 def _judge_is_alive() -> bool:
     """Check if the judge server is responding on the default port."""
-    try:
-        import requests
-    except ImportError:
-        return False
-
     try:
         r = requests.get(f"{_JUDGE_URL}/problems", timeout=5)
         return r.status_code == 200
@@ -258,7 +280,40 @@ def _evaluate(candidate: str, *, problem_id: str) -> tuple[float, dict[str, Any]
 
     try:
         runner = AlgorithmicLocalRunner(base_dir=base, auto_start=False)
-        result = runner.evaluate(str(problem_id), candidate)
+    except Exception as e:
+        return 0.0, {
+            "score": 0.0,
+            "problem_id": problem_id,
+            "status": "error",
+            "message": f"{type(e).__name__}: {e}",
+            "logs": "",
+        }
+
+    # Run runner.evaluate in a worker thread so we can enforce a hard
+    # timeout. Try once, then retry on timeout. A timed-out thread can't
+    # be preempted, so we orphan it via shutdown(wait=False) and move on.
+    try:
+        result = _eval_with_timeout(runner, problem_id, candidate)
+    except concurrent.futures.TimeoutError:
+        logger.warning("frontier_cs eval timeout 1/2 on problem %s — retrying", problem_id)
+        try:
+            result = _eval_with_timeout(runner, problem_id, candidate)
+        except concurrent.futures.TimeoutError:
+            return 0.0, {
+                "score": 0.0,
+                "problem_id": problem_id,
+                "status": "timeout",
+                "message": f"eval exceeded {EVAL_TIMEOUT_SEC}s on both attempts",
+                "logs": "",
+            }
+        except Exception as e:
+            return 0.0, {
+                "score": 0.0,
+                "problem_id": problem_id,
+                "status": "error",
+                "message": f"{type(e).__name__}: {e}",
+                "logs": "",
+            }
     except Exception as e:
         return 0.0, {
             "score": 0.0,
@@ -283,9 +338,7 @@ def _make_problem_task(problem_id: str) -> Task:
     """Factory for a single-problem task. Runs on first get_task() access."""
     rows = _algorithmic_rows()
     if problem_id not in rows:
-        raise KeyError(
-            f"Frontier-CS algorithmic problem {problem_id!r} not found in HF dataset."
-        )
+        raise KeyError(f"Frontier-CS algorithmic problem {problem_id!r} not found in HF dataset.")
     row = rows[problem_id]
 
     def eval_fn(candidate: str) -> tuple[float, dict[str, Any]]:
@@ -331,12 +384,11 @@ def _make_smoke_task() -> Task:
         )
         for pid in available
     ]
+
     def eval_fn(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
         return _evaluate(candidate, problem_id=example.inputs["problem_id"])
 
-    statements = "\n\n---\n\n".join(
-        f"### Problem {pid}\n\n{rows[pid]['statement']}" for pid in available
-    )
+    statements = "\n\n---\n\n".join(f"### Problem {pid}\n\n{rows[pid]['statement']}" for pid in available)
     return Task(
         name="frontier_cs_algo_smoke",
         objective=_OBJECTIVE,
@@ -345,34 +397,48 @@ def _make_smoke_task() -> Task:
         eval_fn=eval_fn,
         train_set=examples,
         metadata={
-            "type": "multi_task",
+            "type": "generalization",
             "candidate_type": "code",
             "language": "cpp",
             "frontier_cs_track": "algorithmic",
-            "official": False,
-            "purpose": "adapter pipeline smoke test",
         },
     )
 
 
-def _resolve_task(name: str):
-    if not name.startswith("frontier_cs_algo_"):
-        return None
-    problem_id = name.removeprefix("frontier_cs_algo_")
-    if not problem_id:
-        return None
-    return lambda p=problem_id: _make_problem_task(p)
-
-
 def _register_all() -> None:
-    """Register Frontier-CS entry points without touching the remote dataset.
+    """Register the smoke task + one factory per algorithmic problem.
 
-    The smoke task and dynamic ``frontier_cs_algo_<id>`` resolver defer
-    HuggingFace access until the selected Frontier-CS task is actually loaded.
-    This keeps unrelated tasks from doing Frontier-CS discovery at startup.
+    Registration is cheap: each factory captures just the problem_id. The HF
+    dataset isn't loaded until a factory is actually invoked (via get_task()),
+    and then it's loaded exactly once (cached).
+
+    If the ``datasets`` package isn't installed, we skip silently — the
+    Frontier-CS extra wasn't installed, and other terrarium tasks should still
+    work.
     """
+    try:
+        from datasets import load_dataset  # noqa: F401
+    except ImportError:
+        return
+
+    try:
+        rows = _algorithmic_rows()
+    except Exception as e:  # pragma: no cover - network/HF hub issues
+        warnings.warn(
+            f"Could not load Frontier-CS problem list from HuggingFace: {e}. "
+            "Per-problem tasks (frontier_cs_algo_<id>) will not be registered. "
+            "Other terrarium tasks are unaffected.",
+            stacklevel=2,
+        )
+        return
+
     register_task_factory("frontier_cs_algo_smoke", _make_smoke_task)
-    register_task_resolver(_resolve_task)
+    for pid in rows:
+        # Default-arg binding pins pid into each lambda's closure.
+        register_task_factory(
+            f"frontier_cs_algo_{pid}",
+            lambda p=pid: _make_problem_task(p),
+        )
 
 
 _register_all()

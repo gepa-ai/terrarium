@@ -30,7 +30,7 @@ FAILED_SCORE = -100_000.0
 # graph) can run forever. Implemented as a daemon thread + join — Python
 # can't kill threads, so the timed-out worker keeps burning CPU until the
 # process exits. Diverges from blog setup (no timeout there) intentionally.
-SEARCH_ALGORITHM_TIMEOUT_SECS = 60.0
+SEARCH_ALGORITHM_TIMEOUT_SECS = 300.0
 
 
 def _call_with_timeout(fn: Callable, args: tuple, timeout: float) -> tuple[str, Any]:
@@ -54,6 +54,18 @@ def _call_with_timeout(fn: Callable, args: tuple, timeout: float) -> tuple[str, 
 # Program file management (cached per process)
 # ---------------------------------------------------------------------------
 
+# ``_cache_lock`` serializes the check + evict + write sequence so two
+# threads can't simultaneously rmtree+rewrite the cache mid-mutation.
+# A separate ``_graph_lock`` protects the lazily-populated graph cache.
+# Note: the program-cache lock does NOT prevent a third thread from
+# evicting the tempdir *after* ``get_program_path`` has returned to a
+# caller still using the path (e.g. running its simulator subprocess).
+# That residual race is acceptable in practice because callers
+# typically run a candidate's evals in a tight burst before the next
+# candidate flips the cache.
+_cache_lock = threading.RLock()
+_graph_lock = threading.RLock()
+
 _program_cache: dict[str, Any] = {
     "code": None,
     "path": None,
@@ -68,33 +80,38 @@ _graph_cache: dict[int, Any] = {}
 
 def get_program_path(program_code: str) -> str:
     """Write the candidate program to a temp file if it has changed; return its path."""
-    if _program_cache["code"] != program_code:
-        _evict_cached_program()
-        _write_program_to_cache(program_code)
-    return _program_cache["path"]
+    with _cache_lock:
+        if _program_cache["code"] != program_code:
+            _evict_cached_program()
+            _write_program_to_cache(program_code)
+        return _program_cache["path"]
 
 
 def syntax_is_valid(program_path: str) -> bool:
     """Return True if the cached program passed the syntax and structure check."""
-    return _program_cache["syntax_ok"] is True
+    with _cache_lock:
+        return _program_cache["syntax_ok"] is True
 
 
 def syntax_failure_info(example: dict[str, Any]) -> SideInfo:
     """Build a SideInfo dict describing a syntax or structure validation failure."""
-    return {
-        "scores": {"cost": FAILED_SCORE},
-        "Input": {"config_file": os.path.basename(example.get("config_file", "?"))},
-        "Error": _program_cache["syntax_error"] or "Syntax validation failed",
-    }
+    with _cache_lock:
+        return {
+            "scores": {"cost": FAILED_SCORE},
+            "Input": {"config_file": os.path.basename(example.get("config_file", "?"))},
+            "Error": _program_cache["syntax_error"] or "Syntax validation failed",
+        }
 
 
 def _evict_cached_program() -> None:
+    # Caller already holds ``_cache_lock``.
     if _program_cache["tmpdir"]:
         shutil.rmtree(_program_cache["tmpdir"], ignore_errors=True)
     _program_cache.update(code=None, path=None, tmpdir=None, syntax_ok=None, syntax_error=None)
 
 
 def _write_program_to_cache(code: str) -> None:
+    # Caller already holds ``_cache_lock``.
     tmpdir = tempfile.mkdtemp(prefix="cloudcast_eval_")
     path = os.path.join(tmpdir, "program.py")
     with open(path, "w", encoding="utf-8") as f:
@@ -196,11 +213,12 @@ def _load_config(config_file: str) -> dict[str, Any]:
 
 def _get_graph(num_vms: int) -> Any:
     """Return a cached NetworkX graph for the given number of VMs."""
-    if num_vms not in _graph_cache:
-        from terrarium.tasks.cloudcast_lib.core.utils import make_nx_graph
+    with _graph_lock:
+        if num_vms not in _graph_cache:
+            from terrarium.tasks.cloudcast_lib.core.utils import make_nx_graph
 
-        _graph_cache[num_vms] = make_nx_graph(num_vms=num_vms)
-    return _graph_cache[num_vms].copy()
+            _graph_cache[num_vms] = make_nx_graph(num_vms=num_vms)
+        return _graph_cache[num_vms].copy()
 
 
 def _run_search_algorithm(program: Any, config: dict[str, Any], G: Any) -> Any:
