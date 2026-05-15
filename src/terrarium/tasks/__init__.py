@@ -12,6 +12,8 @@ from terrarium.tasks import (  # noqa: F401
     cloudcast,
     frontier_cs,
     optuna_blackbox,
+    needle_in_range,
+    slot_machines,
 )
 
 __all__ = [
@@ -23,4 +25,6 @@ __all__ = [
     "cloudcast",
     "frontier_cs",
     "optuna_blackbox",
+    "needle_in_range",
+    "slot_machines",
 ]

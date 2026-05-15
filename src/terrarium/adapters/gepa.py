@@ -195,7 +195,11 @@ class GEPAAdapter:
         engine_kwargs: dict[str, Any] = {
             **self.engine,
             "run_dir": self.run_dir,
-            "max_metric_calls": budget.max_evals,
+            # Tell gepa its eval budget is 100x the real one. The eval server is the
+            # actual budget enforcer (raises BudgetExhausted on call N+1). This prevents
+            # gepa's MaxMetricCallsStopper from firing prematurely AND prevents adapters
+            # from voluntarily quitting before the real budget is exhausted.
+            "max_metric_calls": budget.max_evals * 100,
         }
 
         cost_source = reflection_lm if not isinstance(reflection_lm, str) else None

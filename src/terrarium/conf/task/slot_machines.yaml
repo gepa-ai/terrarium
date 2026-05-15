@@ -1,0 +1,6 @@
+# @package task
+name: slot_machines
+mode: single
+n: 10        # number of machines
+m: 100       # number of pulls
+seed: 42     # arm probabilities + reward draws are seeded

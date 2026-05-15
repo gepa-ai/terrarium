@@ -615,6 +615,53 @@ def _apply_task_runtime_config(task: Task, task_cfg: DictConfig) -> Task:
             metadata["solver_num_retries"] = int(num_retries)
         return replace(task, eval_fn=evaluate, metadata=metadata)
 
+    if task.name == "needle_in_range":
+        from terrarium.tasks.needle_in_range import (
+            configure as _configure_nir,
+            make_description as _nir_description,
+            make_objective as _nir_objective,
+        )
+
+        n = int(task_cfg.get("n") or task.metadata.get("n") or 50)
+        _configure_nir(n)
+
+        metadata = dict(task.metadata)
+        metadata["n"] = n
+        return replace(
+            task,
+            objective=_nir_objective(n),
+            background=_nir_description(n),
+            metadata=metadata,
+        )
+    if task.name == "slot_machines":
+        from terrarium.tasks.slot_machines import (
+            configure as _configure_slots,
+            make_description as _slots_description,
+            make_objective as _slots_objective,
+        )
+
+        def _pick(key: str, default: int) -> int:
+            v = task_cfg.get(key)
+            if v is None:
+                v = task.metadata.get(key, default)
+            return int(v)
+
+        n = _pick("n", 10)
+        m = _pick("m", 100)
+        seed = _pick("seed", 42)
+        _configure_slots(n, m, seed)
+
+        metadata = dict(task.metadata)
+        metadata["n"] = n
+        metadata["m"] = m
+        metadata["seed"] = seed
+        return replace(
+            task,
+            objective=_slots_objective(n, m),
+            background=_slots_description(n, m),
+            metadata=metadata,
+        )
+
     if task.name != "arc_agi":
         return task
 

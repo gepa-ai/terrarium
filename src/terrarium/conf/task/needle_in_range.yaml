@@ -1,0 +1,4 @@
+# @package task
+name: needle_in_range
+mode: single
+n: 50
