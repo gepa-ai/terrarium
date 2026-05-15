@@ -1,8 +1,13 @@
 # @package _global_
 #
 # Optimizer bundle: Meta-Harness. Selected with `+optimizer=mh`.
+#
+# Model-matched to Claude Sonnet 4.6 (the adapter default is Opus; we pin
+# Sonnet here so all four optimizers in the trick-task sweep share one
+# model and the comparison isolates the algorithm).
 defaults:
   - override /adapter: meta_harness
 
 adapter:
+  model: sonnet
   max_iterations: 50

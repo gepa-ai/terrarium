@@ -2,8 +2,11 @@
 #
 # Optimizer bundle: GEPA x CCA — GEPA driven by a Claude Code agent
 # proposer instead of an LLM reflection call. Selected with
-# `+optimizer=gepa_cca`. Swap the model via
-# `adapter.reflection.reflection_lm=claude_code_agent/opus`.
+# `+optimizer=gepa_cca`.
+#
+# Model-matched to Claude Sonnet 4.6 (the agent proposer runs Sonnet),
+# consistent with the other three optimizers in the trick-task sweep.
+# Swap to Opus via adapter.reflection.reflection_lm=claude_code_agent/opus.
 defaults:
   - override /adapter: gepa
 
