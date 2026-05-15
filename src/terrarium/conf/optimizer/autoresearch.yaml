@@ -1,0 +1,14 @@
+# @package _global_
+#
+# Optimizer bundle: autoresearch — the Claude Code Ralph loop
+# (experiment loop in the spirit of karpathy/autoresearch).
+# Selected with `+optimizer=autoresearch`.
+#
+# Model pinned to Sonnet explicitly (rather than relying on the
+# claude_code adapter default) so the trick-task sweep is model-matched
+# and reproducible if that default ever changes.
+defaults:
+  - override /adapter: claude_code
+
+adapter:
+  model: sonnet

@@ -1,0 +1,15 @@
+# @package _global_
+#
+# Trick-task experiment: slot_machines.
+# Selected with `+experiment=trick_slots`. The environment seed is
+# `task.seed` — sweep it (e.g. `task.seed=42,0,1`) to vary the hidden MAB.
+defaults:
+  - override /task: slot_machines
+
+task:
+  n: 5
+  m: 50
+
+budget:
+  max_evals: 50
+  max_token_cost: 40.0

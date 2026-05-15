@@ -1,0 +1,19 @@
+# @package _global_
+#
+# Optimizer bundle: GEPA. Selected with `+optimizer=gepa`.
+#
+# Model-matched to Claude Sonnet 4.6 (anthropic_sdk path) so the trick-task
+# comparison isolates the GEPA algorithm rather than the gpt-5 vs Claude
+# difference. anthropic_sdk/ is the direct-SDK reflection LM — the closest
+# analog to the original litellm reflection call, just on Sonnet.
+#
+# Eval caching is disabled so the eval server stays the single source of
+# truth for budget consumption on the trick tasks.
+defaults:
+  - override /adapter: gepa
+
+adapter:
+  engine:
+    cache_evaluation: false
+  reflection:
+    reflection_lm: anthropic_sdk/claude-sonnet-4-6
