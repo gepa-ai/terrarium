@@ -22,15 +22,17 @@ from terrarium.tasks._finance_common import evaluate_with_solver as _solve
 from terrarium.tasks._finance_common import load_finance_dataset
 
 DESCRIPTION = """\
-The candidate is a reusable playbook of strategies, rules, and insights.
-For each item the model answers a finance categorization question with the
-playbook available to it. The score is 1.0 only if every required tag
-matches, 0.0 otherwise.
+The candidate is a prompt string. For each item the model is given a
+financial statement together with a list of allowed category tags, and
+must output the correct tag(s). The score is 1.0 only if every required
+tag matches, 0.0 otherwise.
 """
 
-# ACE offline mode seeds from an effectively empty playbook and curates it;
-# the optimizer evolves this slot. "(empty)" mirrors ACE's empty-slot value.
-INITIAL_CANDIDATE = "(empty)"
+INITIAL_CANDIDATE = (
+    "Read the financial statement and the list of allowed tags. Choose the "
+    "tag(s) that best apply. Respond with only the tag(s), and end your "
+    "response with Finish[<tag>] containing the final answer."
+)
 
 
 def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
