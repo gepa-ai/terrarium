@@ -1,0 +1,15 @@
+# @package _global_
+#
+# Trick-task experiment: needle_in_range.
+# Selected with `+experiment=trick_needle`. Pins task + budget so the
+# comparison is reproducible and diffable; sweep the optimizer with
+# `+optimizer=mh,gepa,autoresearch,gepa_cca` under `-m`.
+defaults:
+  - override /task: needle_in_range
+
+task:
+  n: 50
+
+budget:
+  max_evals: 50
+  max_token_cost: 40.0

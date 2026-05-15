@@ -1,0 +1,11 @@
+# @package _global_
+#
+# Optimizer bundle: GEPA (gpt-5 reflection). Selected with `+optimizer=gepa`.
+# Eval caching is disabled so the eval server stays the single source of
+# truth for budget consumption on the trick tasks.
+defaults:
+  - override /adapter: gepa
+
+adapter:
+  engine:
+    cache_evaluation: false

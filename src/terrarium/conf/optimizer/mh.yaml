@@ -1,0 +1,8 @@
+# @package _global_
+#
+# Optimizer bundle: Meta-Harness. Selected with `+optimizer=mh`.
+defaults:
+  - override /adapter: meta_harness
+
+adapter:
+  max_iterations: 50

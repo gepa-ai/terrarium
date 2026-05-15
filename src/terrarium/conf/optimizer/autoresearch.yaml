@@ -1,0 +1,7 @@
+# @package _global_
+#
+# Optimizer bundle: autoresearch — the Claude Code Ralph loop
+# (experiment loop in the spirit of karpathy/autoresearch).
+# Selected with `+optimizer=autoresearch`.
+defaults:
+  - override /adapter: claude_code

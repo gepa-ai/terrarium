@@ -699,6 +699,19 @@ def main(cfg: DictConfig) -> None:
     adapter_name = hydra_cfg.runtime.choices.get("adapter", "adapter")
     adapter_dir = hydra_out / adapter_name
 
+    # Trick-task research sidecars default to the per-run Hydra output
+    # dir so `--multirun` sweeps produce one sidecar per job with no env
+    # wrangling. An explicit TERRARIUM_*_RESEARCH_LOG env var still wins.
+    _task_name = cfg.get("task", {}).get("name")
+    if _task_name == "needle_in_range":
+        os.environ.setdefault(
+            "TERRARIUM_NEEDLE_RESEARCH_LOG", str(hydra_out / "research.jsonl")
+        )
+    elif _task_name == "slot_machines":
+        os.environ.setdefault(
+            "TERRARIUM_SLOTS_RESEARCH_LOG", str(hydra_out / "research.jsonl")
+        )
+
     try:
         hydra_out.mkdir(parents=True, exist_ok=True)
         (hydra_out / "run.pid").write_text(str(os.getpid()))
