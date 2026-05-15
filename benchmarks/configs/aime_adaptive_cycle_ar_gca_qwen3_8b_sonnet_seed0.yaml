@@ -1,0 +1,41 @@
+# Full AIME adaptive-sequential run.
+#
+# Purpose: compare a metric-budgeted scheduler that starts with
+# AutoResearch, switches to GEPA + Claude Code Agent on plateaus, and cycles
+# between them until the shared AIME metric-call budget is exhausted.
+name: aime_adaptive_cycle_ar_gca_qwen3_8b_sonnet_seed0
+source_zshrc: true
+max_parallel_runs: 1
+
+tasks:
+  - name: aime_math
+    task: aime_math
+    overrides:
+      - task.solver_lm=openai/arbor:qwen/qwen3-8b
+      - task.solver_temperature=0.0
+      - task.solver_max_tokens=32000
+      - task.solver_timeout=180
+      - task.solver_num_retries=0
+
+seeds: [0]
+
+budget:
+  max_evals: 800
+  max_token_cost: 10.0
+
+defaults:
+  - max_concurrency=32
+
+algorithms:
+  - name: adaptive_cycle_ar_gca
+    algorithm: omni
+    overrides:
+      - adapter.strategy=adaptive_sequential
+      - benchmark.split_train_val=true
+      - adapter.scheduler.plateau_evals=90
+      - adapter.scheduler.patience=1
+      - adapter.scheduler.min_evals_per_stage=90
+      - adapter.scheduler.improvement_epsilon=0.0
+      - adapter.scheduler.cycle=true
+    seed_overrides:
+      - "adapter.configs=[{{backend: claude_code, split_train_val: false, config: {{model: sonnet, ralph: true, max_no_eval_seconds: 240}}}}, {{backend: gepa, split_train_val: true, config: {{reflection: {{reflection_lm: null}}, claude_code_agent: {{model: sonnet}}, engine: {{parallel: true, max_workers: 32, seed: {seed}}}}}}}]"

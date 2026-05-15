@@ -8,12 +8,24 @@ version = "0.1.0"
 description = "Common evaluation infrastructure for evolving/auto-research systems."
 requires-python = ">=3.10"
 dependencies = [
+    "dspy>=2.6",
+    "gepa",
     "hydra-core>=1.3",
     "omegaconf>=2.3",
 ]
 
 [project.optional-dependencies]
+# Backward-compatible no-op extra; GEPA is a core dependency because
+# terrarium.tracking imports GEPA callback types at module import time.
 gepa = ["gepa"]
+aime = [
+    "datasets>=2.14",
+    "dspy>=2.6",
+]
+arc_agi = [
+    "datasets>=2.14",
+    "litellm>=1.64",
+]
 # Direct Anthropic SDK reflection LM — used when ``reflection_lm`` is set to
 # ``"anthropic_sdk/<model>"`` to bypass litellm. See
 # ``terrarium.adapters._anthropic_sdk_lm`` for why (litellm + httpx wedges on
@@ -24,6 +36,7 @@ frontier_cs = [
     # terrarium's broader 3.10 support isn't blocked at lock time.
     "frontier-cs @ git+https://github.com/FrontierCS/Frontier-CS ; python_version >= '3.11'",
     "datasets>=2.14",
+    "requests>=2.31",
 ]
 # Can't Be Late: vendored sky-spot simulator. Configs ship with terrarium;
 # the AWS spot-availability traces are an external download (one-time, see
@@ -45,6 +58,9 @@ cloudcast = [
     "pandas>=1.3",
     "numpy>=1.20",
 ]
+
+[tool.uv.sources]
+gepa = { path = "gepa", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,38 @@
+# Cheap AIME adaptive sequential smoke.
+#
+# Same AR -> GEPA+CCA path as the full run, but with a smaller metric-call
+# budget and optimizer cap to catch wiring/runtime errors first.
+name: aime_adaptive_ar_then_gca_smoke_qwen3_8b_sonnet_seed0
+source_zshrc: true
+max_parallel_runs: 1
+
+tasks:
+  - name: aime_math
+    task: aime_math
+    overrides:
+      - task.solver_lm=openai/arbor:qwen/qwen3-8b
+      - task.solver_temperature=0.0
+      - task.solver_max_tokens=32000
+
+seeds: [0]
+
+budget:
+  max_evals: 180
+  max_token_cost: 1.5
+
+defaults:
+  - max_concurrency=16
+
+algorithms:
+  - name: adaptive_ar_then_gca_smoke
+    algorithm: omni
+    overrides:
+      - adapter.strategy=adaptive_sequential
+      - benchmark.split_train_val=true
+      - adapter.scheduler.plateau_evals=90
+      - adapter.scheduler.patience=1
+      - adapter.scheduler.min_evals_per_stage=90
+      - adapter.scheduler.improvement_epsilon=0.0
+      - adapter.scheduler.cycle=false
+    seed_overrides:
+      - "adapter.configs=[{{backend: claude_code, split_train_val: false, config: {{model: sonnet, ralph: true}}}}, {{backend: gepa, split_train_val: true, config: {{reflection: {{reflection_lm: null}}, claude_code_agent: {{model: sonnet}}, engine: {{parallel: true, max_workers: 16, seed: {seed}}}}}}}]"

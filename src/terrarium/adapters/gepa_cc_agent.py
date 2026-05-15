@@ -72,7 +72,7 @@ from typing import Any
 
 from terrarium.adapters.claude_code import _copy_session_transcript
 from terrarium.budget import BudgetExhausted
-from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args
+from terrarium.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_settings_args, prepare_claude_home
 
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
@@ -567,6 +567,9 @@ can see your reasoning; keep it tight.
         with jail_ctx as jail_root_str:
             jail_root = Path(jail_root_str)
             agent_subdir = self._build_jail_mirror(subdir, jail_root) if self.sandbox else subdir
+            claude_home = prepare_claude_home(jail_root) if self.sandbox else None
+            if claude_home is not None:
+                env["HOME"] = str(claude_home)
 
             wrapper = self._wrapper_prompt(
                 agent_subdir,
@@ -576,7 +579,7 @@ can see your reasoning; keep it tight.
                 parent_iter_id=parent_iter_id,
                 root_dir=jail_root,
             )
-            cmd: list[str] = bwrap_prefix(jail_root) if self.sandbox else []
+            cmd: list[str] = bwrap_prefix(jail_root, claude_home=claude_home) if self.sandbox else []
             cmd += [
                 "claude",
                 "--print",
@@ -601,8 +604,9 @@ can see your reasoning; keep it tight.
 
             if self.sandbox:
                 self._sync_jail_outputs(agent_subdir, subdir)
-
-        _copy_session_transcript(self.run_dir, session_id, subdir)
+                _copy_session_transcript(jail_root, session_id, subdir, claude_home=claude_home)
+            else:
+                _copy_session_transcript(self.run_dir, session_id, subdir)
 
         payload: dict[str, Any] = {}
         stdout = (proc.stdout or "").strip()

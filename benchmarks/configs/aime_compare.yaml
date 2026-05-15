@@ -1,0 +1,50 @@
+# Full AIME comparison template. Tune budgets before paper runs.
+name: aime_compare
+source_zshrc: true
+max_workers: 1
+
+tasks:
+  - aime_math
+
+seeds: [0]
+
+budget:
+  max_evals: 800
+  max_token_cost: 3.0
+
+defaults:
+  - benchmark.split_train_val=true
+  - max_concurrency=8
+
+algorithms:
+  - name: gepa
+    algorithm: omni
+    overrides:
+      - adapter.backend=gepa
+      - ++adapter.config.reflection.reflection_lm=anthropic/claude-sonnet-4-6
+    seed_overrides:
+      - ++adapter.config.engine.seed={seed}
+
+  - name: gepa_cc_agent
+    algorithm: omni
+    overrides:
+      - adapter.backend=gepa
+      - ++adapter.config.reflection.reflection_lm=null
+      - ++adapter.config.claude_code_agent.model=sonnet
+    seed_overrides:
+      - ++adapter.config.engine.seed={seed}
+
+  - name: claude_code
+    algorithm: omni
+    overrides:
+      - adapter.backend=claude_code
+      - ++adapter.config.model=sonnet
+      - benchmark.split_train_val=false
+
+  - name: meta_harness
+    algorithm: omni
+    overrides:
+      - adapter.backend=meta_harness
+      - ++adapter.config.model=sonnet
+      - ++adapter.config.max_iterations=null
+      - benchmark.split_train_val=false

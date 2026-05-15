@@ -1,2 +1,5 @@
 # @package task
 name: arc_agi
+mode: generalization
+solver_lm: anthropic/claude-haiku-4-5
+max_llm_calls: 10

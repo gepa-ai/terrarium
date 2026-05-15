@@ -1,2 +1,3 @@
 # @package task
 name: circle_packing
+mode: single

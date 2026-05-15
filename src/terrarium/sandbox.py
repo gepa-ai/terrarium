@@ -20,8 +20,8 @@ Layout we expose inside the jail:
   ``/etc`` succeed inside the jail but do not leak to the host.
 - ``/proc``, ``/dev``, ``/tmp``: standard mounts (``--proc``, ``--dev``,
   fresh ``--tmpfs``).
-- ``$HOME/.claude``, ``$HOME/.claude.json``, ``$HOME/.cache``: writable —
-  Claude Code stores sessions, config, and caches here.
+- a per-call ``$HOME``: writable, with copied top-level Claude auth/config
+  and a fresh empty ``.claude/projects`` directory.
 - ``$HOME/.local``: read-only — ``claude`` itself lives under here.
 - ``work_dir``: the only writable path under ``/data``-style trees. Sibling
   run dirs are completely invisible (their parent paths aren't bound, so
@@ -42,21 +42,16 @@ its argv when sandboxed; the rest of the ``claude`` flags
 :data:`DENY_WEB_TOOLS` ``--disallowedTools=...`` string) are inlined and
 unconditional — they don't depend on whether bwrap wraps the call.
 
-TODO(sandbox-leak): binding ``$HOME/.claude`` writable exposes every prior
-session transcript under ``~/.claude/projects/<project>/<uuid>.jsonl`` to
-the sandboxed agent. Confirmed reproducible: a probe ``grep -r SECRET /``
-inside the jail finds markers planted by the parent Claude Code session
-because the parent's transcript is in the same projects dir. For GEPA
-proposers this is a real cheating channel — sibling proposer transcripts
-contain their full code attempts and scores. Fix idea: per-job HOME with a
-copy of ``.claude.json`` (auth) and a fresh empty ``.claude/projects/``,
-then update ``_copy_session_transcript`` to read from the per-job HOME.
+Shared ``~/.claude/projects`` and ``~/.cache`` are not bound by default.
+Callers must pass explicit ``extra_writable`` paths for any benchmark setting
+that allows shared cache access.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -103,6 +98,37 @@ _ETC_FILES: tuple[str, ...] = (
 DENY_WEB_TOOLS: str = "--disallowedTools=WebFetch,WebSearch"
 
 
+def prepare_claude_home(base_dir: Path | str) -> Path:
+    """Create an isolated HOME for one sandboxed Claude subprocess.
+
+    The home gets only top-level Claude auth/config files plus an empty
+    ``.claude/projects`` directory. Project transcripts from the parent home
+    are deliberately not copied.
+    """
+    source_home = Path.home()
+    base = Path(base_dir).resolve()
+    claude_home = base / ".terrarium_claude_home"
+    claude_dir = claude_home / ".claude"
+    projects_dir = claude_dir / "projects"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+
+    source_json = source_home / ".claude.json"
+    if source_json.exists():
+        shutil.copy2(source_json, claude_home / ".claude.json")
+
+    source_claude = source_home / ".claude"
+    if source_claude.is_dir():
+        for child in source_claude.iterdir():
+            if child.name == "projects" or not child.is_file():
+                continue
+            try:
+                shutil.copy2(child, claude_dir / child.name)
+            except OSError:
+                pass
+
+    return claude_home
+
+
 def _system_bind_args() -> list[str]:
     """Build ``--ro-bind`` / ``--symlink`` args for standard system dirs."""
     args: list[str] = []
@@ -126,6 +152,7 @@ def _etc_bind_args() -> list[str]:
 def bwrap_prefix(
     work_dir: Path | str,
     *,
+    claude_home: Path | str | None = None,
     extra_writable: list[Path | str] | None = None,
 ) -> list[str]:
     """Return the ``bwrap`` argv prefix that jails everything that follows.
@@ -155,7 +182,8 @@ def bwrap_prefix(
         # No bwrap on macOS — caller should use claude_settings_args() instead.
         return []
 
-    home = Path.home()
+    real_home = Path.home()
+    home = Path(claude_home).resolve() if claude_home is not None else prepare_claude_home(work_dir)
     work = Path(work_dir).resolve()
 
     args: list[str] = [
@@ -165,14 +193,12 @@ def bwrap_prefix(
         "--tmpfs", "/tmp",
         *_system_bind_args(),
         *_etc_bind_args(),
-        # Claude config + on-disk session transcripts.
-        # See TODO(sandbox-leak) at the top of this file.
-        "--bind", str(home / ".claude"), str(home / ".claude"),
-        "--bind", str(home / ".claude.json"), str(home / ".claude.json"),
+        # Per-call Claude config + empty projects dir. Do not bind the parent
+        # ~/.claude/projects transcript history into the sandbox.
+        "--bind", str(home), str(home),
         # Claude binary lives under ~/.local/share/claude; ~/.local/bin/claude
         # is a symlink to it. Read-only is enough.
-        "--ro-bind", str(home / ".local"), str(home / ".local"),
-        "--bind", str(home / ".cache"), str(home / ".cache"),
+        "--ro-bind", str(real_home / ".local"), str(real_home / ".local"),
         # The sole writable /data path.
         "--bind", str(work), str(work),
         # Scrub hostname so the jail can't be fingerprinted by it.
@@ -296,5 +322,4 @@ def claude_settings_args(
         "--settings", json.dumps(settings),
         "--permission-mode", "default",
     ]
-
 

@@ -8,6 +8,7 @@ from terrarium.task import Task
 
 _REGISTRY: dict[str, Task] = {}
 _FACTORIES: dict[str, Callable[[], Task]] = {}
+_RESOLVERS: list[Callable[[str], Callable[[], Task] | None]] = []
 
 
 def register_task(task: Task) -> Task:
@@ -29,6 +30,16 @@ def register_task_factory(name: str, factory: Callable[[], Task]) -> None:
     _FACTORIES[name] = factory
 
 
+def register_task_resolver(resolver: Callable[[str], Callable[[], Task] | None]) -> None:
+    """Register a resolver for dynamic task names.
+
+    Resolvers are consulted only after built-in tasks have been imported and no
+    concrete task/factory exists for the requested name. They let integrations
+    support open-ended names without doing expensive discovery at import time.
+    """
+    _RESOLVERS.append(resolver)
+
+
 def get_task(name: str) -> Task:
     """Retrieve a registered task by name.
 
@@ -37,11 +48,24 @@ def get_task(name: str) -> Task:
     """
     if not _REGISTRY and not _FACTORIES:
         _load_builtin_tasks()
+    if name not in _REGISTRY and name not in _FACTORIES:
+        _maybe_register_dynamic_task(name)
     if name in _FACTORIES:
         task = _FACTORIES.pop(name)()
         _REGISTRY[name] = task
         return task
     if name not in _REGISTRY:
+        for resolver in _RESOLVERS:
+            factory = resolver(name)
+            if factory is None:
+                continue
+            task = factory()
+            if task.name != name:
+                raise ValueError(
+                    f"Task resolver for {name!r} returned task named {task.name!r}"
+                )
+            _REGISTRY[name] = task
+            return task
         raise KeyError(f"Unknown task '{name}'. Available: {sorted(_REGISTRY | _FACTORIES)}")
     return _REGISTRY[name]
 
@@ -56,3 +80,12 @@ def list_tasks() -> list[str]:
 def _load_builtin_tasks() -> None:
     """Import the tasks subpackage to trigger registration of built-in tasks."""
     import terrarium.tasks  # noqa: F401
+
+
+def _maybe_register_dynamic_task(name: str) -> None:
+    """Register known patterned tasks without expensive import-time discovery."""
+    if name.startswith("frontier_cs_algo_") and name != "frontier_cs_algo_smoke":
+        from terrarium.tasks.frontier_cs import _make_problem_task
+
+        problem_id = name.removeprefix("frontier_cs_algo_")
+        register_task_factory(name, lambda p=problem_id: _make_problem_task(p))

@@ -1,7 +1,6 @@
 # @package adapter
 _target_: terrarium.adapters.claude_code.ClaudeCodeAdapter
 model: sonnet
-max_turns: null
 # Work dir for candidate/eval-script files. Runner injects
 # <hydra_run_dir>/claude_code/ when null. Set to keep artifacts elsewhere.
 run_dir: null
@@ -18,3 +17,7 @@ stop_at_score: null
 # MAX_THINKING_TOKENS=<value>). null = adaptive (provider default).
 # The runner threads the top-level ``max_thinking_tokens`` here.
 max_thinking_tokens: null
+# Ralph loop: when claude exits before the LLM/eval budget is out, resume
+# the pinned session (``claude --resume <session_id>``) and keep iterating
+# until the budget is exhausted.
+ralph: true

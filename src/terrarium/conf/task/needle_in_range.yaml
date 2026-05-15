@@ -1,3 +1,4 @@
 # @package task
-name: optuna_blackbox
+name: needle_in_range
 mode: single
+n: 50

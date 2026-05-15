@@ -1,5 +1,8 @@
 # @package task
 name: aime_math_mini
-solver_lm: gpt-4.1-mini
+mode: generalization
+solver_lm: openai/arbor:qwen/qwen3-8b
 solver_temperature: 1.0
 solver_max_tokens: 32000
+solver_timeout: 180
+solver_num_retries: 0

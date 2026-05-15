@@ -1,2 +1,3 @@
 # @package task
 name: cloudcast
+mode: multi_task
