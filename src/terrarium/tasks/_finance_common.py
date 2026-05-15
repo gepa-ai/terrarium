@@ -1,23 +1,22 @@
 """ACE finance benchmarks: shared harness — internal researcher notes,
 NOT surfaced to the optimizer. DO NOT include in any task-facing text.
 
-Common dataset loader + dspy solver shared by tasks/finer.py and
-tasks/formula.py. Both are single-turn ``context -> answer`` generalization
-dataset tasks ported from ACE (arXiv:2510.04618):
+Full ACE replication (arXiv:2510.04618). Both finer/formula are
+single-turn generalization dataset tasks where:
 
-  - The candidate is a *prompt* the optimizer evolves (dspy signature
-    instructions), exactly like tasks/aime_math.py. One eval = one example.
-  - The model input is ACE's full ``context`` string (instruction +
-    question, ending in "Answer:"). The expected value is ACE's ``target``.
-  - The raw model answer is run through the verbatim-ported ACE
-    ``extract_answer`` and then the task-specific correctness check, so
-    scores are comparable to the ACE paper. ACE relies on the
-    prompt/playbook to make the generator emit a parseable final answer
-    (JSON ``final_answer`` / ``Finish[...]`` / boxed); the optimizer's job
-    here is to evolve a prompt that does the same — that *is* the benchmark.
+  - The evolved *candidate* IS ACE's playbook: it fills the ``{playbook}``
+    slot of the verbatim ``GENERATOR_PROMPT``. One eval = one example.
+  - At load time, each example's raw ``context`` is split into
+    (input_text, question) by the task's ACE parse fn, exactly as ACE's
+    ``DataProcessor.process_task_data`` does.
+  - At eval time the model is sent ACE's exact prompt
+    ``GENERATOR_PROMPT.format(candidate, "(empty)", question, context)``
+    (reflection = "(empty)", matching ACE's test path), the raw response
+    is run through the verbatim ``extract_answer``, then the task's
+    correctness check. This reproduces ACE's generator -> extract ->
+    answer_is_correct pipeline so numbers are comparable to the paper.
 
-Data is vendored at terrarium/data/finance/{task}_{split}.jsonl so the
-tasks are portable for any user (no external ACE checkout required).
+Data is vendored at terrarium/data/finance/{task}_{split}.jsonl.
 """
 
 from __future__ import annotations
@@ -29,12 +28,15 @@ from typing import Any, Callable
 
 from terrarium.budget import BudgetExhausted
 from terrarium.task import Example
+from terrarium.tasks._ace_prompts import GENERATOR_PROMPT, PARSE_FN
+from terrarium.tasks._ace_scoring import extract_answer
 
 _DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "finance"
 
 
 def load_finance_dataset(task_name: str) -> tuple[list[Example], list[Example], list[Example]]:
-    """Load vendored (train, val, test) splits for ``finer`` or ``formula``."""
+    """Load vendored splits, applying ACE's per-task context parse."""
+    parse_fn = PARSE_FN[task_name]
     splits: list[list[Example]] = []
     for split in ("train", "val", "test"):
         path = _DATA_DIR / f"{task_name}_{split}.jsonl"
@@ -46,9 +48,15 @@ def load_finance_dataset(task_name: str) -> tuple[list[Example], list[Example], 
             if not line:
                 continue
             item = json.loads(line)
+            original_context = item["context"]
+            input_text, question = parse_fn(original_context)
             examples.append(Example(
                 id=f"{task_name}_{split}_{i}",
-                inputs={"input": item["context"]},
+                inputs={
+                    "question": question,
+                    "context": input_text,
+                    "original_context": original_context,
+                },
                 expected=str(item["target"]),
             ))
         splits.append(examples)
@@ -67,17 +75,11 @@ def evaluate_with_solver(
     solver_timeout: float | None = None,
     solver_num_retries: int | None = None,
 ) -> tuple[float, dict[str, Any]]:
-    """Run the evolved prompt on one finance example and score it ACE-faithfully."""
+    """Run ACE's generator pipeline for one example and score it."""
     import dspy
-    from dspy.utils.exceptions import AdapterParseError
 
     # Reuse aime_math's per-eval LM builder (generic; avoids duplication).
     from terrarium.tasks.aime_math import _build_eval_lm
-    from terrarium.tasks._ace_scoring import extract_answer
-
-    class FinanceSolverSignature(dspy.Signature):
-        input = dspy.InputField(desc="The finance question, including all instructions.")
-        answer = dspy.OutputField(desc="The final answer in the exact format the question requires.")
 
     lm = _build_eval_lm(
         solver_lm=solver_lm,
@@ -95,38 +97,32 @@ def evaluate_with_solver(
             model = history[-1].get("model") or history[-1].get("response_model")
         return cost, model
 
-    predictor = dspy.ChainOfThought(FinanceSolverSignature)
-    predictor.predict.signature.instructions = candidate
     expected = str(example.expected)
+    # ACE's exact generator prompt; the candidate IS the playbook slot.
+    prompt = GENERATOR_PROMPT.format(
+        candidate,
+        "(empty)",
+        example.inputs["question"],
+        example.inputs["context"],
+    )
     lm_context = dspy.context(lm=lm) if lm is not None else nullcontext()
 
     try:
         with lm_context:
-            prediction = predictor(input=example.inputs["input"])
+            if lm is None:
+                raise RuntimeError("no solver LM configured (set task.solver_lm)")
+            completions = lm(messages=[{"role": "user", "content": prompt}])
+        response = completions[0] if completions else ""
+        if not isinstance(response, str):
+            response = str(response)
     except BudgetExhausted:
         raise
-    except AdapterParseError as exc:
-        cost, model = solver_cost_and_model()
-        return 0.0, {
-            "score": 0.0,
-            "task": task_name,
-            "input": example.inputs["input"],
-            "prompt": candidate,
-            "output": getattr(exc, "lm_response", None) or str(exc),
-            "feedback": (
-                "The solver response could not be parsed into the required "
-                f"answer field. The correct answer is '{expected}'."
-            ),
-            "error": "solver_parse_error",
-            "cost": cost,
-            "solver_model": model,
-        }
     except Exception as exc:
         cost, model = solver_cost_and_model()
         return 0.0, {
             "score": 0.0,
             "task": task_name,
-            "input": example.inputs["input"],
+            "input": example.inputs["original_context"],
             "prompt": candidate,
             "output": str(exc),
             "feedback": (
@@ -139,19 +135,17 @@ def evaluate_with_solver(
         }
 
     cost, model = solver_cost_and_model()
-    raw_answer = str(getattr(prediction, "answer", ""))
-    extracted = extract_answer(raw_answer)
+    extracted = extract_answer(response)
     ok = bool(is_correct(extracted, expected))
     score = float(ok)
     status = "correct" if ok else "incorrect"
     return score, {
         "score": score,
         "task": task_name,
-        "input": example.inputs["input"],
+        "input": example.inputs["original_context"],
         "prompt": candidate,
-        "output": raw_answer,
+        "output": response,
         "extracted": extracted,
-        "reasoning": getattr(prediction, "reasoning", ""),
         "feedback": f"Your answer is {status}. The correct answer is '{expected}'.",
         "cost": cost,
         "solver_model": model,

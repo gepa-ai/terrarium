@@ -22,17 +22,15 @@ from terrarium.tasks._finance_common import evaluate_with_solver as _solve
 from terrarium.tasks._finance_common import load_finance_dataset
 
 DESCRIPTION = """\
-The candidate is a prompt string. For each item the model is given a
-named formula and a word problem with numeric values, and must output the
-numeric answer. The score is 1.0 if the numeric answer matches the
-expected value, 0.0 otherwise.
+The candidate is a reusable playbook of strategies, rules, and insights.
+For each item the model answers a numeric finance question with the
+playbook available to it. The score is 1.0 if the numeric answer matches
+the expected value, 0.0 otherwise.
 """
 
-INITIAL_CANDIDATE = (
-    "Apply the given formula to the numbers in the question. Compute "
-    "carefully and end your response with Finish[<number>] containing the "
-    "final numeric answer rounded to two decimal places."
-)
+# ACE offline mode seeds from an effectively empty playbook and curates it;
+# the optimizer evolves this slot. "(empty)" mirrors ACE's empty-slot value.
+INITIAL_CANDIDATE = "(empty)"
 
 
 def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
