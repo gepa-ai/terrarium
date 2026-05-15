@@ -14,6 +14,8 @@ from terrarium.tasks import (  # noqa: F401
     optuna_blackbox,
     needle_in_range,
     slot_machines,
+    finer,
+    formula,
 )
 
 __all__ = [
@@ -27,4 +29,6 @@ __all__ = [
     "optuna_blackbox",
     "needle_in_range",
     "slot_machines",
+    "finer",
+    "formula",
 ]
