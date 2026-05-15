@@ -17,9 +17,9 @@ from typing import Any
 
 from terrarium.registry import register_task_factory
 from terrarium.task import Example, Task
-from terrarium.tasks._ace_scoring import finer_answer_is_correct
-from terrarium.tasks._finance_common import evaluate_with_solver as _solve
-from terrarium.tasks._finance_common import load_finance_dataset
+from terrarium.tasks.finance._ace_scoring import finer_answer_is_correct
+from terrarium.tasks.finance._finance_common import evaluate_with_solver as _solve
+from terrarium.tasks.finance._finance_common import load_finance_dataset
 
 DESCRIPTION = """\
 The candidate is a prompt string. For each item the model is given a

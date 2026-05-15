@@ -28,10 +28,12 @@ from typing import Any, Callable
 
 from terrarium.budget import BudgetExhausted
 from terrarium.task import Example
-from terrarium.tasks._ace_prompts import PARSE_FN
-from terrarium.tasks._ace_scoring import extract_answer
+from terrarium.tasks.finance._ace_prompts import PARSE_FN
+from terrarium.tasks.finance._ace_scoring import extract_answer
 
-_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "finance"
+# This module lives at tasks/finance/_finance_common.py, so parents[2] is
+# the terrarium package root (finance -> tasks -> terrarium).
+_DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "finance"
 
 
 def load_finance_dataset(task_name: str) -> tuple[list[Example], list[Example], list[Example]]:

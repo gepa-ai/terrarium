@@ -618,7 +618,7 @@ def _apply_task_runtime_config(task: Task, task_cfg: DictConfig) -> Task:
     if task.name in ("finer", "formula"):
         from importlib import import_module
 
-        _solve = import_module(f"terrarium.tasks.{task.name}").evaluate_with_solver
+        _solve = import_module(f"terrarium.tasks.finance.{task.name}").evaluate_with_solver
 
         model_id = task_cfg.get("solver_lm")
         temperature = task_cfg.get("solver_temperature")
