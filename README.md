@@ -108,10 +108,13 @@ bash scripts/reproduce_paper.sh finer  # one task
 ```
 
 Notes:
-- The reproducer uses `adapter=omni` wrapping `adapter.configs=[gepa]` (and
-  `[claude_code_agent]` for GEPA-Agent). The standalone `adapter=gepa` path
-  is supported but is the legacy code path; the paper numbers come from
-  `omni`.
+- Both optimizers run under `adapter=omni` with `backend: gepa` inside
+  `adapter.configs`. The difference is the nested key that selects the
+  reflection proposer: `reflection.reflection_lm` (LLM reflection) for plain
+  GEPA, `claude_code_agent.model` (agentic reflection) for GEPA-Agent. See
+  `scripts/reproduce_paper.sh` for the exact configs payload.
+- The standalone `adapter=gepa` / `adapter=claude_code` paths still work but
+  are legacy; the paper numbers come from the `omni` composition.
 - `livebench_math` requires the optional dependency group:
   `pip install -e .[livebench_math]`. The upstream HF dataset
   (`livebench/math`) is downloaded on first use; set `HF_HOME` if your
