@@ -55,8 +55,46 @@ result = run("circle_packing", adapter, max_evals=150)
 |------|------|-----------|-------------|
 | `circle_packing` | single-task | code | Pack 26 circles in a unit square, maximize sum of radii |
 | `optuna_blackbox` | single-task | code | Evolve code to minimize a blackbox objective function |
-| `aime_math` | dataset | prompt | Optimize a math-solving prompt across AIME problems |
-| `arc_agi` | dataset | code | Optimize an ARC-AGI agent for abstract reasoning |
+| `frontier_cs_algo_<id>` | single-task | program | Solve one Frontier-CS algorithmic problem (C++) |
+| `cloudcast` | multi-task | code | Cross-cloud broadcast routing across 5 region configs |
+| `cant_be_late` | generalization | code | Spot-instance scheduling under deadlines |
+| `aime_math` / `aime_math_mini` | generalization | prompt | AIME math problem solving |
+| `arc_agi` | generalization | code | ARC-AGI abstract reasoning agent |
+| `finer` | generalization | prompt | XBRL US-GAAP tag classification (ACE FiNER) |
+| `formula` | generalization | prompt | Financial-formula numeric QA (ACE Formula) |
+| `livebench_math` | generalization | prompt | LiveBench math benchmark (stratified by subtask) |
+| `needle_in_range` | single-task | code | Needle-in-haystack range search |
+| `slot_machines` | single-task | code | Bandit-style stationary slot-machine search |
+
+## Reproducing Paper Experiments
+
+The agent-ablation results in our paper are produced by the OMNI pipeline
+(`adapter=omni`) wrapping each base optimizer. Each task is run at a matched
+budget of 4000 metric calls / $400 token cost. The three prompt-optimization
+tasks use deterministic subsampling for reproducibility:
+
+| Paper experiment | Task name | Split (train / val / test) | `subsample_seed` |
+|---|---|---|---|
+| FiNER (Fig. agent_vs_gepa)        | `finer`          | 100 / 100 / 150 | `0` |
+| Formula (Fig. agent_vs_gepa)      | `formula`        | 100 / 100 / 150 | `0` |
+| LiveBench-Math (Fig. agent_vs_gepa) | `livebench_math` | 100 / 100 / 168 (frozen) | n/a |
+| Frontier-CS (Fig. agent_vs_gepa)  | `frontier_cs_algo_<id>` for `id ∈ {0, 4, 145, 162, 255}` | per-problem (single-task) | n/a |
+
+A one-shot reproducer for the prompt-optimization rows lives at
+`scripts/reproduce_paper.sh`:
+
+```bash
+bash scripts/reproduce_paper.sh        # all 3 prompt-opt tasks, GEPA + GEPA-Agent
+bash scripts/reproduce_paper.sh finer  # one task
+```
+
+Notes:
+- The reproducer uses `adapter=omni` wrapping `adapter.configs=[gepa]` (and
+  `[claude_code_agent]` for GEPA-Agent). The standalone `adapter=gepa` path
+  is supported but is the legacy code path; the paper numbers come from
+  `omni`.
+- `livebench_math` downloads the upstream HF dataset (`livebench/math`)
+  on first use; set `HF_HOME` if your default cache is read-only.
 
 ## How to Write an Adapter
 
