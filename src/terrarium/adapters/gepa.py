@@ -212,8 +212,10 @@ class GEPAAdapter:
             callbacks.append(cost_callback)
         if agent_proposer is not None:
             callbacks.append(_ReflectiveDatasetDumpCallback(self.run_dir))
+        progress_callback: _ProgressCallback | None = None
         if task.val_set:
-            callbacks.append(_ProgressCallback(server, reflection_lm=cost_source))
+            progress_callback = _ProgressCallback(server, reflection_lm=cost_source)
+            callbacks.append(progress_callback)
 
         stop_callbacks: list[Any] = []
         if self.stop_at_score is not None:
@@ -311,9 +313,20 @@ class GEPAAdapter:
                 metadata={"gepa_result": gepa_result, "adapter_cost": adapter_cost, **reflection_meta},
             )
 
+        # GEPA was aborted before returning a result. BudgetExhausted is the
+        # intended stop path here (max_metric_calls is set 100x so the eval
+        # server is the real limiter), so this fallback is the COMMON path,
+        # not an edge case. ``server.best_candidate`` is the noisy
+        # per-example argmax; prefer the val-aggregate Pareto-best captured
+        # by ``_ProgressCallback`` during optimization.
+        fallback_candidate = server.best_candidate
+        fallback_score = server.best_score
+        if progress_callback is not None and progress_callback.best_candidate is not None:
+            fallback_candidate = progress_callback.best_candidate
+            fallback_score = progress_callback.best_score
         return Result(
-            best_candidate=server.best_candidate,
-            best_score=server.best_score,
+            best_candidate=fallback_candidate,
+            best_score=fallback_score,
             total_evals=server.budget.used,
             eval_log=server.eval_log,
             metadata={"adapter_cost": adapter_cost, **reflection_meta},
