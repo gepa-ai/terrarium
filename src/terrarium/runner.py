@@ -707,39 +707,11 @@ def _apply_task_runtime_config(task: Task, task_cfg: DictConfig) -> Task:
         return replace(task, eval_fn=evaluate, metadata=metadata)
 
     if task.name in ("finer", "formula"):
-        from importlib import import_module
-
-        _solve = import_module(f"terrarium.tasks.finance.{task.name}").evaluate_with_solver
-
-        model_id = task_cfg.get("solver_lm")
-        temperature = task_cfg.get("solver_temperature")
-        max_tokens = task_cfg.get("solver_max_tokens")
-        timeout = task_cfg.get("solver_timeout")
-        num_retries = task_cfg.get("solver_num_retries")
-
-        def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
-            return _solve(
-                candidate,
-                example,
-                solver_lm=str(model_id) if model_id is not None else None,
-                solver_temperature=float(temperature) if temperature is not None else None,
-                solver_max_tokens=int(max_tokens) if max_tokens is not None else None,
-                solver_timeout=float(timeout) if timeout is not None else None,
-                solver_num_retries=int(num_retries) if num_retries is not None else None,
-            )
-
-        metadata = dict(task.metadata)
-        if model_id is not None:
-            metadata["solver_lm"] = str(model_id)
-        if temperature is not None:
-            metadata["solver_temperature"] = float(temperature)
-        if max_tokens is not None:
-            metadata["solver_max_tokens"] = int(max_tokens)
-        if timeout is not None:
-            metadata["solver_timeout"] = float(timeout)
-        if num_retries is not None:
-            metadata["solver_num_retries"] = int(num_retries)
-        return replace(task, eval_fn=evaluate, metadata=metadata)
+        return _build_solver_eval_task(
+            task,
+            task_cfg,
+            solver_module=f"terrarium.tasks.finance.{task.name}",
+        )
 
     if task.name == "livebench_math":
         return _build_solver_eval_task(

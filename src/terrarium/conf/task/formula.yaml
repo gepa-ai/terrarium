@@ -6,3 +6,9 @@ solver_temperature: 1.0
 solver_max_tokens: 32000
 solver_timeout: 180
 solver_num_retries: 0
+# Optional deterministic subsampling. Leave null to use the full vendored
+# splits (500 / 300 / 200). The paper reports results at 100 / 100 / 150.
+subsample_seed: null
+subsample_train: null
+subsample_val: null
+subsample_test: null
