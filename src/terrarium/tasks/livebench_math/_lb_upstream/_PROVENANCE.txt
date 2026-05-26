@@ -1,6 +1,0 @@
-LiveBench math scorers vendored verbatim from github.com/LiveBench/LiveBench@main
-Fetched: 2026-05-18T22:18:52Z
-util.py                <- livebench/process_results/util.py  sha256=f4f8769b5b0d1bf696151212962823009753b822e3310c2087818f7a36b1ac0a  bytes=1108
-math_competitions.py   <- livebench/process_results/math/math_competitions/utils.py  sha256=16f9f9cc14f4c83d4b288ab7361e04b4a1e3ede4069e94c465ab3a42b21ec694  bytes=3933
-olympiad.py            <- livebench/process_results/math/olympiad/utils.py  sha256=f6e8a9622f44dd69ac80b64f7e5fd158ea487bc17833a367ea4de7a289018f8e  bytes=4840
-amps_hard.py           <- livebench/process_results/math/AMPS_Hard/utils.py  sha256=68b7804c7c9e8aefbc1d3315ed363af8c186d5a37d6453ac8a9623eb2bec86a6  bytes=9579

@@ -93,8 +93,10 @@ Notes:
   `[claude_code_agent]` for GEPA-Agent). The standalone `adapter=gepa` path
   is supported but is the legacy code path; the paper numbers come from
   `omni`.
-- `livebench_math` downloads the upstream HF dataset (`livebench/math`)
-  on first use; set `HF_HOME` if your default cache is read-only.
+- `livebench_math` requires the optional dependency group:
+  `pip install -e .[livebench_math]`. The upstream HF dataset
+  (`livebench/math`) is downloaded on first use; set `HF_HOME` if your
+  default cache is read-only.
 
 ## How to Write an Adapter
 

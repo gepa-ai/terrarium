@@ -75,7 +75,7 @@ def _make_task() -> Task:
                 },
                 "per_subtask": split_breakdown(train_set, val_set, test_set),
             },
-            "scoring_provenance": "verbatim LiveBench port; see _lb_upstream/_PROVENANCE.txt",
+            "scoring_provenance": "upstream livebench package via [livebench_math] extra",
         },
     )
 

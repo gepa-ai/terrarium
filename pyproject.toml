@@ -58,6 +58,17 @@ cloudcast = [
     "pandas>=1.3",
     "numpy>=1.20",
 ]
+# LiveBench math: pulls the four math scorer modules from upstream
+# LiveBench (pinned commit) plus their minimal runtime deps. Avoids
+# vendoring the scorer source. The HF dataset ``livebench/math`` is
+# downloaded on first use via the existing ``datasets`` dependency.
+livebench_math = [
+    "livebench @ git+https://github.com/LiveBench/LiveBench@1de6a43e82a137beeeaf2b92d683eedb67f0cf97",
+    "sympy>=1.13",
+    "lark>=1.1",
+    "immutabledict>=4.0",
+    "datasets>=2.14",
+]
 
 [tool.uv.sources]
 gepa = { path = "gepa", editable = true }

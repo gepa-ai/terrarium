@@ -1,15 +1,11 @@
 """LiveBench math scoring — internal researcher notes, NOT surfaced to the
 optimizer. DO NOT include any of this in task-facing text.
 
-Verbatim port of the LiveBench math scorers + their dispatch logic
-(LiveBench: A Challenging, Contamination-Free LLM Benchmark,
-arXiv:2406.19314, github.com/LiveBench/LiveBench).
-
-The four upstream files are vendored BYTE-FOR-BYTE under ``_lb_upstream/``
-(SHA256s + fetch date recorded in ``_lb_upstream/_PROVENANCE.txt``). The
-ONLY edit applied to them is rewriting the internal
-``from livebench.process_results.util import ...`` line to the vendored
-path — no scoring logic was touched.
+Thin dispatcher over the upstream LiveBench math scorers (LiveBench: A
+Challenging, Contamination-Free LLM Benchmark, arXiv:2406.19314,
+github.com/LiveBench/LiveBench). The scorer functions themselves live
+in the ``livebench`` package (pinned via the ``[livebench_math]`` extra
+in ``pyproject.toml``) — install with ``pip install -e .[livebench_math]``.
 
 Dispatch below replicates ``livebench/gen_ground_truth_judgment.py``'s
 math branch exactly: the subtask name is split on ``_`` and
@@ -42,14 +38,14 @@ from __future__ import annotations
 import contextlib
 import os
 
-from terrarium.tasks.livebench_math._lb_upstream.amps_hard import (
+from livebench.process_results.math.AMPS_Hard.utils import (
     amps_hard_process_results,
 )
-from terrarium.tasks.livebench_math._lb_upstream.math_competitions import (
+from livebench.process_results.math.math_competitions.utils import (
     aime_process_results,
     mathcontest_process_results,
 )
-from terrarium.tasks.livebench_math._lb_upstream.olympiad import (
+from livebench.process_results.math.olympiad.utils import (
     extract_expression_completions_from_generation,
     proof_rearrangement_process_results,
 )
