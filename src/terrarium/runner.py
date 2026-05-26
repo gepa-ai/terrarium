@@ -580,6 +580,97 @@ def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) ->
     return prepared
 
 
+def _apply_subsample(task: Task, task_cfg: DictConfig) -> Task:
+    """Optionally subsample train/val/test using a deterministic seed.
+
+    Returns ``task`` unchanged when ``subsample_seed`` is not set. When a seed
+    is provided, each split is independently sampled with a freshly-seeded
+    RNG (so train/val/test are reproducible per-seed and independent of one
+    another). The realized split sizes are recorded under
+    ``task.metadata["subsample"]``.
+    """
+    import random as _rnd
+
+    sub_seed = task_cfg.get("subsample_seed")
+    if sub_seed is None:
+        return task
+
+    def _sub(pool: list | None, k: Any) -> list | None:
+        if not pool or k is None:
+            return pool
+        k = int(k)
+        if k >= len(pool):
+            return pool
+        return _rnd.Random(int(sub_seed)).sample(list(pool), k)
+
+    new_train = _sub(task.train_set, task_cfg.get("subsample_train"))
+    new_val = _sub(task.val_set, task_cfg.get("subsample_val"))
+    new_test = _sub(task.test_set, task_cfg.get("subsample_test"))
+    metadata = dict(task.metadata)
+    metadata["subsample"] = {
+        "seed": int(sub_seed),
+        "train": len(new_train) if new_train else 0,
+        "val": len(new_val) if new_val else 0,
+        "test": len(new_test) if new_test else 0,
+    }
+    return replace(
+        task,
+        metadata=metadata,
+        train_set=new_train,
+        val_set=new_val,
+        test_set=new_test,
+    )
+
+
+def _build_solver_eval_task(
+    task: Task,
+    task_cfg: DictConfig,
+    solver_module: str,
+) -> Task:
+    """Wire ``solver_*`` knobs from yaml into the task's ``eval_fn``.
+
+    For tasks whose evaluator follows the standard
+    ``evaluate_with_solver(candidate, example, **solver_kwargs)`` shape,
+    this constructs the closure, records the resolved solver settings in
+    metadata, and applies optional subsampling. Used by ``aime_math``,
+    ``finer``/``formula`` (finance), and ``livebench_math``.
+    """
+    from importlib import import_module
+
+    _solve = import_module(solver_module).evaluate_with_solver
+
+    model_id = task_cfg.get("solver_lm")
+    temperature = task_cfg.get("solver_temperature")
+    max_tokens = task_cfg.get("solver_max_tokens")
+    timeout = task_cfg.get("solver_timeout")
+    num_retries = task_cfg.get("solver_num_retries")
+
+    def evaluate(candidate: str, example: Example) -> tuple[float, dict[str, Any]]:
+        return _solve(
+            candidate,
+            example,
+            solver_lm=str(model_id) if model_id is not None else None,
+            solver_temperature=float(temperature) if temperature is not None else None,
+            solver_max_tokens=int(max_tokens) if max_tokens is not None else None,
+            solver_timeout=float(timeout) if timeout is not None else None,
+            solver_num_retries=int(num_retries) if num_retries is not None else None,
+        )
+
+    metadata = dict(task.metadata)
+    if model_id is not None:
+        metadata["solver_lm"] = str(model_id)
+    if temperature is not None:
+        metadata["solver_temperature"] = float(temperature)
+    if max_tokens is not None:
+        metadata["solver_max_tokens"] = int(max_tokens)
+    if timeout is not None:
+        metadata["solver_timeout"] = float(timeout)
+    if num_retries is not None:
+        metadata["solver_num_retries"] = int(num_retries)
+
+    return _apply_subsample(replace(task, eval_fn=evaluate, metadata=metadata), task_cfg)
+
+
 def _apply_task_runtime_config(task: Task, task_cfg: DictConfig) -> Task:
     """Thread Hydra task runtime knobs into task evaluators that need them."""
     if task.name == "aime_math":
@@ -649,6 +740,13 @@ def _apply_task_runtime_config(task: Task, task_cfg: DictConfig) -> Task:
         if num_retries is not None:
             metadata["solver_num_retries"] = int(num_retries)
         return replace(task, eval_fn=evaluate, metadata=metadata)
+
+    if task.name == "livebench_math":
+        return _build_solver_eval_task(
+            task,
+            task_cfg,
+            solver_module="terrarium.tasks.livebench_math.livebench_math",
+        )
 
     if task.name == "needle_in_range":
         from terrarium.tasks.needle_in_range import (

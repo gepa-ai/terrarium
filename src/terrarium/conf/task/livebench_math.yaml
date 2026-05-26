@@ -1,0 +1,15 @@
+# @package task
+name: livebench_math
+mode: generalization
+solver_lm: openai/arbor:qwen/qwen3-8b
+solver_temperature: 1.0
+solver_max_tokens: 32000
+solver_timeout: 180
+solver_num_retries: 0
+# Single-source dataset (368). _make_task builds a deterministic,
+# subtask-stratified split of exactly 100 train / 100 val / 168 test
+# (frozen). subsample_* are null: the frozen split is used as-is.
+subsample_seed: null
+subsample_train: null
+subsample_val: null
+subsample_test: null

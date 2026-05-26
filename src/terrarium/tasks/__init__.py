@@ -10,11 +10,12 @@ from terrarium.tasks import (  # noqa: F401
     cant_be_late,
     circle_packing,
     cloudcast,
-    frontier_cs,
-    optuna_blackbox,
-    needle_in_range,
-    slot_machines,
     finance,
+    frontier_cs,
+    livebench_math,
+    needle_in_range,
+    optuna_blackbox,
+    slot_machines,
 )
 
 __all__ = [
@@ -24,9 +25,10 @@ __all__ = [
     "cant_be_late",
     "circle_packing",
     "cloudcast",
-    "frontier_cs",
-    "optuna_blackbox",
-    "needle_in_range",
-    "slot_machines",
     "finance",
+    "frontier_cs",
+    "livebench_math",
+    "needle_in_range",
+    "optuna_blackbox",
+    "slot_machines",
 ]
