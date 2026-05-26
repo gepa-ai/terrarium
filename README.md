@@ -23,6 +23,21 @@ Common evaluation infrastructure for evolving/auto-research systems. Terrarium p
 
 ## Quick Start
 
+### 0. Setup
+
+`gepa` is included as a submodule pinned to a commit on
+`feat/optimize-anything-omni`. To pick up newer optimizer features
+(e.g. the agentic reflection proposer used in the paper's agent
+ablation), initialize the submodule with `--remote` so it follows the
+branch tip rather than the recorded SHA:
+
+```bash
+git clone https://github.com/gepa-ai/terrarium.git
+cd terrarium
+git submodule update --init --remote gepa
+pip install -e .
+```
+
 ### 1. Run from the command line
 
 ```bash
