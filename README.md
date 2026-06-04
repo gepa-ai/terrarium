@@ -25,10 +25,9 @@ Common evaluation infrastructure for evolving/auto-research systems. Terrarium p
 
 ### 0. Setup
 
-`gepa` is included as a submodule, pinned to the exact commit used to
-produce the paper numbers (`cfef49e` on `feat/optimize-anything-omni`,
-which includes the `ClaudeCodeAgentProposer` agentic reflection backend
-used in the agent ablation):
+`gepa` is included as a submodule, pinned to the `feat/optimize-anything-omni`
+branch, which includes the `ClaudeCodeAgentProposer` agentic reflection
+backend used in the agent ablation:
 
 ```bash
 git clone https://github.com/gepa-ai/terrarium.git
@@ -37,10 +36,11 @@ git submodule update --init gepa
 pip install -e .
 ```
 
-To track the branch tip of `feat/optimize-anything-omni` instead (e.g.
-to pick up post-submission optimizer features), use
-`git submodule update --init --remote gepa`. Note that branch-tip
-tracking can change numbers vs. the paper.
+To advance the submodule to the latest `feat/optimize-anything-omni`
+branch tip (e.g. to pick up post-submission optimizer features), use
+`git submodule update --init --remote gepa`. Note that the branch is
+under active development, so the tip can change numbers vs. the paper;
+the paper numbers were produced with `cfef49e`.
 
 ### 1. Run from the command line
 
