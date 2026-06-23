@@ -41,6 +41,7 @@ import sys
 import tempfile
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -735,6 +736,13 @@ class MetaHarnessAdapter:
         max_thinking_tokens: int | None = None,
         sandbox: bool | None = None,
     ) -> None:
+        warnings.warn(
+            "MetaHarnessAdapter is deprecated; use the optimize_anything adapter instead "
+            "(adapter=optimize_anything adapter.engine=meta_harness). Options like "
+            "model/max_iterations move under adapter.engine_config.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.model = model
         self.effort = effort
         self.run_dir = run_dir

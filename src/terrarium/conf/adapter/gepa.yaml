@@ -1,5 +1,11 @@
 # @package adapter
 #
+# DEPRECATED: prefer the optimize_anything adapter
+# (``adapter=optimize_anything adapter.engine=gepa``), which is the primary
+# terrarium adapter. GEPA-specific options move under
+# ``adapter.engine_config`` (e.g. ``adapter.engine_config.reflection``).
+# This config still works but the adapter emits a DeprecationWarning.
+#
 # Full GEPA optimize_anything config. Fields listed here are overridable from
 # the CLI without the `+` prefix:
 #

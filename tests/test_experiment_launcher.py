@@ -17,9 +17,9 @@ class ExperimentLauncherTest(unittest.TestCase):
                 "algorithms": [
                     {
                         "name": "gepa",
-                        "algorithm": "omni",
-                        "overrides": ["adapter.backend=gepa", "adapter.config.engine.seed=0"],
-                        "seed_overrides": ["adapter.config.engine.seed={seed}"],
+                        "algorithm": "optimize_anything",
+                        "overrides": ["adapter.engine=gepa", "adapter.engine_config.engine.seed=0"],
+                        "seed_overrides": ["adapter.engine_config.engine.seed={seed}"],
                     }
                 ],
                 "budgets": [{"name": "cheap", "max_evals": 3, "max_token_cost": 0.25}],
@@ -33,10 +33,10 @@ class ExperimentLauncherTest(unittest.TestCase):
         self.assertEqual(run.task, "aime")
         self.assertEqual(run.algorithm, "gepa")
         self.assertIn("task=aime_math", run.overrides)
-        self.assertIn("adapter=omni", run.overrides)
+        self.assertIn("adapter=optimize_anything", run.overrides)
         self.assertIn("budget.max_evals=3", run.overrides)
         self.assertIn("budget.max_token_cost=0.25", run.overrides)
-        self.assertIn("adapter.config.engine.seed=7", run.overrides)
+        self.assertIn("adapter.engine_config.engine.seed=7", run.overrides)
         self.assertTrue(str(run.output_dir).endswith("aime__gepa__cheap__seed7"))
 
     def test_sequential_composition_override_is_preserved_as_one_arg(self) -> None:
@@ -47,10 +47,10 @@ class ExperimentLauncherTest(unittest.TestCase):
                 "algorithms": [
                     {
                         "name": "seq",
-                        "algorithm": "omni",
+                        "algorithm": "optimize_anything",
                         "overrides": [
                             "adapter.strategy=sequential",
-                            "adapter.configs=[{backend: gepa}, {backend: claude_code}]",
+                            "adapter.configs=[{engine: gepa}, {engine: autoresearch}]",
                         ],
                     }
                 ],
@@ -58,7 +58,7 @@ class ExperimentLauncherTest(unittest.TestCase):
             }
         )
 
-        self.assertIn("adapter.configs=[{backend: gepa}, {backend: claude_code}]", runs[0].overrides)
+        self.assertIn("adapter.configs=[{engine: gepa}, {engine: autoresearch}]", runs[0].overrides)
 
     def test_max_parallel_runs_preferred_over_legacy_max_workers(self) -> None:
         self.assertEqual(_max_parallel_runs({"max_parallel_runs": 8, "max_workers": 2}, None), 8)

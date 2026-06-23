@@ -18,33 +18,33 @@ defaults:
 
 algorithms:
   - name: gepa
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=gepa
-      - ++adapter.config.reflection.reflection_lm=anthropic/claude-sonnet-4-6
+      - adapter.engine=gepa
+      - ++adapter.engine_config.reflection.reflection_lm=anthropic/claude-sonnet-4-6
     seed_overrides:
-      - ++adapter.config.engine.seed={seed}
+      - ++adapter.engine_config.engine.seed={seed}
 
   - name: gepa_cc_agent
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=gepa
-      - ++adapter.config.reflection.reflection_lm=null
-      - ++adapter.config.claude_code_agent.model=sonnet
+      - adapter.engine=gepa
+      - ++adapter.engine_config.reflection.reflection_lm=null
+      - ++adapter.engine_config.claude_code_agent.model=sonnet
     seed_overrides:
-      - ++adapter.config.engine.seed={seed}
+      - ++adapter.engine_config.engine.seed={seed}
 
-  - name: claude_code
-    algorithm: omni
+  - name: autoresearch
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=claude_code
-      - ++adapter.config.model=sonnet
+      - adapter.engine=autoresearch
+      - ++adapter.engine_config.model=sonnet
       - benchmark.split_train_val=false
 
   - name: meta_harness
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=meta_harness
-      - ++adapter.config.model=sonnet
-      - ++adapter.config.max_iterations=null
+      - adapter.engine=meta_harness
+      - ++adapter.engine_config.model=sonnet
+      - ++adapter.engine_config.max_iterations=null
       - benchmark.split_train_val=false

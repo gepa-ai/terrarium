@@ -3,7 +3,7 @@
 # (Fig. agent_vs_gepa) at the paper's matched 4000-eval / $400 budget.
 #
 # Each (task, optimizer) cell is one seed=0 run. Both optimizers run
-# under the OMNI pipeline with backend=gepa; what makes one of them
+# under the optimize_anything pipeline with engine=gepa; what makes one of them
 # "GEPA-Agent" is the presence of the claude_code_agent.model nested
 # config, which swaps the LLM reflection proposer for the agentic one.
 #
@@ -42,16 +42,16 @@ declare -A SUBSAMPLE_N=(
 )
 
 # Map optimizer name -> the adapter.configs payload that selects it.
-# Both use backend=gepa; "gepa_agent" adds the claude_code_agent block
+# Both use engine=gepa; "gepa_agent" adds the claude_code_agent block
 # to swap in the agentic reflection proposer.
 configs_for () {
   case "$1" in
     gepa)
-      printf '[{backend: gepa, config: {engine: {seed: %s}, reflection: {reflection_lm: %s}}}]' \
+      printf '[{engine: gepa, engine_config: {engine: {seed: %s}, reflection: {reflection_lm: %s}}}]' \
         "${SEED}" "${REFLECTION_LM}"
       ;;
     gepa_agent)
-      printf '[{backend: gepa, config: {engine: {seed: %s}, claude_code_agent: {model: %s}}}]' \
+      printf '[{engine: gepa, engine_config: {engine: {seed: %s}, claude_code_agent: {model: %s}}}]' \
         "${SEED}" "${REFLECTION_LM}"
       ;;
     *)
@@ -78,7 +78,7 @@ run_cell () {
   python -m terrarium \
     task.name="${task}" \
     task.solver_lm="${SOLVER_LM}" \
-    adapter=omni \
+    adapter=optimize_anything \
     adapter.strategy=sequential \
     adapter.configs="${configs}" \
     benchmark.max_evals="${MAX_EVALS}" \

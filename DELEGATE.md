@@ -4,8 +4,8 @@
 
 Launch the Terrarium paper experiment comparing:
 
-- GEPA via Omni
-- AutoResearch / Claude Code via Omni, with Ralph mode explicitly enabled
+- GEPA via the optimize_anything adapter (engine=gepa)
+- AutoResearch via the optimize_anything adapter (engine=autoresearch), with Ralph mode explicitly enabled
 
 Task is full AIME generalization:
 
@@ -31,7 +31,7 @@ Terrarium imports vendored GEPA from:
 The local code already includes required uncommitted changes:
 
 - GEPA Omni Claude Code backend supports Ralph resume mode.
-- AIME config explicitly sets `++adapter.config.ralph=true`.
+- AIME config explicitly sets `++adapter.engine_config.ralph=true`.
 - Launcher supports `max_parallel_runs` as the preferred name for process-level parallelism.
 
 Do not revert local changes.
@@ -52,9 +52,9 @@ Important settings:
 - `budget.max_token_cost=10.0`
 - GEPA reflection LM: `anthropic/claude-sonnet-4-6`
 - AIME solver/evaluator LM: `anthropic/claude-haiku-4-5`
-- GEPA internal workers: `++adapter.config.engine.max_workers=32`
+- GEPA internal workers: `++adapter.engine_config.engine.max_workers=32`
 - AutoResearch model: `sonnet`
-- AutoResearch Ralph: `++adapter.config.ralph=true`
+- AutoResearch Ralph: `++adapter.engine_config.ralph=true`
 - GEPA split policy: `benchmark.split_train_val=true`
 - AutoResearch split policy: `benchmark.split_train_val=false`
 
@@ -83,9 +83,9 @@ uv run python benchmarks/experiment_launcher.py \
 Confirm the dry-run output command contains:
 
 - GEPA: `max_concurrency=32`
-- GEPA: `++adapter.config.engine.max_workers=32`
+- GEPA: `++adapter.engine_config.engine.max_workers=32`
 - AutoResearch: `max_concurrency=32`
-- AutoResearch: `++adapter.config.ralph=true`
+- AutoResearch: `++adapter.engine_config.ralph=true`
 
 Known non-launch caveat:
 
@@ -183,15 +183,15 @@ defaults:
   - max_concurrency=16
 
 ...
-      - ++adapter.config.engine.max_workers=16
+      - ++adapter.engine_config.engine.max_workers=16
 ```
 
-Keep `budget.max_evals=500`, `budget.max_token_cost=10.0`, and `++adapter.config.ralph=true` unchanged unless the experiment owner explicitly changes the condition.
+Keep `budget.max_evals=500`, `budget.max_token_cost=10.0`, and `++adapter.engine_config.ralph=true` unchanged unless the experiment owner explicitly changes the condition.
 
 ## Do Not Do
 
 - Do not launch old stopped run directories.
 - Do not trust hidden-test scores from interrupted runs.
 - Do not change split policy mid-experiment.
-- Do not remove `++adapter.config.ralph=true`.
+- Do not remove `++adapter.engine_config.ralph=true`.
 - Do not commit `gepa/uv.lock` churn unless intentionally refreshing the GEPA lockfile.

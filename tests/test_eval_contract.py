@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from terrarium.adapter import Adapter, Result
-from terrarium.adapters.omni import OmniAdapter
+from terrarium.adapters.optimize_anything_adapter import OptimizeAnythingAdapter
 from terrarium.budget import BudgetExhausted, BudgetTracker
 from terrarium.eval_server import EvalServer
 from terrarium.runner import run
@@ -69,13 +69,13 @@ class _LeakyDirectAdapter(Adapter):
         )
 
 
-class _CapturingOmniAdapter(OmniAdapter):
+class _CapturingOptimizeAnythingAdapter(OptimizeAnythingAdapter):
     def __init__(self) -> None:
-        super().__init__(backend="gepa")
+        super().__init__(engine="gepa")
         self.captured_task = None
 
-    def _run_single(self, omni_task, evaluate, server, max_evals, max_token_cost):  # type: ignore[no-untyped-def]
-        self.captured_task = omni_task
+    def _run_single(self, oa_task, evaluate, server, max_evals, max_token_cost):  # type: ignore[no-untyped-def]
+        self.captured_task = oa_task
         return Result(
             best_candidate="test-answer",
             best_score=0.0,
@@ -203,8 +203,8 @@ class EvalContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "appears in both train and val"):
             run(task, _SearchOnlyAdapter(), max_evals=1)
 
-    def test_omni_adapter_does_not_relabel_validation_as_test(self) -> None:
-        adapter = _CapturingOmniAdapter()
+    def test_optimize_anything_adapter_does_not_relabel_validation_as_test(self) -> None:
+        adapter = _CapturingOptimizeAnythingAdapter()
         result = run(_dataset_task(), adapter, max_evals=1)
 
         self.assertEqual(result.metadata["test_score"], 1.0)

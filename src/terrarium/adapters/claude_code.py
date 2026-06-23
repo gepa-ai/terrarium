@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -459,6 +460,13 @@ class ClaudeCodeAdapter:
         sandbox: bool | None = None,
         ralph: bool = True,
     ) -> None:
+        warnings.warn(
+            "ClaudeCodeAdapter is deprecated; use the optimize_anything adapter instead "
+            "(adapter=optimize_anything adapter.engine=autoresearch). Options like "
+            "model/ralph move under adapter.engine_config.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if max_turns is not None:
             raise ValueError(
                 "ClaudeCodeAdapter.max_turns is not supported by the installed "

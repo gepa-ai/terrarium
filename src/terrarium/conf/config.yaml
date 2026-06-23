@@ -1,10 +1,10 @@
 # Default terrarium run configuration.
 #
-# Override from the CLI:
-#   python -m terrarium task=aime_math adapter=gepa budget.max_evals=200
-#   python -m terrarium adapter=claude_code budget.max_token_cost=5.0
+# Override from the CLI (the default adapter is ``optimize_anything``):
+#   python -m terrarium task=aime_math adapter.engine=gepa budget.max_evals=200
+#   python -m terrarium adapter.engine=autoresearch budget.max_token_cost=5.0
 #   python -m terrarium budget.max_evals=200 budget.max_token_cost=10.0
-#   python -m terrarium adapter.engine.max_workers=32
+#   python -m terrarium adapter.engine_config.engine.max_workers=32
 #   python -m terrarium tracking=wandb tracking.wandb_project=my-proj
 #
 # Or point at a custom adapter file:
@@ -12,7 +12,7 @@
 
 defaults:
   - task: circle_packing
-  - adapter: omni
+  - adapter: optimize_anything
   - tracking: none
   - _self_
 

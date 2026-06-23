@@ -29,40 +29,40 @@ defaults:
 
 algorithms:
   - name: gepa
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=gepa
-      - ++adapter.config.reflection.reflection_lm=anthropic/claude-sonnet-4-6
-      - ++adapter.config.engine.parallel=true
-      - ++adapter.config.engine.max_workers=32
+      - adapter.engine=gepa
+      - ++adapter.engine_config.reflection.reflection_lm=anthropic/claude-sonnet-4-6
+      - ++adapter.engine_config.engine.parallel=true
+      - ++adapter.engine_config.engine.max_workers=32
       - benchmark.split_train_val=true
     seed_overrides:
-      - ++adapter.config.engine.seed={seed}
+      - ++adapter.engine_config.engine.seed={seed}
 
   - name: gepa_cc_agent
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=gepa
-      - ++adapter.config.reflection.reflection_lm=null
-      - ++adapter.config.claude_code_agent.model=sonnet
-      - ++adapter.config.engine.parallel=true
-      - ++adapter.config.engine.max_workers=32
+      - adapter.engine=gepa
+      - ++adapter.engine_config.reflection.reflection_lm=null
+      - ++adapter.engine_config.claude_code_agent.model=sonnet
+      - ++adapter.engine_config.engine.parallel=true
+      - ++adapter.engine_config.engine.max_workers=32
       - benchmark.split_train_val=true
     seed_overrides:
-      - ++adapter.config.engine.seed={seed}
+      - ++adapter.engine_config.engine.seed={seed}
 
   - name: autoresearch
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=claude_code
-      - ++adapter.config.model=sonnet
-      - ++adapter.config.ralph=true
+      - adapter.engine=autoresearch
+      - ++adapter.engine_config.model=sonnet
+      - ++adapter.engine_config.ralph=true
       - benchmark.split_train_val=false
 
   - name: meta_harness
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=meta_harness
-      - ++adapter.config.model=sonnet
-      - ++adapter.config.max_iterations=null
+      - adapter.engine=meta_harness
+      - ++adapter.engine_config.model=sonnet
+      - ++adapter.engine_config.max_iterations=null
       - benchmark.split_train_val=false

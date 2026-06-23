@@ -1,11 +1,20 @@
 """Built-in adapters for common evolution systems.
 
-Adapters are the bridge between Terrarium and an evolution/search system:
+Adapters are the bridge between Terrarium and an evolution/search system.
 
-- ``gepa`` \u2014 in-process GEPA via ``optimize_anything``.
-- ``claude_code`` \u2014 launches a single Claude Code subprocess that evolves.
-- ``meta_harness`` \u2014 Meta-Harness loop (https://arxiv.org/abs/2603.28052):
-  iterative Claude-based proposer + Terrarium-side benchmarking.
-- ``omni`` \u2014 dispatcher for ``gepa.omni`` backends (gepa / claude_code /
-  meta_harness) under a single configurable surface.
+The primary adapter is ``optimize_anything``: a single configurable surface over
+every ``gepa.optimize_anything`` engine (``gepa`` / ``autoresearch`` /
+``meta_harness`` / ``best_of_n``), plus ensemble compositions.
+
+- ``optimize_anything`` — dispatcher for ``gepa.optimize_anything`` engines
+  under a single ``engine`` knob (and ensemble ``strategy`` + ``configs``).
+
+The remaining native adapters are **deprecated** (still callable, but they emit a
+``DeprecationWarning``); prefer the equivalent ``optimize_anything`` engine:
+
+- ``gepa`` — in-process GEPA. Use ``adapter.engine=gepa`` instead.
+- ``claude_code`` — single Claude Code subprocess. Use
+  ``adapter.engine=autoresearch`` instead.
+- ``meta_harness`` — Meta-Harness loop (https://arxiv.org/abs/2603.28052).
+  Use ``adapter.engine=meta_harness`` instead.
 """

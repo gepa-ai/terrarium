@@ -1,4 +1,4 @@
-"""File-backed handoff artifacts for sequential Omni compositions."""
+"""File-backed handoff artifacts for sequential optimize_anything compositions."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def collect_stage_handoff(
     handoff_root: Path,
     evals_dir: Path | None,
     stage_idx: int,
-    backend: str,
+    engine: str,
     eval_start: int,
     eval_end: int,
     best_candidate: str,
@@ -62,8 +62,12 @@ def collect_stage_handoff(
     disk because ARC traces can be large. We intentionally do not synthesize
     GEPA's ``gepa_state.bin`` here; GEPA should consume prior candidates/traces
     through a future warm-start/import API that preserves GEPAState invariants.
+
+    The ``engine`` key in the returned manifest matches the field
+    ``gepa.optimize_anything``'s autoresearch engine reads when it materializes
+    prior-stage handoff artifacts.
     """
-    stage_dir = handoff_root / f"stage_{stage_idx:02d}_{_safe_name(backend)}"
+    stage_dir = handoff_root / f"stage_{stage_idx:02d}_{_safe_name(engine)}"
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     selected_eval_ids = _bounded_eval_ids(eval_start, eval_end, config.max_evals)
@@ -88,7 +92,7 @@ def collect_stage_handoff(
 
     summary = {
         "stage_idx": stage_idx,
-        "backend": backend,
+        "engine": engine,
         "best_score": best_score,
         "num_evals": max(0, eval_end - eval_start),
         "eval_start": eval_start,
@@ -105,7 +109,7 @@ def collect_stage_handoff(
     return {
         "schema_version": 1,
         "stage_idx": stage_idx,
-        "backend": backend,
+        "engine": engine,
         "best_score": best_score,
         "num_evals": summary["num_evals"],
         "summary_path": str(summary_path),

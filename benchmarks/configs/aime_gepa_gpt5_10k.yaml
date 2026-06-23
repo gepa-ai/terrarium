@@ -34,14 +34,14 @@ defaults:
 
 algorithms:
   - name: gepa_gpt5
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
-      - adapter.backend=gepa
-      - ++adapter.config.reflection.reflection_lm=openai/gpt-5
-      - "++adapter.config.reflection_lm_kwargs={timeout: 3600, num_retries: 2}"
-      - ++adapter.config.engine.parallel=true
-      - ++adapter.config.engine.max_workers=32
-      - ++adapter.config.engine.cache_evaluation=true
-      - ++adapter.config.engine.cache_evaluation_storage=auto
+      - adapter.engine=gepa
+      - ++adapter.engine_config.reflection.reflection_lm=openai/gpt-5
+      - "++adapter.engine_config.reflection_lm_kwargs={timeout: 3600, num_retries: 2}"
+      - ++adapter.engine_config.engine.parallel=true
+      - ++adapter.engine_config.engine.max_workers=32
+      - ++adapter.engine_config.engine.cache_evaluation=true
+      - ++adapter.engine_config.engine.cache_evaluation_storage=auto
     seed_overrides:
-      - ++adapter.config.engine.seed={seed}
+      - ++adapter.engine_config.engine.seed={seed}

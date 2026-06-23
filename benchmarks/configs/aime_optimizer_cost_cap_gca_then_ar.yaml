@@ -1,6 +1,6 @@
 # AIME GCA -> AR run for the optimizer-cost-cap comparison.
 #
-# Sequential Omni compositions split max_token_cost evenly across stages, so
+# Sequential optimize_anything compositions split max_token_cost evenly across stages, so
 # this gives GCA $10 and AR $10 of optimizer budget.
 name: aime_optimizer_cost_cap_gca_then_ar
 source_zshrc: true
@@ -25,8 +25,8 @@ defaults:
 
 algorithms:
   - name: sequential_gca_then_ar
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
       - adapter.strategy=sequential
-      - "adapter.configs=[{backend: gepa, split_train_val: true, config: {reflection: {reflection_lm: null}, claude_code_agent: {model: sonnet}, engine: {parallel: true, max_workers: 32, seed: 0}}}, {backend: claude_code, split_train_val: false, config: {model: sonnet, ralph: true}}]"
+      - "adapter.configs=[{engine: gepa, split_train_val: true, engine_config: {reflection: {reflection_lm: null}, claude_code_agent: {model: sonnet}, engine: {parallel: true, max_workers: 32, seed: 0}}}, {engine: autoresearch, split_train_val: false, engine_config: {model: sonnet, ralph: true}}]"
       - benchmark.split_train_val=true

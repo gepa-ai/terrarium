@@ -1,5 +1,11 @@
 # @package adapter
 #
+# DEPRECATED: prefer the optimize_anything adapter
+# (``adapter=optimize_anything adapter.engine=meta_harness``), which is the
+# primary terrarium adapter. Options like model/max_iterations move under
+# ``adapter.engine_config``. This config still works but the adapter emits a
+# DeprecationWarning.
+#
 # Meta-Harness adapter (https://arxiv.org/abs/2603.28052): runs an outer
 # evolution loop where a Claude Code subprocess proposes new candidates each
 # iteration and the adapter benchmarks them through the Terrarium eval server

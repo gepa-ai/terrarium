@@ -27,7 +27,7 @@ defaults:
 
 algorithms:
   - name: adaptive_ar_then_gca_tiny
-    algorithm: omni
+    algorithm: optimize_anything
     overrides:
       - adapter.strategy=adaptive_sequential
       - benchmark.split_train_val=true
@@ -37,4 +37,4 @@ algorithms:
       - adapter.scheduler.improvement_epsilon=0.0
       - adapter.scheduler.cycle=false
     seed_overrides:
-      - "adapter.configs=[{{backend: claude_code, split_train_val: false, config: {{model: sonnet, ralph: true, max_no_eval_seconds: 180}}}}, {{backend: gepa, split_train_val: true, config: {{reflection: {{reflection_lm: null}}, claude_code_agent: {{model: sonnet}}, engine: {{parallel: true, max_workers: 16, seed: {seed}}}}}}}]"
+      - "adapter.configs=[{{engine: autoresearch, split_train_val: false, engine_config: {{model: sonnet, ralph: true, max_no_eval_seconds: 180}}}}, {{engine: gepa, split_train_val: true, engine_config: {{reflection: {{reflection_lm: null}}, claude_code_agent: {{model: sonnet}}, engine: {{parallel: true, max_workers: 16, seed: {seed}}}}}}}]"

@@ -11,8 +11,8 @@ Two ways to drive a run:
 
 2. **CLI** (via ``python -m terrarium`` — see ``__main__.py``)::
 
-       python -m terrarium task=aime_math adapter=claude_code budget.max_evals=200
-       python -m terrarium adapter=gepa budget.max_token_cost=5.0
+       python -m terrarium task=aime_math adapter.engine=autoresearch budget.max_evals=200
+       python -m terrarium adapter.engine=gepa budget.max_token_cost=5.0
        python -m terrarium budget.max_evals=200 budget.max_token_cost=10.0
 
    Hydra composes the config from ``terrarium/conf/`` and calls :func:`main`.
@@ -115,12 +115,13 @@ def run(
     if tracker:
         tracker.start({"task": official_task.name, "max_evals": max_evals, "max_token_cost": max_token_cost})
         # Inject GEPA-level callback for iteration/valset metrics. Both the
-        # native GEPAAdapter and the OmniAdapter (when ``backend=gepa``)
-        # surface a ``.callbacks`` list that flows into the GEPA engine.
+        # (deprecated) native GEPAAdapter and the OptimizeAnythingAdapter (when
+        # ``engine=gepa``) surface a ``.callbacks`` list that flows into the
+        # GEPA engine.
         from terrarium.adapters.gepa import GEPAAdapter
-        from terrarium.adapters.omni import OmniAdapter
+        from terrarium.adapters.optimize_anything_adapter import OptimizeAnythingAdapter
 
-        if isinstance(adapter, GEPAAdapter | OmniAdapter):
+        if isinstance(adapter, GEPAAdapter | OptimizeAnythingAdapter):
             adapter.callbacks.append(tracker.create_callback())
 
     start = time.time()
@@ -557,8 +558,8 @@ def _prepare_task_for_benchmark(task: Task, benchmark_cfg: DictConfig | None) ->
 
     train_set = task.train_set
     val_set = task.val_set
-    # Omni composition can run heterogeneous backends in one adapter call.
-    # Preserve the original visible split so each member can choose whether
+    # optimize_anything composition can run heterogeneous engines in one adapter
+    # call. Preserve the original visible split so each member can choose whether
     # it wants a real validation channel or a merged train+val view.
     metadata["_terrarium_source_train_set"] = list(task.train_set) if task.train_set is not None else None
     metadata["_terrarium_source_val_set"] = list(task.val_set) if task.val_set is not None else None

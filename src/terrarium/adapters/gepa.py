@@ -23,6 +23,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import warnings
 from dataclasses import fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -93,6 +94,13 @@ class GEPAAdapter:
         max_thinking_tokens: int | None = None,
         sandbox: bool | None = None,
     ) -> None:
+        warnings.warn(
+            "GEPAAdapter is deprecated; use the optimize_anything adapter instead "
+            "(adapter=optimize_anything adapter.engine=gepa). GEPA-specific options "
+            "move under adapter.engine_config (e.g. adapter.engine_config.reflection).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.run_dir = run_dir
         self.engine = dict(engine) if engine else {}
         self.reflection = dict(reflection) if reflection else {}

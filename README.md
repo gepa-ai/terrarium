@@ -87,8 +87,8 @@ result = run("circle_packing", adapter, max_evals=150)
 
 ## Reproducing Paper Experiments
 
-The agent-ablation results in our paper are produced by the OMNI pipeline
-(`adapter=omni`) wrapping each base optimizer. Each task is run at a matched
+The agent-ablation results in our paper are produced by the optimize_anything
+pipeline (`adapter=optimize_anything`) wrapping each base optimizer. Each task is run at a matched
 budget of 4000 metric calls / $400 token cost. The three prompt-optimization
 tasks use deterministic subsampling for reproducibility:
 
@@ -108,13 +108,14 @@ bash scripts/reproduce_paper.sh finer  # one task
 ```
 
 Notes:
-- Both optimizers run under `adapter=omni` with `backend: gepa` inside
-  `adapter.configs`. The difference is the nested key that selects the
+- Both optimizers run under `adapter=optimize_anything` with `engine: gepa`
+  inside `adapter.configs`. The difference is the nested key that selects the
   reflection proposer: `reflection.reflection_lm` (LLM reflection) for plain
   GEPA, `claude_code_agent.model` (agentic reflection) for GEPA-Agent. See
   `scripts/reproduce_paper.sh` for the exact configs payload.
 - The standalone `adapter=gepa` / `adapter=claude_code` paths still work but
-  are legacy; the paper numbers come from the `omni` composition.
+  are deprecated (they emit a `DeprecationWarning`); the paper numbers come from
+  the `optimize_anything` composition.
 - `livebench_math` requires the optional dependency group:
   `pip install -e .[livebench_math]`. The upstream HF dataset
   (`livebench/math`) is downloaded on first use; set `HF_HOME` if your
