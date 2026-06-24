@@ -185,7 +185,7 @@ class OptimizeAnythingAdapter:
 
         return OATask(
             name=task.name,
-            initial_candidate=task.initial_candidate,
+            seed_candidate=task.initial_candidate,
             objective=task.objective,
             background=task.background,
             train_set=task.train_set,
@@ -283,7 +283,7 @@ class OptimizeAnythingAdapter:
                 stage_task = self._to_oa_task(self._task_for_entry(task, entry))
                 if handoffs:
                     cfg = replace(cfg, engine_config={**cfg.engine_config, "handoffs": list(handoffs)})
-                stage_task = replace(stage_task, initial_candidate=current_candidate)
+                stage_task = replace(stage_task, seed_candidate=current_candidate)
                 eval_start = len(server.eval_log)
                 result = optimize_anything_from_task(stage_task, evaluate, cfg)
                 eval_end = len(server.eval_log)
@@ -449,7 +449,7 @@ class OptimizeAnythingAdapter:
             stage_task = self._to_oa_task(self._task_for_entry(task, entry))
             if handoffs:
                 cfg = replace(cfg, engine_config={**cfg.engine_config, "handoffs": list(handoffs)})
-            stage_task = replace(stage_task, initial_candidate=current_candidate)
+            stage_task = replace(stage_task, seed_candidate=current_candidate)
 
             eval_start = len(server.eval_log)
             budget_start = server.budget.used
