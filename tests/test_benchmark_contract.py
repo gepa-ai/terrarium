@@ -222,10 +222,9 @@ class BenchmarkContractTests(unittest.TestCase):
 
         self.assertIs(oa_task.train_set, task.train_set)
         self.assertIs(oa_task.val_set, task.val_set)
+        # Held-out test set is sealed off from the optimize_anything Task; the
+        # terrarium runner owns post-search test reporting.
         self.assertIsNone(oa_task.test_set)
-        self.assertNotIn("val_set", oa_task.metadata)
-        self.assertNotIn("validation_policy", oa_task.metadata)
-        self.assertEqual(oa_task.metadata["optimize_anything_test_policy"], "terrarium_test_set_sealed")
 
     def test_optimize_anything_adapter_translates_budget_exhaustion(self) -> None:
         from gepa.oa.budget import BudgetExhausted as GepaBudgetExhausted
@@ -241,7 +240,7 @@ class BenchmarkContractTests(unittest.TestCase):
                 evaluate("second")
             return SimpleNamespace(best_candidate="first", best_score=1.0, metadata={})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(result.best_candidate, "first")
@@ -355,20 +354,19 @@ class BenchmarkContractTests(unittest.TestCase):
             seen: dict[str, object] = {}
 
             def fake_optimize(oa_task, evaluate, cfg):
-                del cfg
                 if oa_task.initial_candidate == "seed":
                     evaluate("stage0-candidate")
                     return SimpleNamespace(best_candidate="stage0-best", best_score=0.4, metadata={})
                 seen["initial_candidate"] = oa_task.initial_candidate
-                seen["metadata"] = oa_task.metadata
+                seen["handoffs"] = cfg.engine_config.get("handoffs")
                 evaluate("stage1-candidate")
                 return SimpleNamespace(best_candidate="stage1-best", best_score=0.5, metadata={})
 
-            with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+            with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
                 result = adapter.evolve(task, server)
 
             self.assertEqual(seen["initial_candidate"], "stage0-best")
-            handoffs = seen["metadata"]["optimize_anything_handoffs"]  # type: ignore[index]
+            handoffs = seen["handoffs"]  # type: ignore[index]
             self.assertEqual(len(handoffs), 1)
             manifest = handoffs[0]
             self.assertNotIn("evals", manifest)
@@ -404,7 +402,7 @@ class BenchmarkContractTests(unittest.TestCase):
             seen.append((len(oa_task.train_set or []), len(oa_task.val_set or [])))
             return SimpleNamespace(best_candidate=f"stage-{len(seen)}", best_score=float(len(seen)), metadata={})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             adapter.evolve(task, server)
 
         self.assertEqual(seen, [(1, 1), (2, 0)])
@@ -424,7 +422,7 @@ class BenchmarkContractTests(unittest.TestCase):
             evaluate("stage0")
             return SimpleNamespace(best_candidate="stage0-best", best_score=1.0, metadata={})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(calls, ["seed"])
@@ -453,7 +451,7 @@ class BenchmarkContractTests(unittest.TestCase):
                 metadata={"adapter_cost": 2.5},
             )
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(result.metadata["adapter_cost"], 3.75)
@@ -483,7 +481,7 @@ class BenchmarkContractTests(unittest.TestCase):
                 return SimpleNamespace(best_candidate="gepa-best", best_score=0.8, metadata={"adapter_cost": 1.0})
             return SimpleNamespace(best_candidate="regressed", best_score=0.2, metadata={"adapter_cost": 2.0})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(calls, [("gepa", "seed"), ("gepa", "gepa-best"), ("autoresearch", "gepa-best")])
@@ -514,7 +512,7 @@ class BenchmarkContractTests(unittest.TestCase):
                 return SimpleNamespace(best_candidate="gepa-best", best_score=0.4, metadata={})
             return SimpleNamespace(best_candidate="cc-best", best_score=0.6, metadata={})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(calls, ["gepa", "gepa", "autoresearch", "autoresearch"])
@@ -539,7 +537,7 @@ class BenchmarkContractTests(unittest.TestCase):
             evaluate("candidate-b")
             return SimpleNamespace(best_candidate="best", best_score=0.1, metadata={})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(calls, ["gepa"])
@@ -562,7 +560,7 @@ class BenchmarkContractTests(unittest.TestCase):
             evaluate(f"{cfg.engine}-candidate")
             return SimpleNamespace(best_candidate="best", best_score=0.1, metadata={"adapter_cost": 1.5})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(calls, ["gepa"])
@@ -594,7 +592,7 @@ class BenchmarkContractTests(unittest.TestCase):
             evaluate("next", examples[0])
             return SimpleNamespace(best_candidate="next", best_score=0.1, metadata={})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(server.best_candidate, "spiky")
@@ -628,7 +626,7 @@ class BenchmarkContractTests(unittest.TestCase):
             seen.append((len(oa_task.train_set or []), len(oa_task.val_set or [])))
             return SimpleNamespace(best_candidate=f"stage-{len(seen)}", best_score=float(len(seen)), metadata={})
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             adapter.evolve(task, server)
 
         self.assertEqual(seen, [(1, 1), (2, 0)])
@@ -659,7 +657,7 @@ class BenchmarkContractTests(unittest.TestCase):
                 metadata={"adapter_cost": 2.5},
             )
 
-        with patch("gepa.optimize_anything.optimize_anything", side_effect=fake_optimize):
+        with patch("gepa.optimize_anything.optimize_anything_from_task", side_effect=fake_optimize):
             result = adapter.evolve(task, server)
 
         self.assertEqual(result.best_candidate, "member1")

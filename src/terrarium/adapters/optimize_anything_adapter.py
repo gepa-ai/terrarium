@@ -113,7 +113,7 @@ class OptimizeAnythingAdapter:
             Defaults to ``len(configs)``.
         handoff: Optional sequential-stage handoff config. ``{"mode": "rich"}``
             writes prior-stage eval records to disk and passes only manifest
-            paths through ``Task.metadata["optimize_anything_handoffs"]``.
+            paths to the next stage via its ``engine_config["handoffs"]``.
         scheduler: Optional adaptive-sequential scheduler config. Supported
             keys: ``plateau_evals`` / ``slice_evals``, ``patience``,
             ``min_evals_per_stage``, ``improvement_epsilon``, ``cycle``, and
@@ -183,8 +183,6 @@ class OptimizeAnythingAdapter:
     def _to_oa_task(self, task: Task) -> Any:
         from gepa.optimize_anything import Task as OATask
 
-        metadata = dict(task.metadata)
-        metadata["optimize_anything_test_policy"] = "terrarium_test_set_sealed"
         return OATask(
             name=task.name,
             initial_candidate=task.initial_candidate,
@@ -196,7 +194,6 @@ class OptimizeAnythingAdapter:
             # optimize_anything owns engine-specific train/val visibility
             # policy internally.
             test_set=None,
-            metadata=metadata,
         )
 
     def _run_single(
@@ -207,7 +204,7 @@ class OptimizeAnythingAdapter:
         max_evals: int | None,
         max_token_cost: float | None,
     ) -> Result:
-        from gepa.optimize_anything import OptimizeAnythingConfig, optimize_anything
+        from gepa.optimize_anything import OptimizeAnythingConfig, optimize_anything_from_task
 
         cfg = OptimizeAnythingConfig(
             engine=self.engine,
@@ -223,7 +220,7 @@ class OptimizeAnythingAdapter:
             engine_config=self._build_engine_config(self.engine, self.engine_config),
         )
 
-        oa_result = optimize_anything(oa_task, evaluate, cfg)
+        oa_result = optimize_anything_from_task(oa_task, evaluate, cfg)
 
         return Result(
             best_candidate=oa_result.best_candidate,
@@ -244,7 +241,7 @@ class OptimizeAnythingAdapter:
         max_evals: int | None,
         max_token_cost: float | None,
     ) -> Result:
-        from gepa.optimize_anything import optimize_anything
+        from gepa.optimize_anything import optimize_anything_from_task
 
         n = len(self.configs)
         # Fixed ensemble strategies use the same fair-share partition.
@@ -285,12 +282,10 @@ class OptimizeAnythingAdapter:
                     break
                 stage_task = self._to_oa_task(self._task_for_entry(task, entry))
                 if handoffs:
-                    metadata = dict(stage_task.metadata)
-                    metadata["optimize_anything_handoffs"] = list(handoffs)
-                    stage_task = replace(stage_task, metadata=metadata)
+                    cfg = replace(cfg, engine_config={**cfg.engine_config, "handoffs": list(handoffs)})
                 stage_task = replace(stage_task, initial_candidate=current_candidate)
                 eval_start = len(server.eval_log)
-                result = optimize_anything(stage_task, evaluate, cfg)
+                result = optimize_anything_from_task(stage_task, evaluate, cfg)
                 eval_end = len(server.eval_log)
                 stage_results.append(result)
                 if best_so_far is None or result.best_score > best_so_far.best_score:
@@ -342,7 +337,7 @@ class OptimizeAnythingAdapter:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(
                 pool.map(
-                    lambda pair: optimize_anything(pair[0], evaluate, pair[1]),
+                    lambda pair: optimize_anything_from_task(pair[0], evaluate, pair[1]),
                     zip(oa_tasks, oa_configs),
                 )
             )
@@ -384,7 +379,7 @@ class OptimizeAnythingAdapter:
         max_evals: int | None,
         max_token_cost: float | None,
     ) -> Result:
-        from gepa.optimize_anything import optimize_anything
+        from gepa.optimize_anything import optimize_anything_from_task
 
         n = len(self.configs)
         plateau_evals = int(
@@ -453,15 +448,13 @@ class OptimizeAnythingAdapter:
 
             stage_task = self._to_oa_task(self._task_for_entry(task, entry))
             if handoffs:
-                metadata = dict(stage_task.metadata)
-                metadata["optimize_anything_handoffs"] = list(handoffs)
-                stage_task = replace(stage_task, metadata=metadata)
+                cfg = replace(cfg, engine_config={**cfg.engine_config, "handoffs": list(handoffs)})
             stage_task = replace(stage_task, initial_candidate=current_candidate)
 
             eval_start = len(server.eval_log)
             budget_start = server.budget.used
             best_before = best_so_far.best_score if best_so_far is not None else float("-inf")
-            result = optimize_anything(stage_task, evaluate, cfg)
+            result = optimize_anything_from_task(stage_task, evaluate, cfg)
             budget_end = server.budget.used
             eval_end = len(server.eval_log)
             eval_delta = budget_end - budget_start

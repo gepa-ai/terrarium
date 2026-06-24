@@ -135,7 +135,7 @@ class GEPAAdapter:
         }
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
-        from gepa.optimize_anything import (
+        from gepa.legacy_optimize_anything import (
             EngineConfig,
             GEPAConfig,
             MergeConfig,
@@ -280,8 +280,6 @@ class GEPAAdapter:
             # optimization loop.
             if task.val_set:
                 oa_kwargs["valset"] = task.val_set
-            if "val_set" in task.metadata:
-                oa_kwargs.setdefault("valset", task.metadata["val_set"])
 
         objective = self.objective or task.objective
         background = self.background or task.background
