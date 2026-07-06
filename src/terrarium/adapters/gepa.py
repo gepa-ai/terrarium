@@ -1,6 +1,6 @@
 """GEPA adapter: runs optimize_anything as the evolution backend.
 
-Config layout mirrors :class:`gepa.optimize_anything.GEPAConfig`:
+Config layout mirrors :class:`gepa.gepa_launcher.GEPAConfig`:
 
 - ``engine``: kwargs for :class:`EngineConfig` (budget, parallelism, caching, ...)
 - ``reflection``: kwargs for :class:`ReflectionConfig` (reflection LM, minibatch, ...)
@@ -135,7 +135,7 @@ class GEPAAdapter:
         }
 
     def evolve(self, task: Task, server: EvalServer) -> Result:
-        from gepa.legacy_optimize_anything import (
+        from gepa.gepa_launcher import (
             EngineConfig,
             GEPAConfig,
             MergeConfig,

@@ -204,34 +204,21 @@ class OptimizeAnythingAdapter:
         max_evals: int | None,
         max_token_cost: float | None,
     ) -> Result:
-        from gepa.optimize_anything import OptimizeAnythingConfig, optimize_anything_from_task
+        from gepa.optimize_anything import optimize_anything_from_task
 
-        cfg = OptimizeAnythingConfig(
-            engine=self.engine,
+        # The single path is the ensemble path with one implicit entry: all
+        # settings come from the adapter-level defaults, and run_dir is
+        # self.run_dir (no per-member subdir). idx=None selects that layout.
+        cfg = self._materialize_config(
+            {},
+            None,
             max_evals=max_evals,
             max_token_cost=max_token_cost,
             max_concurrency=server.max_concurrency,
-            output_dir=self.run_dir,
-            run_dir=self.run_dir,
-            stop_at_score=self.stop_at_score,
-            effort=self.effort,
-            max_thinking_tokens=self.max_thinking_tokens,
-            sandbox=bool(self.sandbox) if self.sandbox is not None else False,
-            engine_config=self._build_engine_config(self.engine, self.engine_config),
+            task=oa_task,
         )
-
         oa_result = optimize_anything_from_task(oa_task, evaluate, cfg)
-
-        return Result(
-            best_candidate=oa_result.best_candidate,
-            best_score=oa_result.best_score,
-            total_evals=server.budget.used,
-            eval_log=server.eval_log,
-            metadata={
-                **oa_result.metadata,
-                "optimize_anything_engine": getattr(self.engine, "name", self.engine),
-            },
-        )
+        return self._wrap_result(oa_result, server)
 
     def _run_ensemble(
         self,
@@ -257,6 +244,7 @@ class OptimizeAnythingAdapter:
                 max_evals=per_evals,
                 max_token_cost=per_cost,
                 max_concurrency=server.max_concurrency,
+                task=self._task_for_entry(task, entry),
             )
             for idx, entry in enumerate(self.configs)
         ]
@@ -444,6 +432,7 @@ class OptimizeAnythingAdapter:
                 max_evals=slice_evals,
                 max_token_cost=remaining_cost,
                 max_concurrency=server.max_concurrency,
+                task=self._task_for_entry(task, entry),
             )
 
             stage_task = self._to_oa_task(self._task_for_entry(task, entry))
@@ -590,23 +579,30 @@ class OptimizeAnythingAdapter:
     def _materialize_config(
         self,
         entry: dict[str, Any],
-        idx: int,
+        idx: int | None,
         *,
         max_evals: int | None,
         max_token_cost: float | None,
         max_concurrency: int,
+        task: Task | None = None,
     ) -> Any:
-        """Build an :class:`OptimizeAnythingConfig` for one ensemble member.
+        """Build an :class:`OptimizeAnythingConfig` for one engine.
 
-        Per-entry keys (``engine``, ``engine_config``, ``effort``,
-        ``max_thinking_tokens``, ``stop_at_score``) override the adapter-level
-        defaults. ``run_dir`` is auto-derived as ``<self.run_dir>/<idx>_<engine>/``
-        unless the entry provides one explicitly.
+        Used for both the single-engine path (``idx=None``, ``entry={}`` — all
+        settings from adapter-level defaults, ``run_dir=self.run_dir``) and each
+        ensemble member (``idx=0,1,…``, per-entry keys ``engine`` /
+        ``engine_config`` / ``effort`` / ``max_thinking_tokens`` /
+        ``stop_at_score`` overriding the defaults, ``run_dir`` auto-derived as
+        ``<self.run_dir>/<idx>_<engine>/`` unless the entry sets one). ``task``
+        supplies the objective/background used when translating a
+        ``claude_code_agent`` block into a proposer.
         """
         from gepa.optimize_anything import OptimizeAnythingConfig
 
         engine = entry.get("engine", self.engine)
-        engine_config = entry.get("engine_config") or {}
+        # Single-engine path passes entry={}, so fall back to the adapter-level
+        # engine_config; ensemble members carry their own.
+        engine_config = entry.get("engine_config", self.engine_config) or {}
         effort = entry.get("effort", self.effort)
         max_thinking_tokens = entry.get("max_thinking_tokens", self.max_thinking_tokens)
         stop_at_score = entry.get("stop_at_score", self.stop_at_score)
@@ -614,6 +610,9 @@ class OptimizeAnythingAdapter:
 
         if entry.get("run_dir"):
             run_dir = entry["run_dir"]
+        elif idx is None:
+            # Single-engine path: no per-member subdir.
+            run_dir = self.run_dir
         elif self.run_dir:
             engine_name = getattr(engine, "name", engine) if not isinstance(engine, str) else engine
             run_dir = str(Path(self.run_dir) / f"{idx}_{engine_name}")
@@ -628,10 +627,18 @@ class OptimizeAnythingAdapter:
             output_dir=run_dir,
             run_dir=run_dir,
             stop_at_score=stop_at_score,
-            effort=effort,
-            max_thinking_tokens=max_thinking_tokens,
             sandbox=bool(sandbox) if sandbox is not None else False,
-            engine_config=self._build_engine_config(engine, engine_config),
+            engine_config=self._build_engine_config(
+                engine,
+                engine_config,
+                run_dir=run_dir,
+                objective=task.objective if task is not None else None,
+                background=task.background if task is not None else None,
+                max_token_cost=max_token_cost,
+                effort=effort,
+                max_thinking_tokens=max_thinking_tokens,
+                sandbox=sandbox,
+            ),
         )
 
     def _wrap_result(self, oa_result: Any, server: EvalServer) -> Result:
@@ -658,16 +665,145 @@ class OptimizeAnythingAdapter:
         run's output tree."""
         return
 
-    def _build_engine_config(self, engine: Any, engine_config: dict[str, Any]) -> dict[str, Any]:
-        """Forward the per-engine ``engine_config`` plus terrarium-injected
-        callbacks. Callbacks are only attached when ``engine == "gepa"`` — the
-        other built-in engines don't read them and would emit an unknown-key
-        warning."""
+    def _build_engine_config(
+        self,
+        engine: Any,
+        engine_config: dict[str, Any],
+        *,
+        run_dir: str | None = None,
+        objective: str | None = None,
+        background: str | None = None,
+        max_token_cost: float | None = None,
+        effort: str | None = None,
+        max_thinking_tokens: int | None = None,
+        sandbox: bool | None = None,
+    ) -> dict[str, Any]:
+        """Forward the per-engine ``engine_config``, translating gepa-specific
+        conveniences and injecting terrarium callbacks.
+
+        For the ``gepa`` engine, ``OptimizeAnythingConfig.engine_config`` is a
+        ``GEPAConfig``-shaped dict passed through 1-to-1 (gepa no longer accepts
+        ad-hoc keys). Terrarium therefore owns two translations:
+
+        - ``claude_code_agent`` → ``reflection.custom_candidate_proposer`` (a
+          terrarium :class:`ClaudeCodeAgentProposer`) plus
+          ``engine.write_agent_state=True`` so the proposer can read the
+          agent-readable run-dir tree.
+        - terrarium tracker callbacks are appended to ``callbacks`` (other
+          engines don't read them and would emit an unknown-key warning).
+        """
         merged = dict(engine_config)
-        if self.callbacks and isinstance(engine, str) and engine == "gepa":
+        is_gepa = isinstance(engine, str) and engine == "gepa"
+        if is_gepa and merged.get("claude_code_agent"):
+            merged = self._translate_claude_code_agent(
+                merged,
+                run_dir=run_dir,
+                objective=objective,
+                background=background,
+                max_token_cost=max_token_cost,
+                effort=effort,
+                max_thinking_tokens=max_thinking_tokens,
+                sandbox=sandbox,
+            )
+        # gepa no longer takes effort / max_thinking_tokens as top-level
+        # OptimizeAnythingConfig fields — each engine reads them from its own
+        # engine_config. Thread the adapter-level values in (without clobbering
+        # explicit per-engine settings).
+        merged = self._inject_reasoning_knobs(engine, merged, effort=effort, max_thinking_tokens=max_thinking_tokens)
+        if self.callbacks and is_gepa:
             existing = list(merged.get("callbacks") or [])
             existing.extend(self.callbacks)
             merged["callbacks"] = existing
+        return merged
+
+    def _inject_reasoning_knobs(
+        self,
+        engine: Any,
+        engine_config: dict[str, Any],
+        *,
+        effort: str | None,
+        max_thinking_tokens: int | None,
+    ) -> dict[str, Any]:
+        """Thread adapter-level ``effort`` / ``max_thinking_tokens`` into the
+        engine's ``engine_config``.
+
+        Agent engines (autoresearch / meta_harness / best_of_n) accept ``effort``
+        and ``max_thinking_tokens`` as engine_config keys directly. The gepa
+        engine takes reasoning knobs on its reflection LM via
+        ``reflection.reflection_lm_kwargs`` (``reasoning_effort`` / ``thinking``).
+        Explicit per-engine settings always win.
+        """
+        if effort is None and max_thinking_tokens is None:
+            return engine_config
+        merged = dict(engine_config)
+        if isinstance(engine, str) and engine == "gepa":
+            reflection = dict(merged.get("reflection") or {})
+            lm_kwargs = dict(reflection.get("reflection_lm_kwargs") or {})
+            if effort is not None:
+                lm_kwargs.setdefault("reasoning_effort", effort)
+            if max_thinking_tokens is not None:
+                lm_kwargs.setdefault("thinking", {"type": "enabled", "budget_tokens": max_thinking_tokens})
+            reflection["reflection_lm_kwargs"] = lm_kwargs
+            merged["reflection"] = reflection
+        else:
+            if effort is not None:
+                merged.setdefault("effort", effort)
+            if max_thinking_tokens is not None:
+                merged.setdefault("max_thinking_tokens", max_thinking_tokens)
+        return merged
+
+    def _translate_claude_code_agent(
+        self,
+        engine_config: dict[str, Any],
+        *,
+        run_dir: str | None,
+        objective: str | None,
+        background: str | None,
+        max_token_cost: float | None,
+        effort: str | None,
+        max_thinking_tokens: int | None,
+        sandbox: bool | None,
+    ) -> dict[str, Any]:
+        """Build a terrarium ``ClaudeCodeAgentProposer`` from the
+        ``claude_code_agent`` convenience key and wire it into the GEPAConfig.
+
+        gepa's ``GepaEngine`` dropped its ``claude_code_agent`` key: proposer
+        construction is the caller's job now. We build the proposer here (with
+        run-dir / objective / effort / sandbox from the surrounding adapter and
+        task) and hand it to gepa through the standard
+        ``ReflectionConfig.custom_candidate_proposer`` slot; per-key entries in
+        the ``claude_code_agent`` mapping override the adapter defaults.
+        """
+        from terrarium.adapters.gepa_cc_agent import ClaudeCodeAgentProposer
+
+        merged = dict(engine_config)
+        cc = dict(merged.pop("claude_code_agent") or {})
+        if run_dir is None:
+            raise ValueError(
+                "claude_code_agent requires a run_dir (set adapter.run_dir or the ensemble entry's run_dir)"
+            )
+        proposer = ClaudeCodeAgentProposer(
+            model=cc.pop("model", "sonnet"),
+            run_dir=cc.pop("run_dir", run_dir),
+            objective=cc.pop("objective", objective),
+            background=cc.pop("background", background),
+            max_budget_usd=cc.pop("max_budget_usd", max_token_cost),
+            max_thinking_tokens=cc.pop("max_thinking_tokens", max_thinking_tokens),
+            effort=cc.pop("effort", effort),
+            sandbox=cc.pop("sandbox", bool(sandbox) if sandbox is not None else True),
+            **cc,
+        )
+        reflection = dict(merged.get("reflection") or {})
+        reflection["custom_candidate_proposer"] = proposer
+        # The agent proposer replaces the reflection LM; leave it unset so gepa
+        # doesn't also build one.
+        reflection.setdefault("reflection_lm", None)
+        merged["reflection"] = reflection
+        # The proposer reads <run_dir>/iterations/, <run_dir>/pareto/, which gepa
+        # only writes when write_agent_state is on.
+        engine_block = dict(merged.get("engine") or {})
+        engine_block["write_agent_state"] = True
+        merged["engine"] = engine_block
         return merged
 
     def _task_for_entry(self, task: Task, entry: dict[str, Any]) -> Task:

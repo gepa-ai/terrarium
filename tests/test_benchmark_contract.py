@@ -265,7 +265,7 @@ class BenchmarkContractTests(unittest.TestCase):
             )
             task = OATask(
                 name="unit",
-                initial_candidate="seed",
+                seed_candidate="seed",
                 objective="objective",
                 train_set=[Example("train", {}, 1.0)],
                 val_set=[Example("val", {}, 1.0)],
@@ -284,40 +284,38 @@ class BenchmarkContractTests(unittest.TestCase):
             )
 
             with (
-                patch("gepa.legacy_optimize_anything.optimize_anything", side_effect=GepaBudgetExhausted("done")),
+                patch("gepa.gepa_launcher.optimize_anything", side_effect=GepaBudgetExhausted("done")),
                 patch.object(engine, "_load_result_from_state", return_value=recovered),
             ):
                 result = engine.run(task, server)
 
         self.assertEqual(result.best_candidate, "validated-best")
         self.assertEqual(result.best_score, 0.75)
-        self.assertEqual(result.metadata["adapter_cost"], 0.0)
-        self.assertEqual(result.metadata["reflection_cost_initial"], 1.25)
-        self.assertEqual(result.metadata["reflection_cost_final"], 1.25)
+        # adapter_cost is the cost source's total_cost (treated as fresh).
+        self.assertEqual(result.metadata["adapter_cost"], 1.25)
 
     def test_gepa_claude_code_agent_defaults_to_token_budget(self) -> None:
-        from gepa.optimize_anything import OptimizeAnythingConfig
-        from gepa.oa.engines.gepa import GepaEngine
+        # gepa's GepaEngine no longer owns a claude_code_agent convenience key
+        # (proposer construction is the caller's job). The terrarium adapter
+        # translates the claude_code_agent engine_config block into a
+        # ClaudeCodeAgentProposer, defaulting its budget to max_token_cost.
+        from terrarium.adapters.optimize_anything_adapter import OptimizeAnythingAdapter
 
-        seen: dict[str, object] = {}
-
-        class FakeProposer:
-            def __init__(self, **kwargs) -> None:
-                seen.update(kwargs)
-
-        engine = GepaEngine(
-            OptimizeAnythingConfig(
-                engine="gepa",
-                run_dir="/tmp/gepa-cc-agent",
-                engine_config={"claude_code_agent": {"model": "sonnet"}},
-            )
+        adapter = OptimizeAnythingAdapter(engine="gepa", run_dir="/tmp/gepa-cc-agent")
+        merged = adapter._build_engine_config(
+            "gepa",
+            {"claude_code_agent": {"model": "sonnet"}},
+            run_dir="/tmp/gepa-cc-agent",
+            objective="objective",
+            background="background",
+            max_token_cost=0.5,
+            effort=None,
+            max_thinking_tokens=None,
+            sandbox=None,
         )
-
-        with patch("gepa.oa.proposers.ClaudeCodeAgentProposer", FakeProposer):
-            engine._build_claude_code_agent("objective", "background", default_max_budget_usd=0.5)
-
-        self.assertEqual(seen["max_budget_usd"], 0.5)
-        self.assertEqual(seen["model"], "sonnet")
+        proposer = merged["reflection"]["custom_candidate_proposer"]
+        self.assertEqual(proposer.max_budget_usd, 0.5)
+        self.assertEqual(proposer.model, "sonnet")
 
     def test_meta_harness_frontier_has_terminal_bench_best_alias(self) -> None:
         from gepa.oa.engines.meta_harness import _update_frontier
